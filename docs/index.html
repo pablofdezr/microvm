@@ -408,6 +408,11 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
           <p>dm-verity checks every block of the read-only rootfs against a hash tree at boot — the kernel panics before init if the image was tampered with.</p>
         </div>
         <div class="card">
+          <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13H11l-1 9 9-12h-6.5z"/></svg></div>
+          <h3>Fast cold starts <span class="new">NEW</span></h3>
+          <p>Warm build caches baked into the images — a cold Go build drops from ~37s to under a second — plus a pool of pre-booted VMs and Firecracker snapshots that restore in milliseconds.</p>
+        </div>
+        <div class="card">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
           <h3>Auth &amp; quotas</h3>
           <p>Per-tenant bearer tokens, storage quotas and usage metering. A firewall blocks RFC1918, link-local and cloud metadata by default.</p>
@@ -458,7 +463,7 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
       <div class="section-head">
         <p class="eyebrow">Benchmarks</p>
         <h2>Measured on a Raspberry Pi 5</h2>
-        <p class="lead">Real code, cold. Go and Rust are large because running their code means compiling it.</p>
+        <p class="lead">Real code, cold — the baseline with no warm cache, pool or snapshots. Go and Rust are large because running their code means compiling it.</p>
       </div>
       <div class="table-card">
         <table>
@@ -471,7 +476,7 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
           </tbody>
         </table>
       </div>
-      <p class="table-note">A warm pool of snapshots is the intended fix for the cold-compile cases.</p>
+      <p class="table-note">A warm build cache cuts a cold Go build ~58× (37s → ~0.5s, measured); a warm pool and Firecracker snapshots cut the boot itself.</p>
     </div>
   </section>
 

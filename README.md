@@ -269,7 +269,9 @@ its sandboxes no storage.
 
 ## Images
 
-Slim where a slim variant exists. Measured, running real code on a Pi 5:
+Slim where a slim variant exists. Measured on a Pi 5, running real code, as a
+**cold boot with no warm cache, pool or snapshots** — the baseline the
+optimizations below improve on:
 
 | Image | Size | Cold run |
 |---|---|---|
@@ -278,8 +280,25 @@ Slim where a slim variant exists. Measured, running real code on a Pi 5:
 | rust | 801 MB | 1.4 s |
 | go | 914 MB | 27 s (compiles cold, no cache) |
 
-Go and Rust are large because running their code means compiling it. Their cold
-times are the case a warm pool of snapshots exists to fix.
+Go and Rust are large because running their code means compiling it, which is
+also why their cold runs are dominated by the compile rather than the boot.
+
+**Cold starts** are attacked in three layers, each opt-in and independent:
+
+- **Warm build caches** baked into each image. Go 1.20+ ships no precompiled
+  standard library, so a cold `go build` recompiles everything it imports — ~37s
+  on a Pi 5. A `GOCACHE` prewarmed with `go build std`, baked into the read-only
+  rootfs and read through the guest's overlay, cuts that to well under a second
+  (measured: 37s → ~0.5s). Node ships a warm `NODE_COMPILE_CACHE`; Rust links
+  with `mold`.
+- **A warm pool** of pristine pre-booted VMs (`-warm image:vcpus:mem:count`), so
+  a task skips the boot entirely. Each pooled VM is a distinct VM that has run no
+  code, so handing one out keeps the one-sandbox-per-task rule — no snapshot
+  collision to fix up.
+- **Firecracker snapshots** (`-snapshot-dir`), so the warm pool fills by restoring
+  a template in tens of milliseconds instead of cold-booting. A snapshot is a
+  copy of RAM, so every restore reseeds the guest's entropy (see
+  [internal/vmgenid](internal/vmgenid)) — restored VMs never share a CSPRNG.
 
 One gotcha worth recording: a Dockerfile's `ENV` is container-runtime metadata,
 not a file. `docker export` discards it and the guest kernel hands PID 1 an
