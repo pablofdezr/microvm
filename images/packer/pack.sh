@@ -81,8 +81,60 @@ mke2fs -q -F -t ext4 -b 4096 -O ^has_journal -d "$ROOTDIR" "$OUT" "${size_mb}M"
 # that fails for reasons that look unrelated.
 e2fsck -fp "$OUT" >/dev/null || die "generated filesystem is not clean"
 
+# dm-verity: generate a Merkle hash tree over the finished image and record the
+# root hash, so the daemon can boot it as a verified device that the kernel
+# refuses to mount if a single block was altered.
+#
+# Opt-in (MICROVM_VERITY=1) because it needs a guest kernel with CONFIG_DM_VERITY
+# and CONFIG_DM_INIT; images built without it have no sidecar and boot normally.
+# The salt is pinned to 64 zero hex chars so the root hash is a deterministic
+# function of the image content alone -- two byte-identical rootfs builds yield
+# the same root hash, which is what keeps a shared image cache meaningful.
+if [ "${MICROVM_VERITY:-0}" = "1" ]; then
+  log "generating dm-verity hash tree"
+  readonly VERITY_SALT="0000000000000000000000000000000000000000000000000000000000000000"
+  [ ${#VERITY_SALT} -eq 64 ] || die "verity salt must be 64 hex chars"
+  readonly HASH_OUT="$OUT.hash"
+  readonly META_OUT="$OUT.verity"
+  : > "$HASH_OUT"
+  rm -f "$META_OUT"
+
+  # --no-superblock: the hash tree starts at block 0 of the hash device, so the
+  # daemon's dm table uses hash_start_block=0 -- no metadata block to skip.
+  vs_out="$(veritysetup format \
+    --no-superblock \
+    --hash=sha256 \
+    --data-block-size=4096 \
+    --hash-block-size=4096 \
+    --salt="$VERITY_SALT" \
+    "$OUT" "$HASH_OUT")"
+
+  root_hash="$(printf '%s\n' "$vs_out" | awk '/Root hash:/ {print $NF}')"
+  [ -n "$root_hash" ] || die "veritysetup produced no root hash"
+
+  # The image is a whole number of 4096-byte blocks (mke2fs -b 4096), so the data
+  # block count is exact -- no need to trust veritysetup's stdout for it.
+  img_bytes="$(stat -c %s "$OUT")"
+  data_blocks=$(( img_bytes / 4096 ))
+
+  cat > "$META_OUT" <<JSON
+{
+  "root_hash": "$root_hash",
+  "salt": "$VERITY_SALT",
+  "data_blocks": $data_blocks,
+  "data_block_size": 4096,
+  "hash_block_size": 4096,
+  "hash_start_block": 0,
+  "hash_algorithm": "sha256"
+}
+JSON
+  log "verity root hash $root_hash ($data_blocks data blocks, hash tree $(du -h "$HASH_OUT" | cut -f1))"
+fi
+
 if [ -n "${OWNER_UID:-}" ] && [ -n "${OWNER_GID:-}" ]; then
   chown "$OWNER_UID:$OWNER_GID" "$OUT"
+  [ -f "$OUT.hash" ] && chown "$OWNER_UID:$OWNER_GID" "$OUT.hash"
+  [ -f "$OUT.verity" ] && chown "$OWNER_UID:$OWNER_GID" "$OUT.verity"
 fi
 
 log "wrote $OUT_NAME ($(du -h "$OUT" | cut -f1))"

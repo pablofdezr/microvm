@@ -99,6 +99,9 @@ one. Either:
   [Firecracker getting-started guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)), or
 - build one from source with their recommended microVM config.
 
+> For **verified boot** (§5), the kernel additionally needs `CONFIG_DM_VERITY=y`
+> and `CONFIG_DM_INIT=y`.
+
 The `vmlinux` architecture must match the host. Place it where the daemon expects
 it (default `/var/lib/microvm/vmlinux`, overridable with `-kernel`):
 
@@ -136,6 +139,37 @@ install -D -m 0644 build/images/python-arm64.ext4 /var/lib/microvm/images/python
 
 The daemon reports the images it can run from what is on disk (`GET /v1/images`),
 so adding an image is just dropping in a file and restarting.
+
+### Verified boot with dm-verity (optional)
+
+The rootfs images are read-only and shared by every sandbox on a host, so a
+tampered image is a tampered userland for everyone who runs it. dm-verity makes
+that fail closed: the kernel verifies every block of the image against a hash
+tree at boot and **panics before init runs** if anything was altered.
+
+Build the verity artifacts by setting `MICROVM_VERITY=1`:
+
+```bash
+MICROVM_VERITY=1 images/build.sh python arm64
+# → build/images/python-arm64.ext4         the image
+#   build/images/python-arm64.ext4.hash     the hash tree
+#   build/images/python-arm64.ext4.verity   the root hash + geometry (JSON)
+```
+
+Install all three next to each other, keeping the `.hash` and `.verity` suffixes
+on whatever you name the image:
+
+```bash
+install -D -m 0644 build/images/python-arm64.ext4        /var/lib/microvm/images/python.ext4
+install -D -m 0644 build/images/python-arm64.ext4.hash   /var/lib/microvm/images/python.ext4.hash
+install -D -m 0644 build/images/python-arm64.ext4.verity /var/lib/microvm/images/python.ext4.verity
+```
+
+The daemon detects the sidecar automatically: an image that has one boots
+verified, an image that does not boots exactly as before — no flags, no
+per-sandbox config. It needs a guest kernel with `CONFIG_DM_VERITY=y` and
+`CONFIG_DM_INIT=y` (§4); that requirement is why verity is opt-in per image
+rather than forced on every host.
 
 ---
 

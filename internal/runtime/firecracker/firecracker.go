@@ -32,6 +32,7 @@ import (
 	"github.com/pablofdezr/microvm/internal/netpool"
 	"github.com/pablofdezr/microvm/internal/protocol"
 	"github.com/pablofdezr/microvm/internal/runtime"
+	"github.com/pablofdezr/microvm/internal/verity"
 	"github.com/pablofdezr/microvm/internal/vsock"
 )
 
@@ -308,7 +309,20 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		return fmt.Errorf("stage rootfs: %w", err)
 	}
 
-	cfgJSON, err := r.vmConfig(spec, inst.lease)
+	// Verified boot, when the image ships a verity sidecar next to its .ext4.
+	// Load returns nil for an image without one, which boots normally from the
+	// rootfs directly -- so this is transparent to existing images.
+	vp, err := verity.Load(rootfs)
+	if err != nil {
+		return fmt.Errorf("verity for image %q: %w", spec.Image, err)
+	}
+	if vp != nil {
+		if err := r.stageFile(vp.HashPath, filepath.Join(jailRoot, verity.HashName)); err != nil {
+			return fmt.Errorf("stage verity hash tree: %w", err)
+		}
+	}
+
+	cfgJSON, err := r.vmConfig(spec, inst.lease, vp)
 	if err != nil {
 		return err
 	}
@@ -404,7 +418,7 @@ func (r *Runtime) stageFile(src, dst string) error {
 //
 // Every path in it is relative to the jail root, because the VMM reads this
 // after it has already chrooted.
-func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease) ([]byte, error) {
+func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease, vp *verity.Params) ([]byte, error) {
 	// Fill the rate limits from the runtime's defaults before rendering. A spec
 	// that names no limit must not mean "no limit": that is how one sandbox
 	// takes the host's uplink.
@@ -418,7 +432,15 @@ func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease) ([]byte, err
 		spec.Limits.DiskIOPS = r.cfg.DefaultDiskIOPS
 	}
 
-	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro" +
+	// The rootfs is the first drive, /dev/vda. With a verity sidecar the kernel
+	// assembles a dm-verity device from it and its hash tree and mounts THAT as
+	// root, panicking before init if a block was altered; without one it mounts
+	// /dev/vda directly, exactly as before.
+	rootBoot := "root=" + verity.DataDevice + " ro"
+	if vp != nil {
+		rootBoot = vp.BootParam() + " root=" + verity.RootDevice + " ro"
+	}
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off " + rootBoot +
 		" microvm.hostname=" + spec.ID
 
 	if spec.Limits.DiskMiB > 0 {
@@ -446,15 +468,28 @@ func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease) ([]byte, err
 	}
 
 	rootDrive := map[string]any{
-		"drive_id":       "rootfs",
-		"path_on_host":   "rootfs.ext4",
-		"is_root_device": true,
+		"drive_id":     "rootfs",
+		"path_on_host": "rootfs.ext4",
 		// Read-only and shared between every sandbox on this image. The
 		// guest makes it writable with an overlay of its own.
 		"is_read_only": true,
+		// Under verity the verified /dev/dm-0 is root, not this raw drive.
+		"is_root_device": vp == nil,
 	}
 	if rl := newRateLimiter(spec.Limits.DiskBps, spec.Limits.DiskIOPS); rl != nil {
 		rootDrive["rate_limiter"] = rl
+	}
+
+	drives := []any{rootDrive}
+	if vp != nil {
+		// The hash tree rides as a second read-only drive, /dev/vdb; the kernel
+		// reads it to verify the rootfs before mounting it.
+		drives = append(drives, map[string]any{
+			"drive_id":       "verity-hash",
+			"path_on_host":   verity.HashName,
+			"is_read_only":   true,
+			"is_root_device": false,
+		})
 	}
 
 	cfg := map[string]any{
@@ -466,7 +501,7 @@ func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease) ([]byte, err
 			"vcpu_count":   spec.VCPUs,
 			"mem_size_mib": spec.MemMiB,
 		},
-		"drives": []any{rootDrive},
+		"drives": drives,
 		"vsock": map[string]any{
 			"guest_cid": protocol.GuestCID,
 			"uds_path":  vsockSocketName,

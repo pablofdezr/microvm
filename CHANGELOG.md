@@ -11,6 +11,12 @@ project aims for [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Verified boot (dm-verity)**: images built with `MICROVM_VERITY=1` ship a
+  hash tree and a root-hash sidecar next to the `.ext4`, and the daemon boots
+  them as a dm-verity device — the guest kernel verifies every block of the
+  shared, read-only rootfs against the hash tree and panics before init if it
+  was tampered with. Opt-in per image (auto-detected from the sidecar), backward
+  compatible, and requires a guest kernel with `CONFIG_DM_VERITY`/`CONFIG_DM_INIT`.
 - **Python SDK** (`sdk/python`, package `microvm`): standard-library-only client
   with the same shape as the Go and TypeScript SDKs — sandboxes, executions,
   files, tasks, queue, images, tenants, `run`, streaming, pagination, typed

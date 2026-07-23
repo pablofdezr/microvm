@@ -286,6 +286,13 @@ empty environment — so the build materialises the image's environment into
 `/etc/microvm/environment` and init loads it. Without that, `rustc` and `go` are
 simply not on the PATH.
 
+Images can be built with **dm-verity** (`MICROVM_VERITY=1 images/build.sh …`):
+the build emits a hash tree and root hash beside the `.ext4`, and a daemon that
+finds them boots the image as a verified device — the kernel checks every block
+against the hash tree and panics before init if the shared image was tampered
+with. Opt-in per image; needs a guest kernel with `CONFIG_DM_VERITY` /
+`CONFIG_DM_INIT`. See [DEPLOY.md](DEPLOY.md).
+
 ## API
 
 Two ways to run code, and the difference matters:

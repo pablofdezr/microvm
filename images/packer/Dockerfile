@@ -6,8 +6,10 @@
 # the host's native architecture regardless of the rootfs being packed.
 FROM debian:trixie-slim
 
+# e2fsprogs builds the ext4 image; cryptsetup-bin provides veritysetup, used to
+# generate the dm-verity hash tree when MICROVM_VERITY=1.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends e2fsprogs \
+ && apt-get install -y --no-install-recommends e2fsprogs cryptsetup-bin \
  && rm -rf /var/lib/apt/lists/*
 
 COPY images/packer/pack.sh /usr/local/bin/pack.sh

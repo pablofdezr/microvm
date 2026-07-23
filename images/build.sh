@@ -9,6 +9,11 @@
 # Usage: images/build.sh <image> [arch]
 #   image  base | python | node | go | rust
 #   arch   arm64 | amd64   (default: the host's architecture)
+#
+# Env:
+#   MICROVM_VERITY=1  also emit a dm-verity hash tree (<out>.hash) and root-hash
+#                     sidecar (<out>.verity) for verified boot. Needs a guest
+#                     kernel with CONFIG_DM_VERITY + CONFIG_DM_INIT. See DEPLOY.md.
 set -euo pipefail
 
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -75,6 +80,7 @@ docker export "$CONTAINER" \
       -e OWNER_UID="$(id -u)" \
       -e OWNER_GID="$(id -g)" \
       -e IMAGE_ENV="$IMAGE_ENV" \
+      -e MICROVM_VERITY="${MICROVM_VERITY:-0}" \
       "$PACKER_TAG"
 
 log "built $OUT_DIR/$OUT_NAME"
