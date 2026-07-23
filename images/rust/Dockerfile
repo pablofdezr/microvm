@@ -16,9 +16,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
 FROM rust:1-slim-trixie
 
 # rustc drives a linker, which it does not ship: without gcc, every compile
-# fails at the link step with an error that reads like a missing crate.
+# fails at the link step with an error that reads like a missing crate. mold is a
+# drop-in linker far faster than the default; linking is a large slice of a small
+# program's build, so it directly shaves the run-once path a sandbox exists for.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates gcc libc6-dev \
+ && apt-get install -y --no-install-recommends ca-certificates gcc libc6-dev mold \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=agent-builder /out/microvm-agent /sbin/microvm-agent
@@ -36,5 +38,9 @@ ENV CARGO_TARGET_DIR=/tmp/target
 # cloning the whole crates.io index. In an ephemeral VM that clone is pure cost:
 # it is downloaded once and thrown away with the sandbox.
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+# Link with mold (installed above). rustc invokes gcc as the linker driver and
+# passes it -fuse-ld=mold. gcc in trixie supports the flag; a small program then
+# links in a fraction of the default linker's time.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
 WORKDIR /workspace

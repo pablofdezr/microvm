@@ -41,4 +41,17 @@ RUN mkdir -p /proc /sys /dev/pts /dev/shm /run /tmp /overlay /workspace \
 ENV NPM_CONFIG_CACHE=/tmp/.npm
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 
+# Node caches compiled module bytecode when NODE_COMPILE_CACHE is set (Node 22+).
+# Point it at a fixed baked path -- not /tmp, which the agent shadows with a
+# fresh tmpfs at boot -- and warm it below. A sandbox's `tsx` startup then reuses
+# the cached compilation of tsx and its dependencies (read from the read-only
+# base, new entries copied up into the overlay) instead of recompiling them
+# every run. A stale cache is only ever ignored, never wrong.
+ENV NODE_COMPILE_CACHE=/opt/node-cache
+RUN mkdir -p /opt/node-cache \
+ && printf 'console.log("warm")\n' > /tmp/warm.ts \
+ && tsx /tmp/warm.ts >/dev/null \
+ && rm -f /tmp/warm.ts \
+ && chmod -R a+rX /opt/node-cache
+
 WORKDIR /workspace
