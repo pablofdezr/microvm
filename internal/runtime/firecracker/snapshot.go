@@ -39,6 +39,11 @@ import (
 const (
 	snapStateFile = "state"
 	snapMemFile   = "mem"
+
+	// restoreReadyTimeout is how long a restored VM has to answer. It is longer
+	// than a cold boot's: a guest resumed from a snapshot re-establishes its vsock
+	// session slower than one that booted fresh.
+	restoreReadyTimeout = 90 * time.Second
 )
 
 var _ runtime.Snapshotter = (*Runtime)(nil)
@@ -175,7 +180,7 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 		_ = inst.Stop(ctx)
 		return nil, fmt.Errorf("restore: load snapshot: %w\n--- console ---\n%s", err, inst.consoleTail())
 	}
-	if err := inst.waitReady(ctx); err != nil {
+	if err := inst.waitReadyWithin(ctx, restoreReadyTimeout); err != nil {
 		_ = inst.Stop(ctx)
 		return nil, fmt.Errorf("restore: guest never became ready: %w", err)
 	}

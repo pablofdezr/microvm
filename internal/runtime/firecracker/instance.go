@@ -217,7 +217,15 @@ func (i *instance) killVMM(ctx context.Context) error {
 // The cgroup is the kernel's own record of what is running, and it cannot be
 // wrong about it.
 func (i *instance) waitReady(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, bootTimeout)
+	return i.waitReadyWithin(ctx, bootTimeout)
+}
+
+// waitReadyWithin is waitReady with an explicit deadline. The restore path uses
+// a longer one: a guest resumed from a snapshot re-accepts on vsock noticeably
+// slower than one that cold-booted, so a cold-boot-sized timeout would give up
+// on a VM that is still coming back.
+func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	ready := make(chan error, 1)
@@ -238,7 +246,7 @@ func (i *instance) waitReady(ctx context.Context) error {
 			return err
 
 		case <-ctx.Done():
-			return fmt.Errorf("sandbox did not answer within %v: %w", bootTimeout, ctx.Err())
+			return fmt.Errorf("sandbox did not answer within %v: %w", timeout, ctx.Err())
 
 		case <-ticker.C:
 			populated, err := i.group.Populated()
