@@ -8,6 +8,7 @@ FROM golang:1.26-trixie AS agent-builder
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
+COPY sdk/go/go.mod sdk/go/
 RUN go mod download
 COPY internal/ internal/
 COPY cmd/ cmd/
