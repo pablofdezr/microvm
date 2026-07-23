@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microvm"
+version = "0.1.0"
+description = "Client for the microvm daemon: run untrusted code in Firecracker microVMs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "pablofdezruiz" }]
+keywords = ["microvm", "firecracker", "sandbox"]
+# No runtime dependencies on purpose: the client is standard library only.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/pablofdezr/microvm"
+
+[tool.hatch.build.targets.wheel]
+packages = ["microvm"]

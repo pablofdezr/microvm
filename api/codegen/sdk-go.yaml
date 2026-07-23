@@ -1,0 +1,8 @@
+# The Go SDK's types. Same spec, separate module: an SDK user must not have to
+# compile netlink, vsock and Firecracker to make an HTTP call.
+package: microvm
+output: sdk/go/microvm/types.gen.go
+output-options:
+  skip-prune: true
+generate:
+  models: true

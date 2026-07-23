@@ -1,0 +1,48 @@
+{
+  "name": "microvm",
+  "version": "0.1.0",
+  "description": "Client for the microvm sandbox API: run untrusted code in Firecracker microVMs",
+  "keywords": [
+    "microvm",
+    "firecracker",
+    "sandbox",
+    "isolation",
+    "untrusted-code",
+    "vm",
+    "sdk"
+  ],
+  "homepage": "https://github.com/pablofdezr/microvm/tree/main/sdk/typescript#readme",
+  "bugs": "https://github.com/pablofdezr/microvm/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pablofdezr/microvm.git",
+    "directory": "sdk/typescript"
+  },
+  "license": "Apache-2.0",
+  "author": "pablofdezruiz",
+  "type": "module",
+  "main": "./dist/client.js",
+  "types": "./dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  },
+  "sideEffects": false,
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

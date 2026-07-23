@@ -1,0 +1,1203 @@
+openapi: 3.0.3
+
+# This file is the contract.
+#
+# The server's wire types, both SDKs and the reference docs are generated from
+# it, which is what keeps them from drifting: a field added here appears
+# everywhere, and a field added anywhere else appears nowhere. Hand-editing a
+# generated file is therefore always a bug -- change this and regenerate.
+#
+# The conventions are Stripe's, because they are the ones a developer already
+# knows: plural resource nouns, an `object` discriminator on every resource, a
+# `list` envelope, errors under a single `error` key, cursor pagination, and
+# Idempotency-Key on every unsafe method.
+#
+# Two deliberate departures, both because Stripe's choice is a legacy artefact
+# rather than a good idea:
+#
+#   Timestamps are RFC 3339 with milliseconds, not Unix seconds. This system
+#   meters in milliseconds and routinely runs sandboxes that live for less than
+#   a second; Unix-second timestamps would render `created` and `stopped`
+#   identical for them, which is not a cosmetic loss.
+#
+#   IDs are time-sortable (a ULID after the prefix). Stripe's IDs carry no
+#   order, so `starting_after` forces the server to look the cursor object up
+#   and page relative to it. Sortable IDs make the cursor self-describing, so
+#   pagination is exact and stable even while objects are being created.
+
+info:
+  title: microvm
+  version: "1.0.0"
+  description: |
+    Every sandbox is a real virtual machine with its own kernel. Code inside one
+    is assumed hostile.
+
+    There are two ways to run code, and the difference is the point:
+
+    - **Sandboxes** are held. You create one, run commands in it, and it is
+      yours until you stop it or its TTL elapses. Creation fails when the node
+      is full, so backpressure is yours to handle.
+    - **Tasks** are queued. You hand work to the fleet and it runs when a slot
+      frees anywhere. Submission never fails for capacity.
+
+    Use a sandbox for several commands sharing state; use a task for throughput.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://127.0.0.1:8080/v1
+    description: A local daemon. Bound to loopback by default, because this API creates VMs that run arbitrary code.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Sandboxes
+    description: A microVM you hold.
+  - name: Executions
+    description: A command run inside a sandbox.
+  - name: Files
+    description: Getting code in and results out.
+  - name: Tasks
+    description: Work handed to the fleet's queue.
+  - name: Images
+    description: The language runtimes this node can run.
+  - name: Queue
+    description: Depth of the queue and this node's slots.
+
+paths:
+  /sandboxes:
+    post:
+      operationId: createSandbox
+      summary: Create a sandbox
+      description: |
+        Boots a microVM and waits for it to answer. Returns once the sandbox is
+        ready to run commands.
+
+        Fails with `capacity_error` when the node has no room. That is
+        deliberate: a sandbox is a reservation, so the caller is told
+        immediately rather than left waiting. If you would rather wait, submit a
+        task.
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SandboxCreateParams' }
+      responses:
+        '201':
+          description: The sandbox is running and ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+        '500': { $ref: '#/components/responses/ApiError' }
+
+    get:
+      operationId: listSandboxes
+      summary: List sandboxes
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/StartingAfter'
+        - $ref: '#/components/parameters/EndingBefore'
+        - name: state
+          in: query
+          description: Only sandboxes in this state.
+          schema: { $ref: '#/components/schemas/SandboxState' }
+      responses:
+        '200':
+          description: A page of sandboxes, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /sandboxes/{sandbox}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    get:
+      operationId: retrieveSandbox
+      summary: Retrieve a sandbox
+      description: Returns the sandbox with live metering.
+      tags: [Sandboxes]
+      responses:
+        '200':
+          description: The sandbox.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    delete:
+      operationId: deleteSandbox
+      summary: Delete a sandbox
+      description: |
+        Kills the VM and releases everything it held.
+
+        Returns the sandbox with its final metering. Those numbers are sampled
+        before the kill and cannot be obtained afterwards: the cgroup that holds
+        them dies with the VM, so this reply is the only record of what the
+        sandbox cost.
+      tags: [Sandboxes]
+      responses:
+        '200':
+          description: The sandbox, stopped, with its final cost.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sandboxes/{sandbox}/executions:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: createExecution
+      summary: Run a command
+      description: |
+        Starts a command and returns immediately with the execution. It does not
+        wait for the command to finish.
+
+        To follow the output, stream the execution; to collect it afterwards,
+        retrieve it. Output is buffered on the host either way, so nothing is
+        lost between starting the command and connecting to its stream.
+      tags: [Executions]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionCreateParams' }
+      responses:
+        '201':
+          description: The command is running.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+    get:
+      operationId: listExecutions
+      summary: List a sandbox's executions
+      tags: [Executions]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/StartingAfter'
+        - $ref: '#/components/parameters/EndingBefore'
+      responses:
+        '200':
+          description: A page of executions, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecutionList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sandboxes/{sandbox}/executions/{execution}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      operationId: retrieveExecution
+      summary: Retrieve an execution
+      description: |
+        Returns the execution and everything it printed.
+
+        This works after the sandbox is gone. Output is buffered on the host
+        precisely because the moment you most need it -- a timeout, a TTL, the
+        OOM killer -- is the moment a guest-side buffer would die with the VM.
+      tags: [Executions]
+      responses:
+        '200':
+          description: The execution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sandboxes/{sandbox}/executions/{execution}/stream:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      operationId: streamExecution
+      summary: Stream an execution's output
+      description: |
+        Server-sent events, one per output chunk, as the process produces them.
+        The stream ends with an `exit` or `error` event.
+
+        The stream replays from the start of the execution, so connecting late
+        loses nothing and a dropped connection can simply reconnect. This is why
+        starting a command and streaming it are separate calls: a single call
+        that did both would make the output unrecoverable the moment the
+        connection broke.
+
+        SSE rather than WebSockets because the traffic is one-directional: there
+        is no upgrade, no ping/pong, and it survives any proxy that speaks HTTP.
+      tags: [Executions]
+      responses:
+        '200':
+          description: A stream of frames.
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/Frame' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sandboxes/{sandbox}/executions/{execution}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      operationId: cancelExecution
+      summary: Cancel an execution
+      description: |
+        Signals the process. The signal reaches the whole process group, so a
+        program that spawned children does not leave them running.
+
+        Defaults to SIGKILL. Hostile code is not owed a chance to clean up, and
+        a graceful signal it can ignore is a way to outlive its own cancel.
+      tags: [Executions]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionCancelParams' }
+      responses:
+        '200':
+          description: The execution.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sandboxes/{sandbox}/files:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: createFile
+      summary: Upload a file
+      description: Writes a file into the sandbox, creating parent directories.
+      tags: [Files]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileCreateParams' }
+      responses:
+        '201':
+          description: The file was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/File' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    get:
+      operationId: retrieveFile
+      summary: Download a file
+      description: |
+        The path is a query parameter rather than part of the route because a
+        file path contains slashes, and encoding them into a path segment would
+        make every caller escape their own paths to name a file.
+      tags: [Files]
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: Absolute path inside the sandbox.
+          schema: { type: string, example: "/app/out.json" }
+      responses:
+        '200':
+          description: The file's contents.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tasks:
+    post:
+      operationId: createTask
+      summary: Submit a task
+      description: |
+        Queues work for the fleet. Unlike creating a sandbox, this never fails
+        for capacity: the task waits for a slot on any node.
+
+        The queue is the source of truth. No node is told what to run; each
+        pulls when it has a free slot, which is why adding the three-hundredth
+        node needs no coordination and losing one needs no detection.
+      tags: [Tasks]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskCreateParams' }
+      responses:
+        '202':
+          description: The task is queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/QueueUnreachable' }
+
+  /tasks/{task}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      operationId: retrieveTask
+      summary: Retrieve a task
+      tags: [Tasks]
+      responses:
+        '200':
+          description: The task, with its result once it has one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/QueueUnreachable' }
+
+  /queue:
+    get:
+      operationId: retrieveQueue
+      summary: Retrieve the queue
+      description: |
+        The queue's depth, plus this node's slots.
+
+        `pending`, `leased`, `done` and `failed` describe the whole fleet's
+        queue. `slots` and `busy` describe *this node only*: no node knows the
+        fleet's capacity, and none needs to, which is exactly what lets a node
+        be added without telling anything else it exists.
+      tags: [Queue]
+      responses:
+        '200':
+          description: The queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Queue' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/QueueUnreachable' }
+
+  /images:
+    get:
+      operationId: listImages
+      summary: List images
+      description: The language runtimes this node can boot.
+      tags: [Images]
+      responses:
+        '200':
+          description: The images.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /tenants:
+    get:
+      operationId: listTenants
+      summary: List tenant policies
+      description: |
+        Every tenant with a storage policy set. **Admin only.** A tenant with no
+        policy is unlimited and does not appear here.
+      tags: [Tenants]
+      responses:
+        '200':
+          description: The configured tenants.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /tenants/{tenant}:
+    parameters:
+      - name: tenant
+        in: path
+        required: true
+        schema: { type: string }
+        description: The tenant namespace, e.g. from a sandbox's `storage.namespace`.
+    put:
+      operationId: updateTenant
+      summary: Set a tenant's storage policy
+      description: |
+        Set the storage cap and full-policy for a tenant. **Admin only.** This is
+        the one thing an admin key can do that a normal key cannot, and it is
+        powerful: `evict` deletes a tenant's oldest data to make room, so setting
+        it is a decision to allow that deletion.
+      tags: [Tenants]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TenantUpdateParams' }
+      responses:
+        '200':
+          description: The updated tenant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      operationId: retrieveTenant
+      summary: Retrieve a tenant's policy and usage
+      description: |
+        A tenant's cap, policy, and how much of the cap is used right now.
+        **Admin only.** The usage is read from the object store, so it is the
+        real total, not an estimate.
+      tags: [Tenants]
+      responses:
+        '200':
+          description: The tenant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /health:
+    get:
+      operationId: retrieveHealth
+      summary: Health check
+      description: Liveness. The one route that needs no credentials.
+      tags: [Queue]
+      security: []
+      responses:
+        '200':
+          description: The daemon is up.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <token>`. Tokens are compared in constant time.
+
+  parameters:
+    SandboxId:
+      name: sandbox
+      in: path
+      required: true
+      schema: { type: string, pattern: '^sb_[0-9A-HJKMNP-TV-Z]{26}$', example: "sb_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+
+    ExecutionId:
+      name: execution
+      in: path
+      required: true
+      schema: { type: string, pattern: '^exe_[0-9A-HJKMNP-TV-Z]{26}$', example: "exe_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+
+    TaskId:
+      name: task
+      in: path
+      required: true
+      schema: { type: string, pattern: '^tsk_[0-9A-HJKMNP-TV-Z]{26}$', example: "tsk_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+
+    Limit:
+      name: limit
+      in: query
+      description: How many objects to return, 1–100.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+
+    StartingAfter:
+      name: starting_after
+      in: query
+      description: |
+        A cursor. Returns the page of objects immediately after this ID, which
+        is the ID of the last object on the previous page.
+      schema: { type: string }
+
+    EndingBefore:
+      name: ending_before
+      in: query
+      description: |
+        A cursor, for paging backwards. Returns the page immediately before this
+        ID, which is the ID of the first object on the current page.
+      schema: { type: string }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: |
+        Makes a retry safe. A request that never got its reply -- a timeout, a
+        dropped connection -- cannot be known to have failed, so the only sane
+        move is to retry it; without a key, that retry runs the work twice.
+
+        The first request with a given key is executed and its reply recorded.
+        Any later request with the same key replays that reply, without doing
+        the work again. Keys are held for 24 hours and are scoped to the token.
+
+        Reusing a key with a *different* request body is an `idempotency_error`:
+        it means the client believes it is retrying something it is not.
+      schema: { type: string, maxLength: 255, example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
+
+  responses:
+    InvalidRequest:
+      description: The request is malformed or contradicts itself.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: The token is missing or wrong.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: |
+        The token is valid but lacks the power for this. Distinct from 401 on
+        purpose: 401 means "log in", 403 means "you are logged in and still may
+        not". Setting a tenant policy needs an admin key.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: No such object.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: The object already exists, or is in a state that forbids this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    CapacityExhausted:
+      description: This node has no free slot. Retry, or submit a task instead.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    QueueUnreachable:
+      description: |
+        The queue could not be reached, so nothing is known about the task. This
+        is deliberately not a 404: "we cannot ask" and "it does not exist" call
+        for opposite reactions from a client, and reporting the first as the
+        second would have a caller give up on work that is running fine.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    ApiError:
+      description: Something failed on our side.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    # --- errors -------------------------------------------------------------
+
+    ErrorEnvelope:
+      type: object
+      description: The body of every non-2xx reply.
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/Error' }
+
+    Error:
+      type: object
+      required: [type, code, message]
+      properties:
+        type:
+          $ref: '#/components/schemas/ErrorType'
+        code:
+          type: string
+          description: |
+            A stable, machine-readable identifier. Switch on this. The message is
+            for humans and may be reworded at any time.
+          example: "sandbox_not_found"
+        message:
+          type: string
+          description: A human-readable explanation. Never parse it.
+          example: "No such sandbox: sb_01JZ8QK3M4N5P6R7S8T9V0W1X2"
+        param:
+          type: string
+          description: Which request field was at fault, when one was.
+          example: "image"
+        request_id:
+          type: string
+          description: Quote this when reporting a problem.
+
+    ErrorType:
+      type: string
+      description: |
+        The class of error, which determines what a client should *do*:
+
+        - `invalid_request_error` — the request is wrong. Retrying it unchanged
+          will fail identically.
+        - `authentication_error` — the token is missing or wrong.
+        - `capacity_error` — no room right now. Retrying later may work; a task
+          would not have failed at all.
+        - `idempotency_error` — an Idempotency-Key was reused with a different
+          body.
+        - `api_error` — our fault. Safe to retry with the same Idempotency-Key.
+      enum:
+        - invalid_request_error
+        - authentication_error
+        - capacity_error
+        - idempotency_error
+        - api_error
+
+    # --- pagination ---------------------------------------------------------
+
+    ListEnvelope:
+      type: object
+      required: [object, url, has_more, data]
+      properties:
+        object: { type: string, enum: [list] }
+        url:
+          type: string
+          description: The endpoint this list came from.
+        has_more:
+          type: boolean
+          description: |
+            Whether more objects exist past this page. Page on with
+            `starting_after` set to the last ID in `data`.
+        data:
+          type: array
+          items:
+            type: object
+
+    # --- sandbox ------------------------------------------------------------
+
+    SandboxState:
+      type: string
+      enum: [running, stopped]
+
+    SandboxStopReason:
+      type: string
+      description: |
+        Why a sandbox stopped. `stopped` means you asked; the rest happened to
+        it, and only `failed` means something went wrong.
+      enum:
+        - stopped   # deleted by the caller
+        - expired   # its TTL elapsed
+        - idle      # nothing ran for its idle timeout
+        - failed    # the VM died
+
+    Sandbox:
+      type: object
+      required: [id, object, image, state, created, expires, stats]
+      properties:
+        id: { type: string, example: "sb_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+        object: { type: string, enum: [sandbox] }
+        image: { type: string, example: "python" }
+        state: { $ref: '#/components/schemas/SandboxState' }
+        stop_reason:
+          allOf: [{ $ref: '#/components/schemas/SandboxStopReason' }]
+          description: Set once the sandbox is stopped.
+        created: { type: string, format: date-time }
+        expires:
+          type: string
+          format: date-time
+          description: When the TTL kills it, whatever it is doing.
+        stopped: { type: string, nullable: true, format: date-time }
+        vcpus: { type: integer }
+        mem_mib: { type: integer }
+        network:
+          type: boolean
+          description: Whether filtered egress is on.
+        storage:
+          allOf: [{ $ref: '#/components/schemas/SandboxStorage' }]
+          description: |
+            Where this sandbox's files persist, when the node has object storage
+            configured. Absent when it does not.
+        stats: { $ref: '#/components/schemas/Stats' }
+
+    SandboxStorage:
+      type: object
+      description: |
+        A sandbox's view of object storage. Files written here outlive the
+        sandbox and are reachable by every sandbox in the same `namespace`, which
+        is how state is carried from one run to the next.
+      required: [namespace, read_only]
+      properties:
+        namespace:
+          type: string
+          description: |
+            The tenant your files live under, derived from your API key. It is
+            yours and stable: write a file today, read it from another sandbox
+            tomorrow. You cannot choose it — that is what stops one tenant from
+            naming another's.
+          example: "t_9f86d081884c7d659a2feaa0c55ad015"
+        read_only:
+          type: boolean
+          description: Whether this sandbox may write, or only read.
+        mount_path:
+          type: string
+          description: |
+            Where storage is mounted inside the guest, e.g. `/mnt/storage`. This
+            is a directory in your own sandbox, not a namespace, so choosing it
+            reaches nobody else's files. Defaults to `/mnt/storage`.
+          example: "/mnt/storage"
+        max_bytes:
+          type: integer
+          format: int64
+          description: |
+            Your tenant's total storage cap in bytes, or 0 for unlimited. This is
+            the limit your writes are measured against; it is set by an admin.
+        policy:
+          allOf: [{ $ref: '#/components/schemas/TenantFullPolicy' }]
+          description: What a write does when the cap is reached. Absent when there is no cap.
+
+    SandboxList:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Sandbox' }
+
+    Stats:
+      type: object
+      description: |
+        What a sandbox has consumed. Cumulative since boot, so a biller must
+        diff two samples: booting alone costs a couple of CPU-seconds, and
+        cumulative idle is meaningless for a sandbox's first seconds.
+      required: [active_cpu_ms, wall_ms, idle_ms, memory_current_bytes, memory_peak_bytes]
+      properties:
+        active_cpu_ms:
+          type: integer
+          description: |
+            CPU actually burned. **This is the billable number.** A sandbox
+            blocked on I/O bills nearly nothing: three seconds asleep costs
+            about 15ms of this.
+        wall_ms:
+          type: integer
+          description: How long the sandbox has existed.
+        idle_ms:
+          type: integer
+          description: |
+            `wall_ms` minus `active_cpu_ms`: existing but doing nothing. Zero
+            when a multi-vCPU sandbox burns more CPU than wall-clock.
+        memory_current_bytes: { type: integer }
+        memory_peak_bytes:
+          type: integer
+          description: The high-water mark, which is what a memory limit must be sized against.
+
+    SandboxCreateParams:
+      type: object
+      required: [image]
+      properties:
+        image:
+          type: string
+          description: The language image.
+          example: "python"
+        vcpus: { type: integer, minimum: 1, default: 1 }
+        mem_mib: { type: integer, minimum: 128, default: 256 }
+        cpu_cores:
+          type: number
+          format: double
+          description: A hard CPU ceiling; may be fractional. 0.5 means half a core, enforced.
+          example: 0.5
+        disk_mib: { type: integer }
+        network_bps:
+          type: integer
+          description: |
+            Caps bandwidth both ways, in bytes per second. Worth setting even
+            when CPU is capped: a sandbox pinned to a quarter core can still
+            saturate the host's uplink, and the first you hear of it is the
+            abuse complaint.
+        disk_bps: { type: integer }
+        disk_iops: { type: integer }
+        network:
+          type: boolean
+          default: false
+          description: |
+            Filtered egress. The public internet is reachable; every private
+            range, link-local and the cloud metadata endpoint are not.
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Injected into every execution in this sandbox. An execution's own
+            env wins where they overlap.
+
+            Write-only. These usually carry credentials, so they are never
+            logged and no endpoint returns them. They are applied by the host on
+            each execution rather than written into the guest's filesystem,
+            where anything inside could read them long after the command that
+            needed them.
+        ttl_seconds:
+          type: integer
+          default: 900
+          description: Maximum lifetime. The sandbox is killed when it elapses.
+        idle_seconds:
+          type: integer
+          default: 120
+          description: Reclaim after this long with nothing running. Negative disables it.
+        storage:
+          allOf: [{ $ref: '#/components/schemas/SandboxStorageParams' }]
+          description: |
+            Options for this sandbox's storage mount. The namespace is never set
+            here — it comes from your API key. Only the read/write posture is
+            yours to choose, and only to tighten.
+
+    SandboxStorageParams:
+      type: object
+      description: What a create request may say about storage, which is very little.
+      properties:
+        read_only:
+          type: boolean
+          description: |
+            Mount storage read-only for this sandbox even if the key could write.
+            It can only tighten: a read-only key stays read-only whatever you set
+            here. Useful for a run that should read shared state but never touch it.
+        mount_path:
+          type: string
+          description: |
+            Where to mount storage inside the guest. An absolute, clean path using
+            only letters, digits and `_-./`; it names a directory in your own
+            sandbox and cannot reach another tenant's files. Defaults to
+            `/mnt/storage`.
+          example: "/data"
+
+    # --- tenants (admin) ----------------------------------------------------
+
+    TenantFullPolicy:
+      type: string
+      description: |
+        What a write does when a tenant is at its cap.
+
+        - `preserve` — reject the write and keep what is stored. For data that
+          matters more than the next write: an audit trail, a paid-for dataset.
+        - `evict` — delete the oldest objects until the write fits. For a cache
+          or scratch space, where the newest data is the point. It deletes data,
+          irreversibly, which is why it is never the default.
+      enum: [preserve, evict]
+
+    Tenant:
+      type: object
+      required: [object, id, max_bytes, policy]
+      properties:
+        object: { type: string, enum: [tenant] }
+        id:
+          type: string
+          description: The tenant namespace this policy applies to.
+          example: "t_9f86d081884c7d659a2feaa0c55ad015"
+        max_bytes:
+          type: integer
+          format: int64
+          description: The tenant's total storage cap, in bytes. 0 means unlimited.
+        policy: { $ref: '#/components/schemas/TenantFullPolicy' }
+        usage_bytes:
+          type: integer
+          format: int64
+          description: |
+            Bytes currently stored, read from the object store on retrieve. Absent
+            on the reply to an update, which does not stop to scan the bucket.
+
+    TenantList:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Tenant' }
+
+    TenantUpdateParams:
+      type: object
+      required: [max_bytes, policy]
+      properties:
+        max_bytes:
+          type: integer
+          format: int64
+          description: The tenant's total storage cap, in bytes. 0 means unlimited.
+          example: 1073741824
+        policy: { $ref: '#/components/schemas/TenantFullPolicy' }
+
+    # --- execution ----------------------------------------------------------
+
+    ExecutionStatus:
+      type: string
+      description: |
+        Outcomes that all look like failure but are not, and a caller must tell
+        apart:
+
+        - `running` — still going.
+        - `exited` — your code ran to completion. `exit_code` is its own verdict.
+        - `timed_out` — it exceeded its timeout and we killed it.
+        - `canceled` — you cancelled it.
+        - `vanished` — **we took the VM away.** Your code did not fail.
+        - `failed` — the command could never start, e.g. no such binary.
+      enum: [running, exited, timed_out, canceled, vanished, failed]
+
+    Execution:
+      type: object
+      required: [id, object, sandbox, cmd, status, created, stdout, stderr]
+      properties:
+        id: { type: string, example: "exe_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+        object: { type: string, enum: [execution] }
+        sandbox: { type: string, example: "sb_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+        cmd: { type: string, example: "python3" }
+        args:
+          type: array
+          items: { type: string }
+        status: { $ref: '#/components/schemas/ExecutionStatus' }
+        exit_code: { type: integer, nullable: true }
+        signal:
+          type: string
+          nullable: true
+          description: The signal that killed it, if one did.
+          example: "SIGKILL"
+        error:
+          type: string
+          description: Why the command could never start. Set only when status is `failed`.
+        stdout: { type: string }
+        stderr: { type: string }
+        stdout_truncated:
+          type: boolean
+          description: |
+            Output exceeded the retention cap and the oldest bytes were dropped.
+            The *tail* is kept, because that is where a traceback is. Never
+            silently truncated: a partial log that looks complete is worse than
+            no log.
+        stderr_truncated: { type: boolean }
+        created: { type: string, format: date-time }
+        finished: { type: string, nullable: true, format: date-time }
+        duration_ms: { type: integer }
+
+    ExecutionList:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Execution' }
+
+    ExecutionCreateParams:
+      type: object
+      required: [cmd]
+      properties:
+        cmd: { type: string, example: "python3" }
+        args:
+          type: array
+          items: { type: string }
+          example: ["main.py"]
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: Merged over the sandbox's env; these win. Write-only.
+        cwd: { type: string }
+        stdin:
+          type: string
+          format: byte
+          description: Written to the process, then closed.
+        timeout_seconds:
+          type: integer
+          default: 300
+          description: Kills the process group when exceeded.
+
+    ExecutionCancelParams:
+      type: object
+      properties:
+        signal:
+          type: string
+          default: SIGKILL
+          description: The signal to send. It reaches the whole process group.
+          example: "SIGKILL"
+
+    # --- file ---------------------------------------------------------------
+
+    File:
+      type: object
+      required: [object, path, size_bytes]
+      properties:
+        object: { type: string, enum: [file] }
+        path: { type: string, example: "/app/main.py" }
+        size_bytes: { type: integer }
+
+    FileCreateParams:
+      type: object
+      required: [path, content]
+      properties:
+        path:
+          type: string
+          description: Absolute path inside the sandbox. Parent directories are created.
+          example: "/app/main.py"
+        content:
+          type: string
+          format: byte
+          description: The file's bytes, base64 encoded so binary survives the trip.
+
+    # --- task ---------------------------------------------------------------
+
+    TaskStatus:
+      type: string
+      description: |
+        - `pending` — waiting for a slot anywhere in the fleet.
+        - `running` — a node holds it.
+        - `done` — it ran. `exit_code` is your code's own verdict, and a
+          non-zero one is still `done`.
+        - `failed` — **our** failure: no node could run it, after its attempts
+          ran out.
+      enum: [pending, running, done, failed]
+
+    Task:
+      type: object
+      required: [id, object, status]
+      properties:
+        id: { type: string, example: "tsk_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
+        object: { type: string, enum: [task] }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        exit_code: { type: integer, nullable: true }
+        stdout: { type: string }
+        stderr: { type: string }
+        error:
+          type: string
+          description: |
+            An infrastructure failure. Distinct from a non-zero exit, which is
+            the caller's own code and not a failure of ours.
+        attempts:
+          type: integer
+          description: |
+            How many tries it took. Retries are for nodes dying, not for code
+            failing: a task whose process exits non-zero is never retried, or a
+            caller's bug would be run repeatedly and billed for each attempt.
+        created: { type: string, format: date-time }
+        started: { type: string, nullable: true, format: date-time }
+        finished: { type: string, nullable: true, format: date-time }
+        active_cpu_ms: { type: integer }
+        memory_peak_bytes: { type: integer }
+
+    TaskCreateParams:
+      type: object
+      required: [image, cmd]
+      properties:
+        image: { type: string, example: "python" }
+        cmd: { type: string, example: "python3" }
+        args:
+          type: array
+          items: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: Write-only.
+        files:
+          type: object
+          additionalProperties:
+            type: string
+            format: byte
+          description: Written into the sandbox before the command runs, keyed by path.
+          example: {"/app/main.py": "cHJpbnQoImhpIik="}
+        timeout_seconds: { type: integer, default: 300 }
+        network: { type: boolean, default: false }
+        vcpus: { type: integer, default: 1 }
+        mem_mib: { type: integer, default: 256 }
+        cpu_cores: { type: number, format: double }
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+          description: |
+            Scheduling priority, 0 to 10. Higher runs first; equal priorities are
+            FIFO, which is the guarantee callers actually reason about. It orders
+            the queue within what a node can fit: among the tasks a node has room
+            for, the highest priority is taken first, so a high-priority task that
+            does not fit yields to a lower one that does rather than blocking it.
+        max_attempts:
+          type: integer
+          default: 2
+          description: |
+            How many times a node may try this before it is failed for good. Two
+            means one retry: enough to survive a node dying, few enough that a
+            task which reliably kills its worker cannot cycle the fleet forever.
+
+    # --- queue, images, health ----------------------------------------------
+
+    Queue:
+      type: object
+      required: [object, pending, leased, done, failed, oldest_pending_ms, slots, busy]
+      properties:
+        object: { type: string, enum: [queue] }
+        pending: { type: integer }
+        leased:
+          type: integer
+          description: Held by a worker somewhere in the fleet.
+        done: { type: integer }
+        failed: { type: integer }
+        oldest_pending_ms:
+          type: integer
+          description: |
+            How long the head of the queue has waited. This is the number that
+            says whether the fleet is big enough.
+        slots:
+          type: integer
+          description: This node's slots. Not the fleet's.
+        busy:
+          type: integer
+          description: This node's slots currently running something.
+
+    Image:
+      type: object
+      required: [object, id, language]
+      properties:
+        object: { type: string, enum: [image] }
+        id: { type: string, example: "python" }
+        language: { type: string, example: "python" }
+        arch: { type: string, example: "arm64" }
+        size_bytes: { type: integer }
+
+    ImageList:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/Image' }
+
+    Health:
+      type: object
+      required: [object, ok, version]
+      properties:
+        object: { type: string, enum: [health] }
+        ok: { type: boolean }
+        version: { type: string }
+
+    # --- streaming ----------------------------------------------------------
+
+    Frame:
+      type: object
+      description: One event in an execution's stream, sent as an SSE data payload.
+      required: [object, type]
+      properties:
+        object: { type: string, enum: [frame] }
+        type:
+          type: string
+          enum: [started, stdout, stderr, exit, error]
+        data:
+          type: string
+          format: byte
+          description: The chunk, base64 so binary output survives the trip.
+        pid: { type: integer }
+        exit_code: { type: integer, nullable: true }
+        signal: { type: string }
+        timed_out: { type: boolean }
+        message: { type: string }

@@ -1,0 +1,40 @@
+# Build artifacts and VM images (rootfs ext4 images, kernels)
+/build/
+
+# Compiled daemon, CLI and agent binaries (produced by `go build`)
+/microvm
+/microvmd
+/microvm-agent
+*.exe
+
+# Go
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Node / TypeScript SDK
+node_modules/
+sdk/typescript/dist/
+*.tsbuildinfo
+
+# Python SDK
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+sdk/python/build/
+sdk/python/dist/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

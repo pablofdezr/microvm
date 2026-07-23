@@ -1,0 +1,9 @@
+# Server-side wire types. Models only: the routing is hand-written, because a
+# generated server stub would own the shape of the handlers and this codebase
+# wants the handlers to stay thin adapters over the core.
+package: apitypes
+output: internal/api/apitypes/types.gen.go
+output-options:
+  skip-prune: true          # every schema is part of the contract, even if no route names it yet
+generate:
+  models: true
