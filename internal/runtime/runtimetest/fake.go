@@ -20,6 +20,7 @@ import (
 
 	"github.com/pablofdezr/microvm/internal/protocol"
 	"github.com/pablofdezr/microvm/internal/runtime"
+	"github.com/pablofdezr/microvm/internal/vmgenid"
 )
 
 // Runtime is a runtime.Runtime that creates fake sandboxes.
@@ -47,6 +48,10 @@ type Runtime struct {
 	// specs records every spec Create was handed, so a test can assert what the
 	// manager decided before boot -- the storage kernel-cmdline flags among it.
 	specs []runtime.Spec
+	// snapshots and restored record the Snapshotter calls, so a warm pool test can
+	// assert a VM was restored rather than cold-booted, without any KVM.
+	snapshots []runtime.SnapshotRef
+	restored  int
 }
 
 // Output is a scripted command's result.
@@ -125,6 +130,55 @@ func (r *Runtime) LastSpec() (runtime.Spec, bool) {
 		return runtime.Spec{}, false
 	}
 	return r.specs[len(r.specs)-1], true
+}
+
+// Snapshot implements runtime.Snapshotter: it records a snapshot of inst and
+// leaves inst stopped, exactly as a real backend would.
+func (r *Runtime) Snapshot(ctx context.Context, inst runtime.Instance) (runtime.SnapshotRef, error) {
+	fi, ok := inst.(*Instance)
+	if !ok {
+		return runtime.SnapshotRef{}, fmt.Errorf("runtimetest: not a fake instance")
+	}
+	ref := runtime.SnapshotRef{
+		Dir:    "fake-snapshot-" + fi.id,
+		Digest: vmgenid.DigestOf([]byte(fi.id)),
+	}
+	_ = inst.Stop(ctx) // Snapshot leaves the source VM stopped.
+	r.mu.Lock()
+	r.snapshots = append(r.snapshots, ref)
+	r.mu.Unlock()
+	return ref, nil
+}
+
+// Restore implements runtime.Snapshotter: it returns a fresh instance under
+// spec's identity, as if loaded from ref.
+func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.SnapshotRef) (runtime.Instance, error) {
+	inst := &Instance{
+		id:       spec.ID,
+		rt:       r,
+		files:    make(map[string][]byte),
+		stopped:  make(chan struct{}),
+		listener: NewListener(),
+	}
+	r.mu.Lock()
+	r.instances[spec.ID] = inst
+	r.restored++
+	r.mu.Unlock()
+	return inst, nil
+}
+
+// Restored reports how many instances were restored from a snapshot.
+func (r *Runtime) Restored() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.restored
+}
+
+// Snapshots returns the refs Snapshot produced.
+func (r *Runtime) Snapshots() []runtime.SnapshotRef {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]runtime.SnapshotRef(nil), r.snapshots...)
 }
 
 // Instance is a fake running sandbox.
@@ -347,4 +401,5 @@ var (
 	_ runtime.Runtime     = (*Runtime)(nil)
 	_ runtime.Instance    = (*Instance)(nil)
 	_ runtime.GuestClient = (*client)(nil)
+	_ runtime.Snapshotter = (*Runtime)(nil)
 )

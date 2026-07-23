@@ -182,3 +182,43 @@ type GuestClient interface {
 // a change to either side is a compile error in this package rather than a
 // surprise at the one call site that happens to run first.
 var _ GuestClient = (*guestclient.Client)(nil)
+
+// SnapshotRef identifies a saved VM snapshot on disk.
+type SnapshotRef struct {
+	// Dir holds the snapshot's state and memory files.
+	Dir string
+
+	// Image, VCPUs and MemMiB are the shape the snapshot was frozen from. A
+	// restore only reuses a snapshot into a request of the same shape, since the
+	// memory image encodes them.
+	Image  string
+	VCPUs  int
+	MemMiB int
+
+	// Digest is a content hash of the snapshot. It is bound into the per-restore
+	// entropy token (see internal/vmgenid) so a token minted for one snapshot
+	// cannot be replayed against another.
+	Digest string
+}
+
+// Snapshotter is an optional capability a runtime may implement: freezing a
+// running VM to disk and booting fresh VMs from that image. It is a separate
+// interface, not part of Runtime, so a backend without it (the container or
+// gVisor backends, say) is not forced to fake one -- callers type-assert for it.
+//
+// Restore is what makes a warm pool cheap: a snapshot loads in tens of
+// milliseconds where a cold boot takes hundreds. But a snapshot is a copy of
+// RAM, so every VM restored from one starts with identical state, including its
+// CSPRNG. Restore therefore MUST reseed the guest's entropy before it returns a
+// usable VM, or restored VMs share keys. The digest on SnapshotRef exists for
+// exactly that reseed (see internal/vmgenid).
+type Snapshotter interface {
+	// Snapshot pauses inst, writes a snapshot, and leaves inst stopped. The
+	// snapshot must be taken from a VM that has run no untrusted code, so every
+	// restore begins from a clean, pristine state.
+	Snapshot(ctx context.Context, inst Instance) (SnapshotRef, error)
+
+	// Restore boots a fresh VM from ref under spec's identity, reseeds its
+	// entropy, and returns it ready to use.
+	Restore(ctx context.Context, spec Spec, ref SnapshotRef) (Instance, error)
+}
