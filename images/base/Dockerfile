@@ -11,8 +11,12 @@ ARG TARGETARCH
 WORKDIR /src
 
 # Copy the manifests first so dependency download caches independently of the
-# source, which changes far more often.
+# source, which changes far more often. The main module replaces the Go SDK with
+# the local ./sdk/go, so that module's go.mod must be present for `go mod
+# download` to resolve the replacement (the SDK has no dependencies of its own,
+# so its go.mod alone is enough -- no source needed to build the agent).
 COPY go.mod go.sum ./
+COPY sdk/go/go.mod sdk/go/
 RUN go mod download
 
 COPY internal/ internal/
