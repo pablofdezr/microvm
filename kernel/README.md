@@ -31,3 +31,8 @@ install -D -m 0644 build/vmlinux /var/lib/microvm/vmlinux
 `ARCH` (`arm64` | `amd64`) and `KERNEL_VERSION` (a `6.1.x` release) are
 overridable via `-e`. The build needs no root on the host — it runs entirely
 inside the container.
+
+The output is always installed as `vmlinux`, but the on-disk format differs by
+architecture, because Firecracker loads different formats: an ELF `vmlinux` on
+x86_64, and the PE-format arm64 `Image` on aarch64 (an ELF there fails with
+"invalid Image magic number"). The builder produces the right one for `ARCH`.

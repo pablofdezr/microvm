@@ -51,8 +51,18 @@ make ARCH="$KARCH" olddefconfig
 echo "==> config check (these must read =y)"
 grep -E 'CONFIG_DM_VERITY|CONFIG_DM_INIT|CONFIG_BLK_DEV_DM=|CONFIG_FUSE_FS=|CONFIG_OVERLAY_FS=' .config
 
-echo "==> building vmlinux with $(nproc) jobs"
-make ARCH="$KARCH" vmlinux -j"$(nproc)"
+# Firecracker loads a different kernel format per architecture: an ELF vmlinux on
+# x86_64, but the PE-format arm64 Image on aarch64 (feeding it a vmlinux there
+# fails with "invalid Image magic number"). Build the one Firecracker expects.
+case "$ARCH" in
+  arm64) target=Image; artifact=arch/arm64/boot/Image ;;
+  amd64) target=vmlinux; artifact=vmlinux ;;
+esac
 
-install -D -m 0644 vmlinux /out/vmlinux
-echo "==> wrote /out/vmlinux ($(du -h vmlinux | cut -f1))"
+echo "==> building $target with $(nproc) jobs"
+make ARCH="$KARCH" "$target" -j"$(nproc)"
+
+# Installed as "vmlinux" to match the daemon's default -kernel path, whatever the
+# on-disk format actually is.
+install -D -m 0644 "$artifact" /out/vmlinux
+echo "==> wrote /out/vmlinux ($(du -h "$artifact" | cut -f1), $target format)"
