@@ -18,6 +18,11 @@ node_modules/
 sdk/typescript/dist/
 *.tsbuildinfo
 
+# npm auth / secrets — never commit
+.npmrc
+.env
+.env.*
+
 # Python SDK
 __pycache__/
 *.py[cod]

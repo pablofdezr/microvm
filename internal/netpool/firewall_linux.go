@@ -56,10 +56,15 @@ table inet {{.Table}} {
 		type ipv6_addr
 		flags interval
 		elements = {
-			::1/128,            # loopback
-			fc00::/7,           # unique local
-			fe80::/10,          # link-local
-			ff00::/8            # multicast
+			::1/128,             # loopback
+			::ffff:0.0.0.0/96,   # IPv4-mapped: a blocked v4 target must not become
+			                     # reachable by expressing it in v6 form
+			64:ff9b::/96,        # NAT64 well-known prefix: on a host with NAT64 this
+			                     # translates straight to a (blocked) v4 destination
+			fc00::/7,            # unique local
+			fe80::/10,           # link-local
+			2001:db8::/32,       # documentation range
+			ff00::/8             # multicast
 		}
 	}
 

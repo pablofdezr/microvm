@@ -1,0 +1,87 @@
+# Publish the TypeScript SDK (sdk/typescript) to npm.
+#
+# Pattern adapted from tinylabscom/mvm (Apache-2.0): validate name/version
+# consistency, build, smoke-test the tarball against a clean install, then
+# publish with provenance. Provenance needs `id-token: write` and a publish
+# from GitHub Actions (OIDC), which is why this lives in CI and not a laptop.
+#
+# Requires repo secret NPM_TOKEN (an npm "Automation" token, which bypasses 2FA).
+name: publish-npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and smoke-test but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance (SLSA attestation)
+
+defaults:
+  run:
+    working-directory: sdk/typescript
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: npm ci
+
+      - name: Version/name consistency
+        # On a release, the tag (e.g. v0.1.0 or sdk-v0.1.0) must match the
+        # version in package.json. Catch a forgotten version bump before we
+        # publish something mislabelled.
+        if: github.event_name == 'release'
+        run: |
+          pkg_name=$(node -p "require('./package.json').name")
+          pkg_ver=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#*v}"
+          echo "package: $pkg_name@$pkg_ver, tag: $tag"
+          if [ "$pkg_ver" != "$tag" ]; then
+            echo "::error::package.json version ($pkg_ver) != release tag ($tag)"
+            exit 1
+          fi
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack
+        run: npm pack --pack-destination /tmp/pkg
+
+      - name: Smoke-test the tarball
+        # Install the exact artifact we are about to publish into a throwaway
+        # project and assert the public entry point actually loads and exports
+        # what callers import. Catches broken "files"/exports before publish.
+        run: |
+          tarball=$(ls /tmp/pkg/*.tgz)
+          work=$(mktemp -d)
+          cd "$work"
+          npm init -y >/dev/null
+          npm install "$tarball" >/dev/null
+          node --input-type=module -e "
+            import { Client } from 'microvm';
+            if (typeof Client !== 'function') {
+              console.error('Client export missing from published package');
+              process.exit(1);
+            }
+            console.log('smoke test ok: Client is exported');
+          "
+
+      - name: Publish
+        if: github.event_name == 'release' || inputs.dry_run == false
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
