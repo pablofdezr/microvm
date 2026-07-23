@@ -97,10 +97,12 @@ one. Either:
 
 - use a prebuilt kernel from Firecracker's own quickstart / CI artifacts (see the
   [Firecracker getting-started guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)), or
-- build one from source with their recommended microVM config.
+- build one from source, or use the reproducible builder this repo ships in
+  [`kernel/`](kernel/): it starts from Firecracker's config and adds the options
+  microvm needs, so its output boots verified images out of the box.
 
-> For **verified boot** (§5), the kernel additionally needs `CONFIG_DM_VERITY=y`
-> and `CONFIG_DM_INIT=y`.
+> For **verified boot** (§5) a kernel needs `CONFIG_DM_VERITY=y` and
+> `CONFIG_DM_INIT=y`; the `kernel/` builder enables both.
 
 The `vmlinux` architecture must match the host. Place it where the daemon expects
 it (default `/var/lib/microvm/vmlinux`, overridable with `-kernel`):
