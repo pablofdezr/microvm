@@ -102,13 +102,19 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 		return nil, fmt.Errorf("restore: snapshots are disabled (no SnapshotDir)")
 	}
 
+	jailID := newJailID()
+	if err := r.checkVsockPath(jailID); err != nil {
+		return nil, err
+	}
 	inst := &instance{
 		id:      spec.ID,
-		jailID:  newJailID(),
+		jailID:  jailID,
 		runtime: r,
-		log:     r.log.With("sandbox", spec.ID),
+		log:     r.log.With("sandbox", spec.ID, "jail", jailID),
 		started: time.Now(),
-		exited:  make(chan struct{}),
+		// The cgroup the jailer creates, at <slice>/<jail-id>; waitReady polls it
+		// for the guest coming up, so it must be set before startForRestore runs.
+		group: r.slice.Child(jailID),
 	}
 
 	if spec.Network {
