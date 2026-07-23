@@ -410,7 +410,7 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
         <div class="card">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13H11l-1 9 9-12h-6.5z"/></svg></div>
           <h3>Fast cold starts <span class="new">NEW</span></h3>
-          <p>Warm build caches baked into the images — a cold Go build drops from ~37s to under a second — plus a pool of pre-booted VMs and Firecracker snapshots that restore in milliseconds.</p>
+          <p>Warm build caches baked into the images — a cold Go run drops from ~27s to ~2.4s, node ~3s to ~1.3s — plus a pool of pre-booted VMs that skips the boot entirely.</p>
         </div>
         <div class="card">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
@@ -472,11 +472,11 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
             <tr><td><span class="name">python</span></td><td class="num">127 MB</td><td class="num">164 ms</td></tr>
             <tr><td><span class="name">node</span> <span style="color:var(--faint)">· TypeScript via tsx</span></td><td class="num">278 MB</td><td class="num">3.2 s</td></tr>
             <tr><td><span class="name">rust</span></td><td class="num">801 MB</td><td class="num">1.4 s</td></tr>
-            <tr><td><span class="name">go</span> <span style="color:var(--faint)">· compiles cold, no cache</span></td><td class="num">914 MB</td><td class="num">27 s</td></tr>
+            <tr><td><span class="name">go</span> <span style="color:var(--faint)">· Alpine, compiles cold, no cache</span></td><td class="num">620 MB</td><td class="num">27 s</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="table-note">A warm build cache cuts a cold Go build ~58× (37s → ~0.5s, measured); a warm pool and Firecracker snapshots cut the boot itself.</p>
+      <p class="table-note">Measured end to end on a Pi 5: a baked warm cache cuts a cold Go run ~27s → ~2.4s (and node ~3s → ~1.3s); a warm pool skips the boot for the rest.</p>
     </div>
   </section>
 

@@ -283,14 +283,27 @@ optimizations below improve on:
 Go and Rust are large because running their code means compiling it, which is
 also why their cold runs are dominated by the compile rather than the boot.
 
+Measured end to end (full `microvm run`, steady state with the image hot in the
+host page cache, on a Pi 5):
+
+| Image | Cold run, no cache | With the baked cache |
+|---|---|---|
+| python | ~0.5 s | — (interpreted) |
+| node (tsx) | ~3 s | **~1.3 s** |
+| go (Alpine) | ~27 s | **~2.4 s** |
+| rust | ~1.4 s | **~1 s** (mold) |
+
 **Cold starts** are attacked in three layers, each opt-in and independent:
 
 - **Warm build caches** baked into each image. Go 1.20+ ships no precompiled
-  standard library, so a cold `go build` recompiles everything it imports — ~37s
+  standard library, so a cold `go build` recompiles everything it imports — ~27s
   on a Pi 5. A `GOCACHE` prewarmed with `go build std`, baked into the read-only
-  rootfs and read through the guest's overlay, cuts that to well under a second
-  (measured: 37s → ~0.5s). Node ships a warm `NODE_COMPILE_CACHE`; Rust links
-  with `mold`.
+  rootfs and read through the guest's overlay, cuts that to **~2.4s** inside a
+  sandbox. (The same cache builds in single-digit milliseconds in the image
+  itself; the gap is the read-only rootfs + overlay + virtio-blk the guest reads
+  the cache through, and it degrades further when a busy node's page cache is
+  contended — so this is a real win but not the sub-second a raw build sees.)
+  Node ships a warm `NODE_COMPILE_CACHE` (~3s → ~1.3s); Rust links with `mold`.
 - **A warm pool** of pristine pre-booted VMs (`-warm image:vcpus:mem:count`), so
   a task skips the boot entirely. Each pooled VM is a distinct VM that has run no
   code, so handing one out keeps the one-sandbox-per-task rule — no snapshot
