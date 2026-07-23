@@ -1,5 +1,8 @@
 # microvm
 
+[![npm](https://img.shields.io/npm/v/@pablofdezr/microvm?logo=npm)](https://www.npmjs.com/package/@pablofdezr/microvm)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Run untrusted code — Go, Python, TypeScript, Rust — in Firecracker microVMs, on
 your own hardware. Written entirely in Go.
 
@@ -397,7 +400,15 @@ for sb, err := range client.Sandboxes.All(ctx, microvm.SandboxListParams{}) {
 
 ### TypeScript
 
+On npm as **[`@pablofdezr/microvm`](https://www.npmjs.com/package/@pablofdezr/microvm)** — ESM, Node ≥ 18, zero runtime dependencies.
+
+```
+npm install @pablofdezr/microvm
+```
+
 ```ts
+import { Client } from "@pablofdezr/microvm";
+
 const client = new Client("http://127.0.0.1:8080", { token });
 
 const sb = await client.sandboxes.create({ image: "python" });
