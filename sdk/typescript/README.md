@@ -5,13 +5,13 @@ microVMs. ESM, Node ≥ 18, zero runtime dependencies (it uses the built-in
 `fetch`). Types are generated from the same OpenAPI spec as the server.
 
 ```
-npm install microvm
+npm install @pablofdezr/microvm
 ```
 
 ## Quick start
 
 ```ts
-import { Client } from "microvm";
+import { Client } from "@pablofdezr/microvm";
 
 const client = new Client("http://127.0.0.1:8080", { token });
 

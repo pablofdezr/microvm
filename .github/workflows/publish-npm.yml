@@ -72,7 +72,7 @@ jobs:
           npm init -y >/dev/null
           npm install "$tarball" >/dev/null
           node --input-type=module -e "
-            import { Client } from 'microvm';
+            import { Client } from '@pablofdezr/microvm';
             if (typeof Client !== 'function') {
               console.error('Client export missing from published package');
               process.exit(1);
