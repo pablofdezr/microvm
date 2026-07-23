@@ -182,6 +182,11 @@ type Manager struct {
 	// said which bucket to spend it in should not be guessing.
 	storage storage.Backend
 
+	// warm holds pre-booted pristine VMs, or nil when the pool is not configured.
+	// It amortizes cold-boot latency without weakening the one-sandbox-per-task
+	// rule, since each pooled VM is a distinct VM that has run no code.
+	warm *warmPool
+
 	mu        sync.RWMutex
 	sandboxes map[string]*Sandbox
 }
@@ -198,6 +203,16 @@ func WithStorage(backend storage.Backend) Option {
 	return func(m *Manager) { m.storage = backend }
 }
 
+// WithWarmPool pre-boots and maintains a stock of pristine VMs for the given
+// shapes, so a task of a matching shape is served without waiting for a cold
+// boot. Each pooled VM is a distinct, never-used VM, so handing one to a task
+// preserves the one-sandbox-per-task invariant. The pool is only consulted for
+// sandboxes with no object storage, since storage binds to a sandbox's own
+// prefix at boot and a pooled VM cannot carry it.
+func WithWarmPool(specs []WarmSpec) Option {
+	return func(m *Manager) { m.warm = newWarmPool(m.rt, m.log, specs) }
+}
+
 // NewManager returns a Manager over a runtime.
 func NewManager(rt runtime.Runtime, logs *logstore.Store, log *slog.Logger, opts ...Option) *Manager {
 	m := &Manager{
@@ -209,6 +224,7 @@ func NewManager(rt runtime.Runtime, logs *logstore.Store, log *slog.Logger, opts
 	for _, opt := range opts {
 		opt(m)
 	}
+	m.warm.start() // no-op when unconfigured or nil
 	return m
 }
 
@@ -262,9 +278,17 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 	// the mount should appear. serveStorage still owns the socket and the store.
 	m.applyStorageBoot(&spec)
 
-	inst, err := m.rt.Create(ctx, spec.Spec)
-	if err != nil {
-		return nil, err
+	// Serve from the warm pool when a pristine VM of this shape is ready; fall
+	// back to a cold boot otherwise. The pool is skipped whenever the sandbox has
+	// object storage, because storage is bound to the sandbox's own prefix on the
+	// boot command line and a pre-booted VM cannot carry it.
+	inst := m.acquireWarm(spec)
+	if inst == nil {
+		var err error
+		inst, err = m.rt.Create(ctx, spec.Spec)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()
@@ -310,6 +334,21 @@ func (m *Manager) applyStorageBoot(spec *Spec) {
 	}
 	spec.Spec.StorageMount = mount.MountPoint()
 	spec.Spec.StorageReadOnly = mount.ReadOnly
+}
+
+// acquireWarm returns a pre-booted VM for this spec when the warm pool has a
+// compatible one, or nil to fall back to a cold boot. It applies only when the
+// sandbox has no object storage: storage binds to the sandbox's own prefix at
+// boot, so a VM pre-booted for the pool cannot carry it.
+func (m *Manager) acquireWarm(spec Spec) runtime.Instance {
+	if m.warm == nil || spec.Spec.StorageMount != "" {
+		return nil
+	}
+	inst := m.warm.checkout(warmKeyOf(spec.Spec))
+	if inst != nil {
+		m.log.Debug("served from warm pool", "sandbox", spec.ID, "image", spec.Image)
+	}
+	return inst
 }
 
 // serveStorage starts this sandbox's private storage server, if it has one.
@@ -421,6 +460,10 @@ func (m *Manager) List() []*Sandbox {
 
 // Close stops every sandbox.
 func (m *Manager) Close(ctx context.Context) error {
+	// Drain the warm pool first, so it stops minting VMs while we are tearing the
+	// live ones down.
+	m.warm.close(ctx)
+
 	var errs []error
 	for _, sb := range m.List() {
 		if err := sb.Stop(ctx, ReasonStopped); err != nil {

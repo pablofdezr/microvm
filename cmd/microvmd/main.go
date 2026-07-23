@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -43,6 +44,7 @@ type config struct {
 	slots  int
 	cpu    float64
 	memMiB int
+	warm   string
 
 	redisAddr   string
 	redisPrefix string
@@ -88,6 +90,8 @@ func main() {
 	flag.IntVar(&cfg.slots, "slots", 0, "max concurrent VMs for queued tasks (0 disables the queue worker)")
 	flag.Float64Var(&cfg.cpu, "cpu", 0,
 		"schedulable CPU cores for queued tasks; tasks are packed so their CPU never exceeds this. 0 means unbounded (pack by -slots and -mem only). Set it on a shared or heterogeneous host")
+	flag.StringVar(&cfg.warm, "warm", "",
+		"comma-separated warm-pool shapes to pre-boot, image:vcpus:mem:count (e.g. python-arm64.ext4:2:512:2); each shape keeps that many pristine VMs ready to skip the cold boot")
 	flag.IntVar(&cfg.memMiB, "mem", 0,
 		"schedulable memory in MiB for queued tasks; tasks are packed so their memory never exceeds this. 0 means unbounded. Memory is the dimension that must not oversubscribe, so set it whenever tasks vary in size")
 	flag.StringVar(&cfg.redisAddr, "redis", "",
@@ -199,6 +203,11 @@ func run(cfg config, log *slog.Logger) error {
 		}
 		opts = append(opts, sandbox.WithStorage(backend))
 		log.Info("sandbox storage enabled", "bucket", cfg.s3Bucket)
+	}
+
+	if specs := parseWarmSpecs(cfg.warm, log); len(specs) > 0 {
+		opts = append(opts, sandbox.WithWarmPool(specs))
+		log.Info("warm pool enabled", "shapes", len(specs))
 	}
 
 	mgr := sandbox.NewManager(rt, logs, log, opts...)
@@ -332,6 +341,38 @@ func sweepLogs(ctx context.Context, logs *logstore.Store, retention time.Duratio
 			}
 		}
 	}
+}
+
+// parseWarmSpecs turns the -warm flag ("image:vcpus:mem:count,...") into warm
+// pool shapes. A malformed entry is logged and skipped rather than failing the
+// daemon: a typo in a performance knob should not stop it serving. Warm VMs are
+// booted without networking, so only network-less tasks of a matching shape are
+// served from the pool.
+func parseWarmSpecs(s string, log *slog.Logger) []sandbox.WarmSpec {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []sandbox.WarmSpec
+	for _, entry := range strings.Split(s, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(entry, ":")
+		if len(parts) != 4 {
+			log.Warn("ignoring malformed -warm entry (want image:vcpus:mem:count)", "entry", entry)
+			continue
+		}
+		vcpus, err1 := strconv.Atoi(parts[1])
+		mem, err2 := strconv.Atoi(parts[2])
+		count, err3 := strconv.Atoi(parts[3])
+		if parts[0] == "" || err1 != nil || err2 != nil || err3 != nil || vcpus <= 0 || mem <= 0 || count <= 0 {
+			log.Warn("ignoring invalid -warm entry", "entry", entry)
+			continue
+		}
+		out = append(out, sandbox.WarmSpec{Image: parts[0], VCPUs: vcpus, MemMiB: mem, Count: count})
+	}
+	return out
 }
 
 // listImages reports which images the node can actually run, from what is on
