@@ -278,7 +278,7 @@ optimizations below improve on:
 | python | 127 MB | 164 ms |
 | node (TypeScript via tsx) | 278 MB | 3.2 s |
 | rust | 801 MB | 1.4 s |
-| go | 914 MB | 27 s (compiles cold, no cache) |
+| go | ~620 MB (Alpine) | 27 s (compiles cold, no cache) |
 
 Go and Rust are large because running their code means compiling it, which is
 also why their cold runs are dominated by the compile rather than the boot.

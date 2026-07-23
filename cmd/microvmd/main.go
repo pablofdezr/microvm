@@ -94,7 +94,7 @@ func main() {
 	flag.StringVar(&cfg.warm, "warm", "",
 		"comma-separated warm-pool shapes to pre-boot, image:vcpus:mem:count (e.g. python-arm64.ext4:2:512:2); each shape keeps that many pristine VMs ready to skip the cold boot")
 	flag.StringVar(&cfg.snapshotDir, "snapshot-dir", "",
-		"enable Firecracker snapshots (VMs boot with the API socket) and store them here; the warm pool then fills by restoring from a template snapshot instead of cold-booting")
+		"EXPERIMENTAL: enable Firecracker snapshots (VMs boot with the API socket) and store them here; the warm pool tries to fill by restoring a template snapshot, falling back to cold boot (the restored guest's vsock reconnect is not yet solved)")
 	flag.IntVar(&cfg.memMiB, "mem", 0,
 		"schedulable memory in MiB for queued tasks; tasks are packed so their memory never exceeds this. 0 means unbounded. Memory is the dimension that must not oversubscribe, so set it whenever tasks vary in size")
 	flag.StringVar(&cfg.redisAddr, "redis", "",

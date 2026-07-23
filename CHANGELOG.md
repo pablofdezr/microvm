@@ -22,11 +22,16 @@ project aims for [Semantic Versioning](https://semver.org).
   - *Warm pool of pristine pre-booted VMs* (`-warm image:vcpus:mem:count`). Each
     pooled VM is a distinct, never-used microVM, so serving one preserves the
     one-sandbox-per-task invariant; the pool refills in the background.
-  - *Firecracker snapshots* (`-snapshot-dir`, opt-in). VMs boot with the control
-    API socket so they can be paused and snapshotted; the warm pool then fills by
-    restoring from a template snapshot instead of cold-booting. Every restore
-    reseeds the guest's entropy (a snapshot is a copy of RAM, so restored VMs
-    would otherwise share a CSPRNG — see `internal/vmgenid`).
+  - *Firecracker snapshots* (`-snapshot-dir`, **experimental**). VMs boot with the
+    control API socket so they can be paused and snapshotted; the warm pool then
+    tries to fill by restoring from a template snapshot. Every restore reseeds the
+    guest's entropy (a snapshot is a copy of RAM, so restored VMs would otherwise
+    share a CSPRNG — see `internal/vmgenid`). Validated end-to-end on a Pi 5:
+    snapshot *create* and the VMM *restore/resume* work, but the restored guest
+    agent does not re-establish its vsock session (the hard, still-open part of
+    snapshot restore, shared with the prior art), so the pool falls back to a cold
+    boot for now. Off by default and safe: the fallback keeps the warm pool
+    working via cold boots.
 - **Verified boot (dm-verity)**: images built with `MICROVM_VERITY=1` ship a
   hash tree and a root-hash sidecar next to the `.ext4`, and the daemon boots
   them as a dm-verity device — the guest kernel verifies every block of the
