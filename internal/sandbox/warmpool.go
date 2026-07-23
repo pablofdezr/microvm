@@ -60,11 +60,18 @@ type warmPool struct {
 	targets map[warmKey]int          // desired ready count per shape
 	specs   map[warmKey]runtime.Spec // boot template per shape
 
+	// snap, when set, fills the pool by restoring from a per-shape template
+	// snapshot instead of cold-booting each VM -- tens of milliseconds instead of
+	// hundreds. A snapshot failure for a shape falls the shape back to cold boots.
+	snap runtime.Snapshotter
+
 	seq  atomic.Uint64
 	hits atomic.Uint64
 
-	mu    sync.Mutex
-	ready map[warmKey][]runtime.Instance
+	mu        sync.Mutex
+	ready     map[warmKey][]runtime.Instance
+	templates map[warmKey]runtime.SnapshotRef // shape -> its template snapshot
+	coldOnly  map[warmKey]bool                // shapes whose snapshot path failed
 
 	kick   chan struct{}
 	ctx    context.Context
@@ -74,17 +81,26 @@ type warmPool struct {
 	closeOnce sync.Once
 }
 
-func newWarmPool(rt runtime.Runtime, log *slog.Logger, specs []WarmSpec) *warmPool {
+func newWarmPool(rt runtime.Runtime, log *slog.Logger, specs []WarmSpec, useSnapshots bool) *warmPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &warmPool{
-		rt:      rt,
-		log:     log,
-		targets: make(map[warmKey]int),
-		specs:   make(map[warmKey]runtime.Spec),
-		ready:   make(map[warmKey][]runtime.Instance),
-		kick:    make(chan struct{}, 1),
-		ctx:     ctx,
-		cancel:  cancel,
+		rt:        rt,
+		log:       log,
+		targets:   make(map[warmKey]int),
+		specs:     make(map[warmKey]runtime.Spec),
+		ready:     make(map[warmKey][]runtime.Instance),
+		templates: make(map[warmKey]runtime.SnapshotRef),
+		coldOnly:  make(map[warmKey]bool),
+		kick:      make(chan struct{}, 1),
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+	// Restore-from-snapshot only when asked for it AND the backend can do it, so
+	// a cold-boot pool (and its tests) behaves exactly as before.
+	if useSnapshots {
+		if s, ok := rt.(runtime.Snapshotter); ok {
+			p.snap = s
+		}
 	}
 	for _, ws := range specs {
 		if ws.Count <= 0 || ws.Image == "" {
@@ -133,13 +149,21 @@ func (p *warmPool) run() {
 	}
 }
 
-// refillOne mints one VM for the shape furthest below target, or returns false
-// when every shape is stocked.
+// refillOne tops up one VM for the shape furthest below target, or returns false
+// when every shape is stocked. It restores from a template snapshot when that is
+// available and working for the shape, and cold-boots otherwise.
 func (p *warmPool) refillOne() bool {
 	k, spec, want := p.pickDeficit()
 	if !want {
 		return false
 	}
+	if p.snap != nil && !p.isColdOnly(k) {
+		return p.refillViaSnapshot(k, spec)
+	}
+	return p.refillViaColdBoot(k, spec)
+}
+
+func (p *warmPool) refillViaColdBoot(k warmKey, spec runtime.Spec) bool {
 	// A fresh id per warm VM; the guest sees it only as a hostname, which the
 	// task that adopts the VM supersedes in every way that matters.
 	spec.ID = fmt.Sprintf("warm-%d", p.seq.Add(1))
@@ -152,10 +176,7 @@ func (p *warmPool) refillOne() bool {
 		// Don't hot-loop on a failing mint (capacity, say) -- back off and let
 		// the caller's next checkout, or the poll, retry.
 		p.log.Warn("warm pool could not pre-boot a VM", "image", spec.Image, "err", err)
-		select {
-		case <-p.ctx.Done():
-		case <-time.After(3 * time.Second):
-		}
+		p.backoff()
 		return false
 	}
 
@@ -165,6 +186,74 @@ func (p *warmPool) refillOne() bool {
 	p.mu.Unlock()
 	p.log.Debug("warm VM ready", "image", spec.Image, "ready", n, "target", p.targets[k])
 	return true
+}
+
+// refillViaSnapshot captures a per-shape template once (by cold-booting a
+// pristine VM and snapshotting it), then fills the pool by restoring from it --
+// each restore reseeds its entropy, so the restored VMs do not share a CSPRNG.
+// Any snapshot failure marks the shape cold-only, so the worst case is slower
+// warm VMs, never none.
+func (p *warmPool) refillViaSnapshot(k warmKey, spec runtime.Spec) bool {
+	p.mu.Lock()
+	ref, haveTemplate := p.templates[k]
+	p.mu.Unlock()
+
+	if !haveTemplate {
+		spec.ID = fmt.Sprintf("warm-tmpl-%d", p.seq.Add(1))
+		inst, err := p.rt.Create(p.ctx, spec)
+		if err != nil {
+			return p.snapshotFailed(k, "boot template", err)
+		}
+		ref, err = p.snap.Snapshot(p.ctx, inst) // consumes the template VM
+		if err != nil {
+			_ = inst.Stop(p.ctx)
+			return p.snapshotFailed(k, "capture template", err)
+		}
+		p.mu.Lock()
+		p.templates[k] = ref
+		p.mu.Unlock()
+		p.log.Debug("warm pool captured a template snapshot", "image", spec.Image)
+		return true // progress; the loop restores from it next
+	}
+
+	spec.ID = fmt.Sprintf("warm-%d", p.seq.Add(1))
+	inst, err := p.snap.Restore(p.ctx, spec, ref)
+	if err != nil {
+		return p.snapshotFailed(k, "restore", err)
+	}
+	p.mu.Lock()
+	p.ready[k] = append(p.ready[k], inst)
+	n := len(p.ready[k])
+	p.mu.Unlock()
+	p.log.Debug("warm VM restored", "image", spec.Image, "ready", n, "target", p.targets[k])
+	return true
+}
+
+// snapshotFailed marks a shape cold-only so the pool stops trying snapshots for
+// it and cold-boots instead: a snapshot problem degrades to slower, never to no
+// warm VMs.
+func (p *warmPool) snapshotFailed(k warmKey, stage string, err error) bool {
+	if p.ctx.Err() != nil {
+		return false
+	}
+	p.log.Warn("warm pool snapshot path failed; cold-booting this shape instead", "stage", stage, "err", err)
+	p.mu.Lock()
+	p.coldOnly[k] = true
+	p.mu.Unlock()
+	return false
+}
+
+func (p *warmPool) isColdOnly(k warmKey) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.coldOnly[k]
+}
+
+func (p *warmPool) backoff() {
+	select {
+	case <-p.ctx.Done():
+	case <-time.After(3 * time.Second):
+	}
 }
 
 func (p *warmPool) pickDeficit() (warmKey, runtime.Spec, bool) {

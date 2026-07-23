@@ -28,7 +28,7 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration, what string)
 
 func TestWarmPoolFillsToTargetAndNoFurther(t *testing.T) {
 	rt := runtimetest.New()
-	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 2, MemMiB: 512, Count: 2}})
+	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 2, MemMiB: 512, Count: 2}}, false)
 	p.start()
 	defer p.close(context.Background())
 
@@ -44,7 +44,7 @@ func TestWarmPoolFillsToTargetAndNoFurther(t *testing.T) {
 
 func TestWarmPoolHandsOutAndRefills(t *testing.T) {
 	rt := runtimetest.New()
-	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 2, MemMiB: 512, Count: 2}})
+	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 2, MemMiB: 512, Count: 2}}, false)
 	p.start()
 	defer p.close(context.Background())
 	waitFor(t, func() bool { return rt.Created() >= 2 }, 2*time.Second, "fill")
@@ -62,7 +62,7 @@ func TestWarmPoolHandsOutAndRefills(t *testing.T) {
 
 func TestWarmPoolMissesOnDifferentShape(t *testing.T) {
 	rt := runtimetest.New()
-	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 1, MemMiB: 256, Count: 1}})
+	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 1, MemMiB: 256, Count: 1}}, false)
 	p.start()
 	defer p.close(context.Background())
 	waitFor(t, func() bool { return rt.Created() >= 1 }, 2*time.Second, "fill")
@@ -80,7 +80,7 @@ func TestWarmPoolMissesOnDifferentShape(t *testing.T) {
 
 func TestWarmPoolCloseDrainsInstances(t *testing.T) {
 	rt := runtimetest.New()
-	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 1, MemMiB: 256, Count: 2}})
+	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 1, MemMiB: 256, Count: 2}}, false)
 	p.start()
 	waitFor(t, func() bool { return rt.Created() >= 2 }, 2*time.Second, "fill")
 
@@ -95,6 +95,26 @@ func TestWarmPoolCloseDrainsInstances(t *testing.T) {
 	p.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("warm pool left %d VMs after close, want 0", remaining)
+	}
+}
+
+func TestWarmPoolRestoresFromSnapshotWhenEnabled(t *testing.T) {
+	rt := runtimetest.New()
+	p := newWarmPool(rt, discardLog(), []WarmSpec{{Image: "python", VCPUs: 2, MemMiB: 512, Count: 2}}, true)
+	p.start()
+	defer p.close(context.Background())
+
+	// The pool captures one template (a single cold boot + snapshot) and then
+	// fills by restoring, so the ready VMs are restores rather than cold boots.
+	waitFor(t, func() bool { return rt.Restored() >= 2 }, 2*time.Second, "warm pool to fill by restore")
+	if snaps := len(rt.Snapshots()); snaps != 1 {
+		t.Errorf("expected exactly one template snapshot, got %d", snaps)
+	}
+	if c := rt.Created(); c != 1 {
+		t.Errorf("expected exactly one cold boot (the template), got %d", c)
+	}
+	if p.checkout(warmKeyOf(runtime.Spec{Image: "python", VCPUs: 2, MemMiB: 512})) == nil {
+		t.Error("a restored warm VM should be handed out")
 	}
 }
 

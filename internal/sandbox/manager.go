@@ -210,7 +210,15 @@ func WithStorage(backend storage.Backend) Option {
 // sandboxes with no object storage, since storage binds to a sandbox's own
 // prefix at boot and a pooled VM cannot carry it.
 func WithWarmPool(specs []WarmSpec) Option {
-	return func(m *Manager) { m.warm = newWarmPool(m.rt, m.log, specs) }
+	return func(m *Manager) { m.warm = newWarmPool(m.rt, m.log, specs, false) }
+}
+
+// WithWarmPoolSnapshots is WithWarmPool that fills the pool by restoring from a
+// per-shape template snapshot when the runtime supports it (tens of milliseconds
+// per VM instead of a cold boot), falling back to cold boots for any shape whose
+// snapshot path fails.
+func WithWarmPoolSnapshots(specs []WarmSpec) Option {
+	return func(m *Manager) { m.warm = newWarmPool(m.rt, m.log, specs, true) }
 }
 
 // NewManager returns a Manager over a runtime.

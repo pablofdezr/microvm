@@ -44,6 +44,10 @@ type instance struct {
 
 	client  *guestclient.Client
 	udsPath string
+	// apiPath is the host path to Firecracker's control API socket, set only when
+	// snapshots are enabled. Empty means the VM booted --no-api and cannot be
+	// paused or snapshotted.
+	apiPath string
 
 	// hostListener accepts connections the guest opens to the host. It lives in
 	// this sandbox's jail and is reachable by this sandbox alone.

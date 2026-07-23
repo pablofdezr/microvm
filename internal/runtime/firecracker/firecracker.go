@@ -84,6 +84,12 @@ type Config struct {
 	// DefaultDiskBps and DefaultDiskIOPS apply likewise to the block device.
 	DefaultDiskBps  int64
 	DefaultDiskIOPS int64
+
+	// SnapshotDir, when set, turns on the snapshot capability: VMs boot with the
+	// Firecracker API socket enabled (instead of --no-api) so they can be paused
+	// and snapshotted, and snapshots are written under this directory. Empty is
+	// the default and leaves the cold-boot path exactly as it was.
+	SnapshotDir string
 }
 
 // Runtime creates Firecracker-backed sandboxes.
@@ -341,6 +347,11 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 	inst.udsPath = filepath.Join(jailRoot, vsockSocketName)
 	inst.client = guestclient.New(inst.udsPath)
 
+	// The control API socket, when snapshots are on, likewise lives in the jail.
+	if r.cfg.SnapshotDir != "" {
+		inst.apiPath = filepath.Join(jailRoot, apiSocketName)
+	}
+
 	// The inbound listener is opened *before* the VMM starts, and the order is
 	// the whole point. Firecracker resolves this path when the guest first
 	// connects, and a socket that is not there yet is a refused connection, not
@@ -387,6 +398,11 @@ const bootTimeout = 30 * time.Second
 // vsockSocketName is where Firecracker puts the guest's vsock socket, relative
 // to the jail root.
 const vsockSocketName = "v.sock"
+
+// apiSocketName is where Firecracker exposes its control API, relative to the
+// jail root, when snapshots are enabled. It is inside the jail, so only the host
+// (which built the jail) can reach it -- never the guest.
+const apiSocketName = "fc-api.sock"
 
 // stageFile makes a host file available inside the jail.
 //
@@ -589,7 +605,14 @@ func (r *Runtime) start(inst *instance, spec runtime.Spec) error {
 		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", limit))
 	}
 
-	args = append(args, "--", "--no-api", "--config-file", "vm.json")
+	// With snapshots enabled the VMM keeps its API socket, which is the only way
+	// to pause and snapshot it; otherwise the API is off and it runs autonomously
+	// from the config file, which is all a plain cold boot needs.
+	if r.cfg.SnapshotDir != "" {
+		args = append(args, "--", "--api-sock", apiSocketName, "--config-file", "vm.json")
+	} else {
+		args = append(args, "--", "--no-api", "--config-file", "vm.json")
+	}
 
 	cmd := exec.Command(r.cfg.JailerBin, args...)
 
