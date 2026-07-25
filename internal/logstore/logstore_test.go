@@ -282,3 +282,46 @@ func TestAppendToUnknownExecIsHarmless(t *testing.T) {
 		t.Error("Get returned a record that was never begun")
 	}
 }
+
+// A store with no retention window keeps records forever, which is right: the
+// window is what says when to drop them, and none means never. It also means Sweep
+// can never release the records of a sandbox that has been forgotten -- and those
+// are reachable through nothing, since an exec is only ever reached through its
+// sandbox. ForgetSandbox is the other release, and this is the leak it closes.
+func TestForgetSandboxDropsRecordsNoSweepWould(t *testing.T) {
+	s := New(Config{}) // no retention: Sweep drops nothing, by design
+	code := 0
+
+	s.Begin("exe_1", "sb_a", "python3", nil)
+	s.Append("exe_1", protocol.Frame{Type: protocol.FrameExit, ExitCode: &code})
+	s.Begin("exe_2", "sb_a", "python3", nil)
+	s.Append("exe_2", protocol.Frame{Type: protocol.FrameExit, ExitCode: &code})
+	s.Begin("exe_other", "sb_b", "python3", nil)
+
+	if n := s.Sweep(); n != 0 {
+		t.Fatalf("Sweep dropped %d records with no retention window, want 0", n)
+	}
+
+	if n := s.ForgetSandbox("sb_a"); n != 2 {
+		t.Errorf("ForgetSandbox dropped %d records, want 2", n)
+	}
+	for _, id := range []string{"exe_1", "exe_2"} {
+		if _, ok := s.Get(id); ok {
+			t.Errorf("%s survived its sandbox being forgotten: nothing can reach it and nothing will drop it", id)
+		}
+	}
+	if recs := s.ListSandbox("sb_a"); len(recs) != 0 {
+		t.Errorf("the store still lists %d records for a forgotten sandbox", len(recs))
+	}
+
+	// Another sandbox's records are untouched, which is the half a keyed delete gets
+	// wrong.
+	if _, ok := s.Get("exe_other"); !ok {
+		t.Error("forgetting one sandbox dropped another's records")
+	}
+
+	// Forgetting twice is not an error and drops nothing more.
+	if n := s.ForgetSandbox("sb_a"); n != 0 {
+		t.Errorf("a second ForgetSandbox dropped %d records, want 0", n)
+	}
+}

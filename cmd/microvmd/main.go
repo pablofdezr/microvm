@@ -62,11 +62,33 @@ type config struct {
 	diskBps  int64
 	diskIOPS int64
 
-	tokens      string
-	adminTokens string
-	logLevel    string
+	// Tokens, from three sources that add up. The flags are the old way and keep
+	// working; the file and the environment exist because a secret on a command
+	// line is a secret in `ps`, in shell history, and in the unit file -- the same
+	// argument that keeps a credential flag out of the storage config below.
+	tokens          string
+	adminTokens     string
+	tokensFile      string
+	adminTokensFile string
 
-	logRetention time.Duration
+	// Per-tenant admission control. Both are ceilings on one caller, unlike
+	// -slots and -ceiling-* which bound the host as a whole: without them any one
+	// valid token can hold every slot on the node and call as fast as VMs boot.
+	//
+	// Charged to a tenant rather than an address, because an address is not an
+	// identity. This daemon derives a tenant per token (see principalFor), so here
+	// the two coincide and two keys are two allowances -- the per-tenant machinery
+	// is what a shared-tenant configuration would use, and there is not one yet.
+	tenantMaxSandboxes int
+	tenantMaxRPS       float64
+
+	logLevel string
+
+	// How long the daemon remembers what is already over. They are one decision,
+	// not two: a stopped sandbox is how an exec record is reached, so the sandbox
+	// window is raised to the log window rather than allowed to undercut it.
+	logRetention     time.Duration
+	sandboxRetention time.Duration
 
 	// Storage. There is no credential flag here and there never will be: a
 	// secret key passed on a command line is a secret key in `ps`, in the shell
@@ -122,12 +144,23 @@ func main() {
 		"S3 endpoint override, for MinIO, R2 or a test double")
 	flag.BoolVar(&cfg.s3UsePathStyle, "s3-path-style", false,
 		"address the bucket as endpoint/bucket; required by MinIO and most S3-compatible servers")
-	flag.StringVar(&cfg.tokens, "tokens", "", "comma-separated bearer tokens; empty disables auth")
+	flag.StringVar(&cfg.tokens, "tokens", "",
+		"DEPRECATED, still honoured: comma-separated bearer tokens. A secret here is a secret in ps, in shell history and in the unit file -- prefer -tokens-file or MICROVM_TOKENS")
 	flag.StringVar(&cfg.adminTokens, "admin-tokens", "",
-		"comma-separated bearer tokens with admin power (setting tenant storage policies); a superset of -tokens' abilities")
+		"DEPRECATED, still honoured: comma-separated bearer tokens with admin power (setting tenant storage policies); a superset of -tokens' abilities. Prefer -admin-tokens-file or MICROVM_ADMIN_TOKENS")
+	flag.StringVar(&cfg.tokensFile, "tokens-file", "",
+		"file of bearer tokens, one per line (# comments and commas allowed); read at startup and added to MICROVM_TOKENS and -tokens. Keep it root-owned and 0600")
+	flag.StringVar(&cfg.adminTokensFile, "admin-tokens-file", "",
+		"file of admin bearer tokens, one per line; added to MICROVM_ADMIN_TOKENS and -admin-tokens")
+	flag.IntVar(&cfg.tenantMaxSandboxes, "tenant-max-sandboxes", 0,
+		"max sandboxes ONE token may have running at once (0 = unlimited). Without it a single token can hold every slot on the node. Does not cover POST /v1/tasks: the count is this node's and a task is scheduled across the fleet, so bound task load with -slots/-cpu/-mem")
+	flag.Float64Var(&cfg.tenantMaxRPS, "tenant-max-rps", 0,
+		"max API requests per second per token, bursting one second's worth (0 = unlimited). One allowance per tenant, and this daemon derives a tenant per token, so two keys are two allowances")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	flag.DurationVar(&cfg.logRetention, "log-retention", time.Hour,
 		"how long an exec's output is kept after it finishes")
+	flag.DurationVar(&cfg.sandboxRetention, "sandbox-retention", 0,
+		"how long a stopped sandbox stays listed and retrievable before the daemon forgets it (0 = forever, which is what every node did before this flag and a slow leak on one that never restarts). Raised to -log-retention when set below it: the stopped record carries the final metering, and every exec record is reached through its sandbox")
 	flag.Parse()
 
 	log := newLogger(cfg.logLevel)
@@ -146,6 +179,18 @@ func run(cfg config, log *slog.Logger) error {
 	}
 	if cfg.uid == 0 || cfg.gid == 0 {
 		return errors.New("-uid and -gid are required and must be non-root: they are what the VMM drops to")
+	}
+
+	// Before anything boots: a bad token path should stop the daemon where an
+	// operator is watching, not leave it serving VM creation to strangers.
+	tokens, err := loadTokens(cfg, log)
+	if err != nil {
+		return err
+	}
+	if len(tokens.tokens) == 0 && len(tokens.admins) == 0 &&
+		(cfg.tenantMaxSandboxes > 0 || cfg.tenantMaxRPS > 0) {
+		log.Warn("per-tenant limits are set but no tokens are, so there is no identity to charge",
+			"hint", "set -tokens-file or MICROVM_TOKENS")
 	}
 
 	prefix, err := netip.ParsePrefix(cfg.poolCIDR)
@@ -210,6 +255,18 @@ func run(cfg config, log *slog.Logger) error {
 		log.Info("sandbox storage enabled", "bucket", cfg.s3Bucket)
 	}
 
+	if cfg.sandboxRetention > 0 {
+		opts = append(opts, sandbox.WithRetention(cfg.sandboxRetention))
+	} else {
+		// The default cannot change -- forgetting records a node has always kept
+		// would change what it answers on upgrade -- but a daemon that never
+		// restarts holds every sandbox it has ever run, and serves them all on every
+		// list page. An operator should hear that once, at the only moment they are
+		// reading.
+		log.Warn("stopped sandboxes are never forgotten: the list grows for the daemon's whole life",
+			"hint", "set -sandbox-retention (it is raised to -log-retention if lower) to reap them")
+	}
+
 	if specs := parseWarmSpecs(cfg.warm, log); len(specs) > 0 {
 		if cfg.snapshotDir != "" {
 			opts = append(opts, sandbox.WithWarmPoolSnapshots(specs))
@@ -244,18 +301,29 @@ func run(cfg config, log *slog.Logger) error {
 			log.Info("tenant policies are in-process: a limit set here is not seen by other nodes",
 				"hint", "set -redis to share tenant limits across a fleet")
 		}
-		if cfg.adminTokens == "" {
-			log.Warn("storage is on but no -admin-tokens set: no one can configure tenant limits",
-				"hint", "set -admin-tokens to grant a key the tenant policy API")
+		if len(tokens.admins) == 0 {
+			log.Warn("storage is on but no admin tokens are set: no one can configure tenant limits",
+				"hint", "set -admin-tokens-file or MICROVM_ADMIN_TOKENS to grant a key the tenant policy API")
 		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Sweep expired log records periodically, or the store grows for the
-	// daemon's whole life.
-	go sweepLogs(ctx, logs, cfg.logRetention, log)
+	// Sweep what is over periodically, or these grow for the daemon's whole life.
+	go sweep(ctx, "exec records", cfg.logRetention, logs.Sweep, log)
+	if window := mgr.Retention(); window > 0 {
+		// The effective window, not the flag: it is raised to -log-retention when it
+		// would undercut it, and an operator who asked for five minutes and got an
+		// hour should read that here rather than deduce it from a list page.
+		if window > cfg.sandboxRetention {
+			log.Warn("-sandbox-retention was raised to -log-retention: a stopped sandbox carries the final "+
+				"metering, and every exec record is reached through its sandbox",
+				"asked", cfg.sandboxRetention, "using", window)
+		}
+		log.Info("stopped sandboxes are forgotten once their retention window elapses", "retention", window)
+		go sweep(ctx, "stopped sandboxes", window, mgr.Sweep, log)
+	}
 
 	// The queue and the slots are separate decisions, and keeping them separate
 	// is what allows a fleet to be shaped rather than cloned. A node with a
@@ -301,7 +369,7 @@ func run(cfg config, log *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr: cfg.addr,
-		Handler: api.NewServer(apiConfig(cfg, listImages(cfg.imageDir), tenants),
+		Handler: api.NewServer(apiConfig(cfg, tokens, listImages(cfg.imageDir), tenants),
 			mgr, q, wp, log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No write timeout: a streaming exec legitimately holds a response open
@@ -331,7 +399,13 @@ func run(cfg config, log *slog.Logger) error {
 	return mgr.Close(shutdownCtx)
 }
 
-func sweepLogs(ctx context.Context, logs *logstore.Store, retention time.Duration, log *slog.Logger) {
+// sweep runs one store's reaper until the daemon stops. Both stores keep records
+// past the thing they describe, so both need one.
+//
+// The interval is a quarter of the retention window and at least a minute, so a
+// record outlives its window by a fraction of it rather than by whatever a fixed
+// interval happened to be, and a short window never turns this into a busy loop.
+func sweep(ctx context.Context, what string, retention time.Duration, reap func() int, log *slog.Logger) {
 	interval := retention / 4
 	if interval < time.Minute {
 		interval = time.Minute
@@ -345,8 +419,8 @@ func sweepLogs(ctx context.Context, logs *logstore.Store, retention time.Duratio
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if n := logs.Sweep(); n > 0 {
-				log.Debug("swept expired exec records", "count", n)
+			if n := reap(); n > 0 {
+				log.Debug("swept expired records", "what", what, "count", n)
 			}
 		}
 	}
@@ -403,46 +477,131 @@ func listImages(dir string) []string {
 	return out
 }
 
-func splitTokens(s string) []string {
-	if s == "" {
-		return nil
+// Environment variables the daemon reads tokens from. These are the names
+// DEPLOY.md's env file already used -- the unit file expanded them into -tokens,
+// which put the secret straight back on the command line the env file existed to
+// keep it off. Read directly, they stay in the process's environment.
+const (
+	envTokens      = "MICROVM_TOKENS"
+	envAdminTokens = "MICROVM_ADMIN_TOKENS"
+)
+
+// tokenSet is who the daemon accepts, after every source has been read.
+type tokenSet struct {
+	tokens []string
+	admins []string
+}
+
+// loadTokens gathers tokens from the file, the environment and the flags.
+//
+// The sources add up rather than override, which is what makes moving off the
+// flags a rotation and not a cutover: add the file, restart, drop the flag,
+// restart, and no client is ever refused mid-way.
+func loadTokens(cfg config, log *slog.Logger) (tokenSet, error) {
+	fromFile, err := readTokenFile(cfg.tokensFile, log)
+	if err != nil {
+		return tokenSet{}, err
 	}
-	var out []string
-	for _, t := range strings.Split(s, ",") {
-		if t = strings.TrimSpace(t); t != "" {
-			out = append(out, t)
-		}
+	adminsFromFile, err := readTokenFile(cfg.adminTokensFile, log)
+	if err != nil {
+		return tokenSet{}, err
 	}
-	return out
+
+	ts := tokenSet{
+		tokens: auth.MergeTokens(fromFile,
+			auth.ParseTokens(os.Getenv(envTokens)), auth.ParseTokens(cfg.tokens)),
+		admins: auth.MergeTokens(adminsFromFile,
+			auth.ParseTokens(os.Getenv(envAdminTokens)), auth.ParseTokens(cfg.adminTokens)),
+	}
+
+	if cfg.tokens != "" || cfg.adminTokens != "" {
+		log.Warn("-tokens/-admin-tokens are deprecated: a secret on the command line is in ps, "+
+			"in shell history and in the unit file",
+			"hint", "move them to -tokens-file or MICROVM_TOKENS; the flags keep working")
+	}
+	// Which sources contributed, because "the file I edited is not being read" is
+	// the failure this feature invites and one log line settles it.
+	log.Info("api tokens loaded",
+		"tokens", len(ts.tokens), "admins", len(ts.admins),
+		"from_file", len(fromFile)+len(adminsFromFile) > 0,
+		"from_env", os.Getenv(envTokens) != "" || os.Getenv(envAdminTokens) != "",
+		"from_flags", cfg.tokens != "" || cfg.adminTokens != "")
+	return ts, nil
+}
+
+// readTokenFile reads one token file, or nothing when no path was given.
+//
+// A missing or empty file is fatal rather than ignored: an operator who named a
+// file meant to require a token, and a daemon that shrugged and started with
+// none would be serving VM creation to anyone who found the port.
+func readTokenFile(path string, log *slog.Logger) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the token file: %w", err)
+	}
+	// A token file anyone else on the box can read is a shared secret. Warned and
+	// not refused: the file is the operator's, and a daemon that will not start
+	// over a permission bit is worse than one that says so loudly.
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		log.Warn("token file is readable beyond its owner",
+			"path", path, "mode", fmt.Sprintf("%04o", mode), "hint", "chmod 600, root-owned")
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read the token file: %w", err)
+	}
+	tokens := auth.ParseTokens(string(raw))
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("the token file %s holds no tokens", path)
+	}
+	return tokens, nil
 }
 
 // apiConfig assembles the API config, promoting admin tokens to admin
 // principals.
 //
-// When any admin token is set, every token has to be spelled out as a principal
-// -- there is no longer a single flat list, because admins and non-admins are
-// different identities. Without admin tokens the simple flat list is enough, and
-// that path is kept so the common case stays simple.
-func apiConfig(cfg config, images []string, tenants tenant.Store) api.Config {
+// When any admin token or per-tenant limit is set, every token has to be spelled
+// out as a principal -- there is no longer a single flat list, because admins and
+// non-admins are different identities and a limit belongs to one identity rather
+// than to the node. Without either, the simple flat list is enough, and that path
+// is kept so the common case stays simple.
+func apiConfig(cfg config, ts tokenSet, images []string, tenants tenant.Store) api.Config {
 	c := api.Config{Images: images, Tenants: tenants}
 
-	admins := splitTokens(cfg.adminTokens)
-	if len(admins) == 0 {
-		c.Tokens = splitTokens(cfg.tokens)
+	if len(ts.admins) == 0 && cfg.tenantMaxSandboxes == 0 && cfg.tenantMaxRPS == 0 {
+		c.Tokens = ts.tokens
 		return c
 	}
 
 	principals := map[string]*auth.Principal{}
-	for _, t := range splitTokens(cfg.tokens) {
-		principals[t] = &auth.Principal{Tenant: auth.DeriveTenant(t)}
+	for _, t := range ts.tokens {
+		principals[t] = principalFor(cfg, t, false)
 	}
 	// Admins last, so a token listed as both is an admin rather than the weaker
 	// of the two -- the more specific grant wins.
-	for _, t := range admins {
-		principals[t] = &auth.Principal{Tenant: auth.DeriveTenant(t), Admin: true}
+	for _, t := range ts.admins {
+		principals[t] = principalFor(cfg, t, true)
 	}
 	c.Principals = principals
 	return c
+}
+
+// principalFor builds one token's identity. The limits are the same for every
+// token because they come from flags; per-token limits are a configuration
+// format this daemon does not have yet, and the Principal is already shaped for
+// one when it does.
+func principalFor(cfg config, token string, admin bool) *auth.Principal {
+	return &auth.Principal{
+		Tenant:               auth.DeriveTenant(token),
+		Admin:                admin,
+		MaxConcurrent:        cfg.tenantMaxSandboxes,
+		MaxRequestsPerSecond: cfg.tenantMaxRPS,
+	}
 }
 
 func newLogger(level string) *slog.Logger {

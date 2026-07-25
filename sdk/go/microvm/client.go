@@ -197,7 +197,20 @@ func IsForbidden(err error) bool {
 type requestOptions struct {
 	idempotencyKey string
 	query          string
+	// replayable marks a POST whose repetition is a no-op by construction, so it
+	// may be retried without an Idempotency-Key. Set by the resource method and
+	// never by a caller: whether replaying a route is safe is a fact about that
+	// route, not a preference.
+	replayable bool
 }
+
+// replayable marks a POST the server makes idempotent by design: extending never
+// brings a deadline forward, a file write is an overwrite, and mkdir -p on an
+// existing directory is success. Without it these routes are the ones a 429 --
+// which is what a per-tenant rate limit answers with, on every route -- surfaces
+// as a hard failure to user code, since they take no Idempotency-Key to earn a
+// retry with.
+func replayable(o *requestOptions) { o.replayable = true }
 
 // RequestOption customises a single call.
 type RequestOption func(*requestOptions)
@@ -252,11 +265,12 @@ func (c *Client) raw(ctx context.Context, method, path string, body any, opts ..
 	}
 
 	// Retrying a request that is not idempotent could run the work twice. GET,
-	// PUT and DELETE are safe by definition; a POST is only safe with a key that
-	// lets the server recognise the repeat.
+	// PUT and DELETE are safe by definition; a POST is safe with a key that lets
+	// the server recognise the repeat, or when repeating it is a no-op by
+	// construction -- see replayable.
 	idempotent := method == http.MethodGet || method == http.MethodHead ||
 		method == http.MethodPut || method == http.MethodDelete ||
-		o.idempotencyKey != ""
+		o.idempotencyKey != "" || o.replayable
 
 	var lastErr error
 	for attempt := 1; attempt <= c.maxRetries+1; attempt++ {

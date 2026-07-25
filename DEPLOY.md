@@ -218,24 +218,92 @@ and in shell history. The daemon uses the AWS SDK's own credential chain
 which has no value to leak at all. For MinIO/R2 or another S3-compatible server,
 set `-s3-endpoint` and `-s3-path-style`.
 
-Storage enables tenant quotas; setting a tenant's policy needs an `-admin-tokens`
-key, and on a fleet the tenant store must be shared, which happens automatically
-when `-redis` is set.
+Storage enables tenant quotas; setting a tenant's policy needs an admin token
+(§9), and on a fleet the tenant store must be shared, which happens
+automatically when `-redis` is set.
 
 ---
 
 ## 9. Generate API tokens
 
-Auth is bearer tokens passed with `-tokens` (comma-separated). An empty `-tokens`
-disables auth entirely — never do that on an exposed host. `-admin-tokens` is a
-superset that may also configure tenant storage policies.
+Auth is bearer tokens. **Never on the command line** — a secret there is a
+secret in `ps`, in shell history, and in the unit file. Three sources, in order
+of preference:
+
+| Source | Tokens | Admin tokens |
+|---|---|---|
+| Environment | `MICROVM_TOKENS` | `MICROVM_ADMIN_TOKENS` |
+| File, one per line | `-tokens-file` | `-admin-tokens-file` |
+| Flag (**deprecated**, still honoured) | `-tokens` | `-admin-tokens` |
+
+They **add up**, which is what makes moving off the flags a rotation rather than
+a cutover: add the file, restart, drop the flag, restart, and no client is
+refused in between. A duplicate across sources is one token. A token file may
+use `#` comments and one token per line, or commas; keep it root-owned and
+`0600` (the daemon warns if it is readable by anyone else). A named file that is
+missing or holds no tokens is fatal — a daemon that shrugged and started with no
+auth would be serving VM creation to whoever found the port.
+
+No tokens at all disables auth entirely — never do that on an exposed host.
+Admin tokens are a superset that may also configure tenant storage policies.
 
 ```bash
-openssl rand -hex 32   # generate one per client; keep them out of the unit file
+openssl rand -hex 32   # generate one per client; put it in the env file below
 ```
 
 Clients send the token as `Authorization: Bearer <token>`, which every SDK does
 for you via `new Client(url, { token })` and equivalents.
+
+### Per-tenant limits
+
+Two ceilings bound **one token**, where `-slots` and `-ceiling-*` bound the
+whole host. Without them any single valid token can occupy every slot on the
+node and call `POST /sandboxes` as fast as VMs boot, and the other tenants meet
+a host that is permanently full.
+
+| Flag | Default | What it caps |
+|---|---|---|
+| `-tenant-max-sandboxes` | `0` = unlimited | Sandboxes one token may have running at once |
+| `-tenant-max-rps` | `0` = unlimited | API requests per second per token, bursting one second's worth |
+
+Both are charged to a **tenant** rather than to an address, because an address is
+not an identity: one tenant behind a NAT would be charged for its neighbours, and
+one with a pool of egress addresses for almost none of its own. `microvmd` derives
+a tenant from each token, so on this daemon a tenant *is* a token and **two keys
+are two allowances**. Rotating a key therefore doubles the ceiling for as long as
+both are listed, and a team that wants one allowance across several keys needs
+those keys to share a tenant — a `Principals` configuration the flags do not
+expose yet. Plan a rotation as remove-then-add, or halve the ceiling while both
+are live.
+
+Over either limit the caller gets the API's existing `capacity_error` 429 — the
+same type a full node answers with, so no SDK needed a new branch. Only the rate
+limit sets `Retry-After`: a token bucket knows to the second when it will have
+another request, whereas when one of a caller's own sandboxes ends is up to them,
+and a number invented here would be a guess dressed as a fact. Both default to
+off, so a node that sets neither behaves exactly as before.
+
+**`-tenant-max-sandboxes` does not cover `POST /v1/tasks`.** The count is one
+node's, and a task is scheduled across the fleet: a task enqueued on this node may
+be leased by any other, where this counter says nothing about its submitter. So a
+token that is refused a sandbox for being at its cap can still put work on the
+node through the queue. That is a real gap in what the flag bounds, not a
+disguised feature — bound task-driven load with `-slots`, `-cpu` and `-mem`, which
+bound the box whoever the work belongs to, and with task `priority` for fairness
+between callers.
+
+### Sandboxes are scoped to their tenant
+
+A sandbox belongs to the tenant whose token created it. Every route that names one
+resolves it against the caller, so another tenant's sandbox answers `404` — not
+`403`, which would confirm which of a guessed range of IDs exist — and
+`GET /v1/sandboxes` returns only the caller's. An admin key keeps the node-wide
+view, because it is the operator's own key and something has to be able to answer
+"what is running on this box".
+
+This matters most for files: a sandbox's `/mnt/storage` is its tenant's whole
+object-store namespace, so a route that handed another tenant's sandbox over
+handed over their stored data with it.
 
 ---
 
@@ -256,6 +324,9 @@ Wants=network-online.target
 [Service]
 # Tokens and AWS creds come from an env file, not the command line, so they
 # stay out of `ps` and the unit itself. chmod 600 it, root-owned.
+# MICROVM_TOKENS and MICROVM_ADMIN_TOKENS are read from the environment
+# directly: expanding them into -tokens here would put the secret back on the
+# command line this env file exists to keep it off.
 EnvironmentFile=/etc/microvm/microvmd.env
 ExecStart=/usr/local/bin/microvmd \
   -addr 127.0.0.1:8080 \
@@ -267,8 +338,8 @@ ExecStart=/usr/local/bin/microvmd \
   -cpu 8 -mem 16384 \
   -ceiling-cores 8 -ceiling-mem-mb 16384 \
   -redis 127.0.0.1:6379 \
-  -tokens ${MICROVM_TOKENS} \
-  -admin-tokens ${MICROVM_ADMIN_TOKENS}
+  -tenant-max-sandboxes 20 \
+  -tenant-max-rps 20
 # Must be root: it manages TAP, nftables and cgroups. The jailer drops the VMM
 # to -uid/-gid; the daemon itself stays root.
 User=root
@@ -383,6 +454,14 @@ is the number that tells you whether the fleet is big enough.
   that.
 - **Log retention:** exec output is kept `-log-retention` (default 1h) after a run
   finishes, then swept. Raise it if clients collect output late.
+- **Sandbox retention:** a stopped sandbox stays listed and retrievable so a caller
+  learns *why* it stopped and what it cost. `-sandbox-retention` is when the daemon
+  forgets it; the default `0` never does, which is a slow leak on a node that never
+  restarts, so set it. Set below `-log-retention` it is raised to it: the stopped
+  record carries the final metering and every exec record is reached through its
+  sandbox, so the shorter window would strand output still on the host. Past the
+  window the ID answers the ordinary `sandbox_not_found` 404 — anything you need to
+  keep comes from the `DELETE` reply.
 - **Monitoring:** scrape `GET /v1/queue` for depth and `oldest_pending_ms`, and
   alert on `microvmd` restarts and on `/v1/health` failing.
 
@@ -391,10 +470,14 @@ is the number that tells you whether the fleet is big enough.
 ## 15. Security checklist
 
 - [ ] `-addr` on loopback; a TLS terminator on the public edge.
-- [ ] `-tokens` set (never empty on an exposed host); `-admin-tokens` only where
-      an operator needs the tenant API.
-- [ ] Tokens and AWS credentials in a `0600` env file or an instance role, never
-      on the command line.
+- [ ] Tokens set (never none on an exposed host); admin tokens only where an
+      operator needs the tenant API.
+- [ ] Tokens and AWS credentials in a `0600` env file, a `0600` token file, or
+      an instance role — never on the command line. `-tokens`/`-admin-tokens`
+      are deprecated for exactly this reason.
+- [ ] `-tenant-max-sandboxes` and `-tenant-max-rps` set wherever more than one
+      tenant shares a node: without them one token can hold every slot and
+      hammer the API as fast as VMs boot.
 - [ ] `-uid`/`-gid` are a real non-root user.
 - [ ] `-ceiling-cores`/`-ceiling-mem-mb` set on any shared host.
 - [ ] Per-sandbox network cap left on (`-default-network-bps`, ~100 Mbit default):

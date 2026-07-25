@@ -128,6 +128,7 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 			return nil, err
 		}
 		inst.lease = &lease
+		inst.tapName = lease.TapName
 		if err := r.taps.Create(lease); err != nil {
 			return nil, fmt.Errorf("restore: create tap: %w", err)
 		}
@@ -211,7 +212,10 @@ func reseedGuest(ctx context.Context, client *guestclient.Client, digest string)
 	if err != nil {
 		return err
 	}
-	return client.WriteFile(ctx, "/dev/urandom", bytes.NewReader(tok.Value), "0644")
+	// No mode: /dev/urandom is a device node that already exists, and a mode asked
+	// for is a mode the agent sets, which would leave the guest's entropy source
+	// with permissions this call has no business choosing.
+	return client.WriteFile(ctx, "/dev/urandom", bytes.NewReader(tok.Value), "")
 }
 
 // waitForSocket blocks until path exists, so the API client does not dial before

@@ -11,7 +11,19 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List sandboxes */
+        /**
+         * List sandboxes
+         * @description This node's sandboxes, newest first -- yours only. A sandbox belongs to the
+         *     tenant that created it, and a list that reported every tenant's would hand
+         *     out the IDs every other route is reached by. An admin key sees the whole
+         *     node, because it is the operator's own.
+         *
+         *     A stopped sandbox stays listed for a retention window and is then
+         *     dropped, so this is not a history: a sandbox that ran an hour ago may no
+         *     longer be here at all. Anything you need to keep -- the final metering
+         *     above all -- comes from the reply to the delete, which is the only place
+         *     it is ever stated.
+         */
         get: operations["listSandboxes"];
         put?: never;
         /**
@@ -36,6 +48,13 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -43,6 +62,12 @@ export interface paths {
         /**
          * Retrieve a sandbox
          * @description Returns the sandbox with live metering.
+         *
+         *     A stopped sandbox is still here for a retention window, so a caller who
+         *     polls learns *why* it stopped -- expired, idle, failed -- rather than
+         *     being handed a bare 404 to interpret. Once the window elapses the record
+         *     is dropped and this returns 404, which is why a 404 on an ID you know
+         *     existed means "too late", not "never was".
          */
         get: operations["retrieveSandbox"];
         put?: never;
@@ -62,11 +87,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sandboxes/{sandbox}/extend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Extend a sandbox's TTL
+         * @description Pushes the TTL deadline out to `ttl_seconds` from now, for the work that
+         *     turned out longer than the caller guessed at create time. Without it the
+         *     only way to buy time is to create a second sandbox, which does not have
+         *     the first one's state.
+         *
+         *     The new deadline is bounded by the host's maximum lifetime measured
+         *     **from creation**, not from now. Extending therefore buys time and can
+         *     never buy immortality: a caller that heartbeats forever still ends up
+         *     with a sandbox that dies, which is the property that keeps a forgotten
+         *     loop from pinning a slot for a week.
+         *
+         *     Asking past that bound is a `400`, naming how many seconds are left,
+         *     rather than a silent trim to the maximum. A caller told `200` for an hour
+         *     they did not get plans for an hour and finds out when their work is
+         *     killed halfway; an error arrives while they can still act on it. Read
+         *     `expires` off the reply all the same -- that field is the deadline.
+         *
+         *     It never brings a deadline forward. The deadline becomes the later of
+         *     what it already was and `now + ttl_seconds`, because two callers
+         *     heartbeating the same sandbox at different intervals would otherwise have
+         *     the shorter one cut the longer one short. That also makes a retry
+         *     harmless, which is why this route takes no Idempotency-Key.
+         *
+         *     Extending a stopped sandbox is a `409`: there is no deadline left to
+         *     move, and a caller heartbeating something already gone should learn it
+         *     here rather than from the next exec.
+         *
+         *     The idle timeout is untouched. A long TTL does not keep an idle sandbox
+         *     alive; nothing except running something does.
+         */
+        post: operations["extendSandbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sandboxes/{sandbox}/executions": {
         parameters: {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -95,6 +184,13 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -122,6 +218,13 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -155,6 +258,13 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -182,6 +292,13 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -199,6 +316,100 @@ export interface paths {
          * @description Writes a file into the sandbox, creating parent directories.
          */
         post: operations["createFile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandbox}/files/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload several files
+         * @description Writes a set of files in one request, in the order given, creating parent
+         *     directories.
+         *
+         *     Each path is named at most once. Two entries for one path would report two
+         *     sizes for one file and leave only the later on disk, which makes the reply
+         *     a statement about nothing, so the batch is refused rather than resolved
+         *     last-wins.
+         *
+         *     One round trip instead of N. A project is rarely a single file, and
+         *     twenty uploads spend twenty HTTP requests and twenty vsock round trips on
+         *     work the guest can do in one.
+         *
+         *     Validation is all-or-nothing: every entry is checked -- path, mode, size
+         *     -- before a single byte enters the sandbox, so a batch with one bad path
+         *     writes nothing at all rather than half a project. Writing is not
+         *     transactional and cannot be: once the third file is on the guest's disk
+         *     there is no unwriting it. A write that fails partway therefore fails the
+         *     request with the files before it already written, and the order is the
+         *     order you gave precisely so a caller can say which those were.
+         *
+         *     The batch is one request body, so it is bound by the daemon's body cap
+         *     for all of the files together -- and base64 makes the payload a third
+         *     larger than the bytes it carries.
+         */
+        post: operations["createFiles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandbox}/dirs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a directory
+         * @description Creates a directory and any parents it needs.
+         *
+         *     Uploading a file already creates its parents, so this route is for the
+         *     directory that stays empty: an output directory a command writes into, a
+         *     mount point, a layout a build tool expects to exist before it starts.
+         *
+         *     Existing is success, not conflict -- `mkdir -p` semantics are what a
+         *     caller building a tree wants, and they make a retry safe. An existing
+         *     *file* at the path is a conflict, because that is a caller confusing two
+         *     different things rather than repeating themselves.
+         *
+         *     The directory is created `0755`, and so is every parent. There is no
+         *     `mode` knob: a directory without its execute bit cannot be entered, so
+         *     most of what one could ask for here is a way to create something
+         *     unusable.
+         */
+        post: operations["createDir"];
         delete?: never;
         options?: never;
         head?: never;
@@ -444,7 +655,10 @@ export interface components {
             created: string;
             /**
              * Format: date-time
-             * @description When the TTL kills it, whatever it is doing.
+             * @description When the TTL kills it, whatever it is doing. Movable with
+             *     `POST /sandboxes/{sandbox}/extend`, but only up to the host's maximum
+             *     lifetime counted from `created`, so this field can be pushed back and
+             *     never removed.
              */
             expires: string;
             /** Format: date-time */
@@ -453,6 +667,21 @@ export interface components {
             mem_mib?: number;
             /** @description Whether filtered egress is on. */
             network?: boolean;
+            /**
+             * @description The labels set at create time, returned exactly as they were given.
+             *
+             *     Unlike `env`, tags **are** returned -- here, and in every list that
+             *     includes this sandbox. Never put a credential in one. A secret that
+             *     needs to reach the guest is what `env` is for, and `env` is
+             *     write-only precisely so this mistake cannot be made by accident.
+             * @example {
+             *       "env": "ci",
+             *       "owner": "billing-team"
+             *     }
+             */
+            tags?: {
+                [key: string]: string;
+            };
             /**
              * @description Where this sandbox's files persist, when the node has object storage
              *     configured. Absent when it does not.
@@ -517,6 +746,30 @@ export interface components {
             memory_current_bytes: number;
             /** @description The high-water mark, which is what a memory limit must be sized against. */
             memory_peak_bytes: number;
+            /**
+             * Format: int64
+             * @description Bytes the guest received.
+             *
+             *     Read from the host's TAP device, where the direction necessarily
+             *     inverts: what the guest sends is what the host receives. Both network
+             *     fields are named from the **guest's** point of view, so `rx` is what
+             *     came into the sandbox and `tx` is what it sent out. Do not line them
+             *     up with host-side counters of the same name -- those are the other way
+             *     round, and the mistake is invisible until an egress bill or an abuse
+             *     report says otherwise.
+             *
+             *     Absent when the sandbox has no network device: with `network: false`
+             *     there is no TAP, and "nothing to count" is not the same claim as
+             *     zero bytes.
+             */
+            network_rx_bytes?: number;
+            /**
+             * Format: int64
+             * @description Bytes the guest sent. This is the egress number -- the one a bandwidth
+             *     cap limits and an abuse complaint is about. Counted at the host's TAP
+             *     and named from the guest's side, like `network_rx_bytes`.
+             */
+            network_tx_bytes?: number;
         };
         SandboxCreateParams: {
             /**
@@ -564,7 +817,35 @@ export interface components {
                 [key: string]: string;
             };
             /**
-             * @description Maximum lifetime. The sandbox is killed when it elapses.
+             * @description Labels of your own, for finding this sandbox again: filter
+             *     `GET /sandboxes` by `tag`, or read them back off the object.
+             *
+             *     At most 10 pairs, keys at most 64 bytes and values at most 256. Bytes
+             *     rather than characters, so a key written in emoji runs out about four
+             *     times sooner than its length suggests. A key may not be empty and may
+             *     not contain `:`, which is the character the `tag` filter splits on.
+             *
+             *     Node-local, like the list they are filtered on: they live in the
+             *     daemon's memory beside the sandbox and go when it is forgotten. They
+             *     are not written into the guest and nothing inside it can read them,
+             *     which is what separates them from `env` -- a tag names a sandbox, it
+             *     does not configure one.
+             *
+             *     **Returned by the API, unlike `env`.** Anything that can read this
+             *     sandbox can read its tags -- which is its own tenant, and an admin key
+             *     -- so a tag is a label and never a secret.
+             * @example {
+             *       "env": "ci",
+             *       "owner": "billing-team"
+             *     }
+             */
+            tags?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Maximum lifetime. The sandbox is killed when it elapses. Capped by
+             *     the host's own maximum, and extensible later within that cap with
+             *     `POST /sandboxes/{sandbox}/extend`.
              * @default 900
              */
             ttl_seconds?: number;
@@ -596,6 +877,20 @@ export interface components {
              * @example /data
              */
             mount_path?: string;
+        };
+        SandboxExtendParams: {
+            /**
+             * @description How much longer the sandbox should live, counted from now rather than
+             *     from its current deadline -- a heartbeat says "give me ten more
+             *     minutes", and repeating it does not stack.
+             *
+             *     What you get is the later of the existing deadline and this one. More
+             *     than the host's maximum lifetime from creation still has left is
+             *     refused, not trimmed. The reply's `expires` is the answer; this number
+             *     is a request.
+             * @example 600
+             */
+            ttl_seconds: number;
         };
         /**
          * @description What a write does when a tenant is at its cap.
@@ -731,6 +1026,13 @@ export interface components {
             /** @example /app/main.py */
             path: string;
             size_bytes: number;
+            /**
+             * @description The permission bits the file ended up with, octal. Set explicitly
+             *     rather than left to whatever umask the guest happens to have, so this
+             *     is what was asked for and not an approximation of it.
+             * @example 0644
+             */
+            mode?: string;
         };
         FileCreateParams: {
             /**
@@ -743,6 +1045,54 @@ export interface components {
              * @description The file's bytes, base64 encoded so binary survives the trip.
              */
             content: string;
+            /**
+             * @description Permission bits, octal -- `0755` for something you intend to execute.
+             *     Defaults to `0644`, so an upload is readable and not runnable unless
+             *     you say otherwise.
+             *
+             *     Three digits, with an optional leading zero. setuid, setgid and the
+             *     sticky bit are refused with an `invalid_request_error` on `mode`: the
+             *     host writes this file as root, and the one thing an upload must never
+             *     be able to do is leave a root-owned setuid binary behind for whatever
+             *     runs in the guest next. Code inside the sandbox can still chmod its
+             *     own files -- then it is the guest's own doing, and stays inside the
+             *     guest.
+             * @default 0644
+             * @example 0755
+             */
+            mode?: string;
+        };
+        FileBatchCreateParams: {
+            /**
+             * @description The files to write, in the order they will be written. An entry is
+             *     exactly a single-file upload, so a path or mode this route refuses is
+             *     one the single-file route refuses too -- there is one set of rules,
+             *     not two.
+             */
+            files: components["schemas"]["FileCreateParams"][];
+        };
+        FileList: components["schemas"]["ListEnvelope"] & {
+            data?: components["schemas"]["File"][];
+        };
+        /**
+         * @description A directory in the sandbox. Deliberately not a `File`: a directory has no
+         *     bytes, and a `size_bytes: 0` on one would be a number a caller could
+         *     believe.
+         */
+        Directory: {
+            /** @enum {string} */
+            object: "directory";
+            /** @example /app/out */
+            path: string;
+        };
+        DirectoryCreateParams: {
+            /**
+             * @description Absolute path inside the sandbox. Parents are created. Validated
+             *     before it reaches the guest: a relative path, or one containing `..`,
+             *     is refused rather than resolved into whatever it would have meant.
+             * @example /app/out
+             */
+            path: string;
         };
         /**
          * @description - `pending` — waiting for a slot anywhere in the fleet.
@@ -935,9 +1285,23 @@ export interface components {
                 "application/json": components["schemas"]["ErrorEnvelope"];
             };
         };
-        /** @description This node has no free slot. Retry, or submit a task instead. */
+        /**
+         * @description No room right now. Either the node has no free slot, or the caller is over
+         *     a per-tenant limit -- both are `capacity_error` with code
+         *     `node_at_capacity`, deliberately, because the caller's move is the same and
+         *     that is the pair every SDK already backs off on. The message is what tells
+         *     them apart: a full node frees up on its own, whereas being over your own
+         *     sandbox cap needs you to delete one.
+         */
         CapacityExhausted: {
             headers: {
+                /**
+                 * @description Seconds to wait, on the refusals whose end can be named to the second --
+                 *     the request-rate limit. Absent for a full node and for the per-tenant
+                 *     sandbox cap: when a slot frees is not something this node knows, and a
+                 *     number invented here would be a guess dressed as a fact.
+                 */
+                "Retry-After"?: number;
                 [name: string]: unknown;
             };
             content: {
@@ -969,6 +1333,13 @@ export interface components {
         };
     };
     parameters: {
+        /**
+         * @description A sandbox belongs to the tenant whose token created it, and every route
+         *     below resolves it against the caller: another tenant's sandbox is a `404`,
+         *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+         *     guessed range exist. So a `404` here means one of three things -- never
+         *     existed, already forgotten, or not yours -- and the API will not say which.
+         */
         SandboxId: string;
         ExecutionId: string;
         TaskId: string;
@@ -1021,6 +1392,23 @@ export interface operations {
                 ending_before?: components["parameters"]["EndingBefore"];
                 /** @description Only sandboxes in this state. */
                 state?: components["schemas"]["SandboxState"];
+                /**
+                 * @description Only sandboxes carrying this tag, written `key:value`. Repeat the
+                 *     parameter to require several: they AND, so `?tag=env:ci&tag=owner:me`
+                 *     returns the sandboxes carrying both. The split is at the first colon,
+                 *     so a value may contain colons and a key may not.
+                 *
+                 *     The filter is node-local, because the list is: it searches the
+                 *     sandboxes this node holds, not the fleet's. On more than one node you
+                 *     get this node's answer, and finding a tagged sandbox anywhere means
+                 *     asking each node. A tag nobody set is an empty page, not an error --
+                 *     there is no registry of known keys to be wrong about.
+                 * @example [
+                 *       "env:ci",
+                 *       "owner:billing-team"
+                 *     ]
+                 */
+                tag?: string[];
             };
             header?: never;
             path?: never;
@@ -1038,6 +1426,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     createSandbox: {
@@ -1088,6 +1477,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1105,6 +1501,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     deleteSandbox: {
@@ -1112,6 +1509,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1129,6 +1533,45 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    extendSandbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SandboxExtendParams"];
+            };
+        };
+        responses: {
+            /** @description The sandbox, with its new `expires`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sandbox"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     listExecutions: {
@@ -1149,6 +1592,13 @@ export interface operations {
             };
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1166,6 +1616,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     createExecution: {
@@ -1187,6 +1638,13 @@ export interface operations {
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
             };
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1210,6 +1668,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     retrieveExecution: {
@@ -1217,6 +1676,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -1235,6 +1701,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     streamExecution: {
@@ -1242,6 +1709,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -1260,6 +1734,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     cancelExecution: {
@@ -1267,6 +1742,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
                 execution: components["parameters"]["ExecutionId"];
             };
@@ -1289,6 +1771,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     retrieveFile: {
@@ -1299,6 +1782,13 @@ export interface operations {
             };
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1316,6 +1806,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     createFile: {
@@ -1323,6 +1814,13 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
                 sandbox: components["parameters"]["SandboxId"];
             };
             cookie?: never;
@@ -1345,6 +1843,88 @@ export interface operations {
             400: components["responses"]["InvalidRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    createFiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FileBatchCreateParams"];
+            };
+        };
+        responses: {
+            /**
+             * @description Every file was written, in the order given. A list envelope for
+             *     consistency with every other collection, not because it pages:
+             *     `has_more` is always false.
+             */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileList"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    createDir: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryCreateParams"];
+            };
+        };
+        responses: {
+            /** @description The directory exists. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Directory"];
+                };
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     createTask: {
@@ -1386,6 +1966,7 @@ export interface operations {
             400: components["responses"]["InvalidRequest"];
             401: components["responses"]["Unauthorized"];
             409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
             503: components["responses"]["QueueUnreachable"];
         };
     };
@@ -1411,6 +1992,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
             503: components["responses"]["QueueUnreachable"];
         };
     };
@@ -1433,6 +2015,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["CapacityExhausted"];
             503: components["responses"]["QueueUnreachable"];
         };
     };
@@ -1455,6 +2038,7 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     listTenants: {
@@ -1477,6 +2061,7 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     retrieveTenant: {
@@ -1503,6 +2088,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     updateTenant: {
@@ -1533,6 +2119,7 @@ export interface operations {
             400: components["responses"]["InvalidRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            429: components["responses"]["CapacityExhausted"];
         };
     };
     retrieveHealth: {

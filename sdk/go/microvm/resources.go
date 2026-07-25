@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 )
 
@@ -41,6 +43,21 @@ func (s *SandboxService) Delete(ctx context.Context, sandboxID string, opts ...R
 	return &out, err
 }
 
+// Extend pushes the sandbox's TTL deadline out to ttlSeconds from now.
+//
+// It never brings a deadline forward, so heartbeating it on a timer is safe and
+// so is retrying it. Read Expires off the returned sandbox rather than computing
+// it: the request says how long you want, and the reply says what you have. It
+// fails with an invalid-request error when the sandbox has less life left than
+// you asked for -- lifetimes are bounded from creation, so extending buys time
+// and never immortality.
+func (s *SandboxService) Extend(ctx context.Context, sandboxID string, ttlSeconds int, opts ...RequestOption) (*Sandbox, error) {
+	var out Sandbox
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/extend",
+		SandboxExtendParams{TtlSeconds: ttlSeconds}, &out, append(opts, replayable)...)
+	return &out, err
+}
+
 // SandboxListParams filters and pages a list.
 type SandboxListParams struct {
 	// Limit is how many per page, 1-100. Zero uses the server's default.
@@ -51,6 +68,10 @@ type SandboxListParams struct {
 	EndingBefore string
 	// State returns only sandboxes in it: "running" or "stopped".
 	State SandboxState
+	// Tags returns only sandboxes carrying every one of these labels. They AND,
+	// so a second tag narrows the result rather than widening it. The filter is
+	// node-local, like the list itself.
+	Tags map[string]string
 }
 
 func (p SandboxListParams) query() string {
@@ -66,6 +87,12 @@ func (p SandboxListParams) query() string {
 	}
 	if p.State != "" {
 		q.Set("state", string(p.State))
+	}
+	// One `tag=key:value` each, in key order: map order is random, and a filter
+	// that produces a different URL on every identical call is one nobody can
+	// cache, compare or read in a log.
+	for _, k := range slices.Sorted(maps.Keys(p.Tags)) {
+		q.Add("tag", k+":"+p.Tags[k])
 	}
 	return q.Encode()
 }
@@ -190,13 +217,40 @@ type FileService struct{ c *Client }
 // Create writes a file into the sandbox, making parent directories.
 func (s *FileService) Create(ctx context.Context, sandboxID string, params FileCreateParams) (*File, error) {
 	var out File
-	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/files", params, &out)
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/files", params, &out, replayable)
 	return &out, err
 }
 
 // Write is Create for the common case: a path and some bytes.
 func (s *FileService) Write(ctx context.Context, sandboxID, path string, content []byte) (*File, error) {
 	return s.Create(ctx, sandboxID, FileCreateParams{Path: path, Content: content})
+}
+
+// CreateBatch writes a set of files in one request, in the order given.
+//
+// One round trip instead of one per file, which is the difference between staging
+// a project and staging it slowly. Validation is all-or-nothing and writing is
+// not, because writing cannot be: a batch with one bad mode writes nothing, and a
+// batch that fails partway names the entry it stopped at, so the order tells you
+// which files landed. Each path may be named only once.
+func (s *FileService) CreateBatch(ctx context.Context, sandboxID string, files []FileCreateParams) (*FileList, error) {
+	var out FileList
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/files/batch",
+		FileBatchCreateParams{Files: files}, &out, replayable)
+	return &out, err
+}
+
+// Mkdir creates a directory and its parents.
+//
+// Uploading a file already creates its parents, so this is for the directory that
+// stays empty: somewhere a command writes its output, or a layout a build tool
+// expects before it starts. It is mkdir -p, so a directory that already exists is
+// success and a retry is safe; a *file* in the way is a conflict.
+func (s *FileService) Mkdir(ctx context.Context, sandboxID, path string) (*Directory, error) {
+	var out Directory
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/dirs",
+		DirectoryCreateParams{Path: path}, &out, replayable)
+	return &out, err
 }
 
 // Retrieve downloads a file.

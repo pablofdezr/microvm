@@ -102,6 +102,17 @@ paths:
     get:
       operationId: listSandboxes
       summary: List sandboxes
+      description: |
+        This node's sandboxes, newest first -- yours only. A sandbox belongs to the
+        tenant that created it, and a list that reported every tenant's would hand
+        out the IDs every other route is reached by. An admin key sees the whole
+        node, because it is the operator's own.
+
+        A stopped sandbox stays listed for a retention window and is then
+        dropped, so this is not a history: a sandbox that ran an hour ago may no
+        longer be here at all. Anything you need to keep -- the final metering
+        above all -- comes from the reply to the delete, which is the only place
+        it is ever stated.
       tags: [Sandboxes]
       parameters:
         - $ref: '#/components/parameters/Limit'
@@ -111,6 +122,24 @@ paths:
           in: query
           description: Only sandboxes in this state.
           schema: { $ref: '#/components/schemas/SandboxState' }
+        - name: tag
+          in: query
+          description: |
+            Only sandboxes carrying this tag, written `key:value`. Repeat the
+            parameter to require several: they AND, so `?tag=env:ci&tag=owner:me`
+            returns the sandboxes carrying both. The split is at the first colon,
+            so a value may contain colons and a key may not.
+
+            The filter is node-local, because the list is: it searches the
+            sandboxes this node holds, not the fleet's. On more than one node you
+            get this node's answer, and finding a tagged sandbox anywhere means
+            asking each node. A tag nobody set is an empty page, not an error --
+            there is no registry of known keys to be wrong about.
+          explode: true
+          schema:
+            type: array
+            items: { type: string, pattern: '^[^:]+:.*$' }
+          example: ["env:ci", "owner:billing-team"]
       responses:
         '200':
           description: A page of sandboxes, newest first.
@@ -118,6 +147,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SandboxList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}:
     parameters:
@@ -125,7 +155,14 @@ paths:
     get:
       operationId: retrieveSandbox
       summary: Retrieve a sandbox
-      description: Returns the sandbox with live metering.
+      description: |
+        Returns the sandbox with live metering.
+
+        A stopped sandbox is still here for a retention window, so a caller who
+        polls learns *why* it stopped -- expired, idle, failed -- rather than
+        being handed a bare 404 to interpret. Once the window elapses the record
+        is dropped and this returns 404, which is why a 404 on an ID you know
+        existed means "too late", not "never was".
       tags: [Sandboxes]
       responses:
         '200':
@@ -135,6 +172,7 @@ paths:
               schema: { $ref: '#/components/schemas/Sandbox' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
     delete:
       operationId: deleteSandbox
@@ -155,6 +193,61 @@ paths:
               schema: { $ref: '#/components/schemas/Sandbox' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
+  /sandboxes/{sandbox}/extend:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: extendSandbox
+      summary: Extend a sandbox's TTL
+      description: |
+        Pushes the TTL deadline out to `ttl_seconds` from now, for the work that
+        turned out longer than the caller guessed at create time. Without it the
+        only way to buy time is to create a second sandbox, which does not have
+        the first one's state.
+
+        The new deadline is bounded by the host's maximum lifetime measured
+        **from creation**, not from now. Extending therefore buys time and can
+        never buy immortality: a caller that heartbeats forever still ends up
+        with a sandbox that dies, which is the property that keeps a forgotten
+        loop from pinning a slot for a week.
+
+        Asking past that bound is a `400`, naming how many seconds are left,
+        rather than a silent trim to the maximum. A caller told `200` for an hour
+        they did not get plans for an hour and finds out when their work is
+        killed halfway; an error arrives while they can still act on it. Read
+        `expires` off the reply all the same -- that field is the deadline.
+
+        It never brings a deadline forward. The deadline becomes the later of
+        what it already was and `now + ttl_seconds`, because two callers
+        heartbeating the same sandbox at different intervals would otherwise have
+        the shorter one cut the longer one short. That also makes a retry
+        harmless, which is why this route takes no Idempotency-Key.
+
+        Extending a stopped sandbox is a `409`: there is no deadline left to
+        move, and a caller heartbeating something already gone should learn it
+        here rather than from the next exec.
+
+        The idle timeout is untouched. A long TTL does not keep an idle sandbox
+        alive; nothing except running something does.
+      tags: [Sandboxes]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SandboxExtendParams' }
+      responses:
+        '200':
+          description: The sandbox, with its new `expires`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/executions:
     parameters:
@@ -187,6 +280,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
     get:
       operationId: listExecutions
@@ -204,6 +298,7 @@ paths:
               schema: { $ref: '#/components/schemas/ExecutionList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/executions/{execution}:
     parameters:
@@ -227,6 +322,7 @@ paths:
               schema: { $ref: '#/components/schemas/Execution' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/executions/{execution}/stream:
     parameters:
@@ -256,6 +352,7 @@ paths:
               schema: { $ref: '#/components/schemas/Frame' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/executions/{execution}/cancel:
     parameters:
@@ -284,6 +381,7 @@ paths:
               schema: { $ref: '#/components/schemas/Execution' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/files:
     parameters:
@@ -307,6 +405,8 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
     get:
       operationId: retrieveFile
@@ -330,6 +430,98 @@ paths:
               schema: { type: string, format: binary }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
+  /sandboxes/{sandbox}/files/batch:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: createFiles
+      summary: Upload several files
+      description: |
+        Writes a set of files in one request, in the order given, creating parent
+        directories.
+
+        Each path is named at most once. Two entries for one path would report two
+        sizes for one file and leave only the later on disk, which makes the reply
+        a statement about nothing, so the batch is refused rather than resolved
+        last-wins.
+
+        One round trip instead of N. A project is rarely a single file, and
+        twenty uploads spend twenty HTTP requests and twenty vsock round trips on
+        work the guest can do in one.
+
+        Validation is all-or-nothing: every entry is checked -- path, mode, size
+        -- before a single byte enters the sandbox, so a batch with one bad path
+        writes nothing at all rather than half a project. Writing is not
+        transactional and cannot be: once the third file is on the guest's disk
+        there is no unwriting it. A write that fails partway therefore fails the
+        request with the files before it already written, and the order is the
+        order you gave precisely so a caller can say which those were.
+
+        The batch is one request body, so it is bound by the daemon's body cap
+        for all of the files together -- and base64 makes the payload a third
+        larger than the bytes it carries.
+      tags: [Files]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileBatchCreateParams' }
+      responses:
+        '201':
+          description: |
+            Every file was written, in the order given. A list envelope for
+            consistency with every other collection, not because it pages:
+            `has_more` is always false.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileList' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
+  /sandboxes/{sandbox}/dirs:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: createDir
+      summary: Create a directory
+      description: |
+        Creates a directory and any parents it needs.
+
+        Uploading a file already creates its parents, so this route is for the
+        directory that stays empty: an output directory a command writes into, a
+        mount point, a layout a build tool expects to exist before it starts.
+
+        Existing is success, not conflict -- `mkdir -p` semantics are what a
+        caller building a tree wants, and they make a retry safe. An existing
+        *file* at the path is a conflict, because that is a caller confusing two
+        different things rather than repeating themselves.
+
+        The directory is created `0755`, and so is every parent. There is no
+        `mode` knob: a directory without its execute bit cannot be entered, so
+        most of what one could ask for here is a way to create something
+        unusable.
+      tags: [Files]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DirectoryCreateParams' }
+      responses:
+        '201':
+          description: The directory exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Directory' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /tasks:
     post:
@@ -359,6 +551,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
         '503': { $ref: '#/components/responses/QueueUnreachable' }
 
   /tasks/{task}:
@@ -376,6 +569,7 @@ paths:
               schema: { $ref: '#/components/schemas/Task' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
         '503': { $ref: '#/components/responses/QueueUnreachable' }
 
   /queue:
@@ -397,6 +591,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Queue' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
         '503': { $ref: '#/components/responses/QueueUnreachable' }
 
   /images:
@@ -412,6 +607,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ImageList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /tenants:
     get:
@@ -429,6 +625,7 @@ paths:
               schema: { $ref: '#/components/schemas/TenantList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /tenants/{tenant}:
     parameters:
@@ -460,6 +657,7 @@ paths:
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
     get:
       operationId: retrieveTenant
       summary: Retrieve a tenant's policy and usage
@@ -477,6 +675,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /health:
     get:
@@ -505,6 +704,12 @@ components:
       name: sandbox
       in: path
       required: true
+      description: |
+        A sandbox belongs to the tenant whose token created it, and every route
+        below resolves it against the caller: another tenant's sandbox is a `404`,
+        not a `403`. An ID is not a capability, and a `403` would confirm which of a
+        guessed range exist. So a `404` here means one of three things -- never
+        existed, already forgotten, or not yours -- and the API will not say which.
       schema: { type: string, pattern: '^sb_[0-9A-HJKMNP-TV-Z]{26}$', example: "sb_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
 
     ExecutionId:
@@ -587,7 +792,22 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     CapacityExhausted:
-      description: This node has no free slot. Retry, or submit a task instead.
+      description: |
+        No room right now. Either the node has no free slot, or the caller is over
+        a per-tenant limit -- both are `capacity_error` with code
+        `node_at_capacity`, deliberately, because the caller's move is the same and
+        that is the pair every SDK already backs off on. The message is what tells
+        them apart: a full node frees up on its own, whereas being over your own
+        sandbox cap needs you to delete one.
+      headers:
+        Retry-After:
+          description: |
+            Seconds to wait, on the refusals whose end can be named to the second --
+            the request-rate limit. Absent for a full node and for the per-tenant
+            sandbox cap: when a slot frees is not something this node knows, and a
+            number invented here would be a guess dressed as a fact.
+          required: false
+          schema: { type: integer, minimum: 1 }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
@@ -712,13 +932,28 @@ components:
         expires:
           type: string
           format: date-time
-          description: When the TTL kills it, whatever it is doing.
+          description: |
+            When the TTL kills it, whatever it is doing. Movable with
+            `POST /sandboxes/{sandbox}/extend`, but only up to the host's maximum
+            lifetime counted from `created`, so this field can be pushed back and
+            never removed.
         stopped: { type: string, nullable: true, format: date-time }
         vcpus: { type: integer }
         mem_mib: { type: integer }
         network:
           type: boolean
           description: Whether filtered egress is on.
+        tags:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            The labels set at create time, returned exactly as they were given.
+
+            Unlike `env`, tags **are** returned -- here, and in every list that
+            includes this sandbox. Never put a credential in one. A secret that
+            needs to reach the guest is what `env` is for, and `env` is
+            write-only precisely so this mistake cannot be made by accident.
+          example: {"env": "ci", "owner": "billing-team"}
         storage:
           allOf: [{ $ref: '#/components/schemas/SandboxStorage' }]
           description: |
@@ -797,6 +1032,30 @@ components:
         memory_peak_bytes:
           type: integer
           description: The high-water mark, which is what a memory limit must be sized against.
+        network_rx_bytes:
+          type: integer
+          format: int64
+          description: |
+            Bytes the guest received.
+
+            Read from the host's TAP device, where the direction necessarily
+            inverts: what the guest sends is what the host receives. Both network
+            fields are named from the **guest's** point of view, so `rx` is what
+            came into the sandbox and `tx` is what it sent out. Do not line them
+            up with host-side counters of the same name -- those are the other way
+            round, and the mistake is invisible until an egress bill or an abuse
+            report says otherwise.
+
+            Absent when the sandbox has no network device: with `network: false`
+            there is no TAP, and "nothing to count" is not the same claim as
+            zero bytes.
+        network_tx_bytes:
+          type: integer
+          format: int64
+          description: |
+            Bytes the guest sent. This is the egress number -- the one a bandwidth
+            cap limits and an abuse complaint is about. Counted at the host's TAP
+            and named from the guest's side, like `network_rx_bytes`.
 
     SandboxCreateParams:
       type: object
@@ -841,10 +1100,36 @@ components:
             each execution rather than written into the guest's filesystem,
             where anything inside could read them long after the command that
             needed them.
+        tags:
+          type: object
+          additionalProperties: { type: string }
+          maxProperties: 10
+          description: |
+            Labels of your own, for finding this sandbox again: filter
+            `GET /sandboxes` by `tag`, or read them back off the object.
+
+            At most 10 pairs, keys at most 64 bytes and values at most 256. Bytes
+            rather than characters, so a key written in emoji runs out about four
+            times sooner than its length suggests. A key may not be empty and may
+            not contain `:`, which is the character the `tag` filter splits on.
+
+            Node-local, like the list they are filtered on: they live in the
+            daemon's memory beside the sandbox and go when it is forgotten. They
+            are not written into the guest and nothing inside it can read them,
+            which is what separates them from `env` -- a tag names a sandbox, it
+            does not configure one.
+
+            **Returned by the API, unlike `env`.** Anything that can read this
+            sandbox can read its tags -- which is its own tenant, and an admin key
+            -- so a tag is a label and never a secret.
+          example: {"env": "ci", "owner": "billing-team"}
         ttl_seconds:
           type: integer
           default: 900
-          description: Maximum lifetime. The sandbox is killed when it elapses.
+          description: |
+            Maximum lifetime. The sandbox is killed when it elapses. Capped by
+            the host's own maximum, and extensible later within that cap with
+            `POST /sandboxes/{sandbox}/extend`.
         idle_seconds:
           type: integer
           default: 120
@@ -874,6 +1159,24 @@ components:
             sandbox and cannot reach another tenant's files. Defaults to
             `/mnt/storage`.
           example: "/data"
+
+    SandboxExtendParams:
+      type: object
+      required: [ttl_seconds]
+      properties:
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          description: |
+            How much longer the sandbox should live, counted from now rather than
+            from its current deadline -- a heartbeat says "give me ten more
+            minutes", and repeating it does not stack.
+
+            What you get is the later of the existing deadline and this one. More
+            than the host's maximum lifetime from creation still has left is
+            refused, not trimmed. The reply's `expires` is the answer; this number
+            is a request.
+          example: 600
 
     # --- tenants (admin) ----------------------------------------------------
 
@@ -1031,6 +1334,13 @@ components:
         object: { type: string, enum: [file] }
         path: { type: string, example: "/app/main.py" }
         size_bytes: { type: integer }
+        mode:
+          type: string
+          description: |
+            The permission bits the file ended up with, octal. Set explicitly
+            rather than left to whatever umask the guest happens to have, so this
+            is what was asked for and not an approximation of it.
+          example: "0644"
 
     FileCreateParams:
       type: object
@@ -1044,6 +1354,70 @@ components:
           type: string
           format: byte
           description: The file's bytes, base64 encoded so binary survives the trip.
+        mode:
+          type: string
+          pattern: '^0?[0-7]{3}$'
+          default: "0644"
+          description: |
+            Permission bits, octal -- `0755` for something you intend to execute.
+            Defaults to `0644`, so an upload is readable and not runnable unless
+            you say otherwise.
+
+            Three digits, with an optional leading zero. setuid, setgid and the
+            sticky bit are refused with an `invalid_request_error` on `mode`: the
+            host writes this file as root, and the one thing an upload must never
+            be able to do is leave a root-owned setuid binary behind for whatever
+            runs in the guest next. Code inside the sandbox can still chmod its
+            own files -- then it is the guest's own doing, and stays inside the
+            guest.
+          example: "0755"
+
+    FileBatchCreateParams:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: |
+            The files to write, in the order they will be written. An entry is
+            exactly a single-file upload, so a path or mode this route refuses is
+            one the single-file route refuses too -- there is one set of rules,
+            not two.
+          items: { $ref: '#/components/schemas/FileCreateParams' }
+
+    FileList:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items: { $ref: '#/components/schemas/File' }
+
+    Directory:
+      type: object
+      description: |
+        A directory in the sandbox. Deliberately not a `File`: a directory has no
+        bytes, and a `size_bytes: 0` on one would be a number a caller could
+        believe.
+      required: [object, path]
+      properties:
+        object: { type: string, enum: [directory] }
+        path: { type: string, example: "/app/out" }
+
+    DirectoryCreateParams:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: |
+            Absolute path inside the sandbox. Parents are created. Validated
+            before it reaches the guest: a relative path, or one containing `..`,
+            is refused rather than resolved into whatever it would have meant.
+          example: "/app/out"
 
     # --- task ---------------------------------------------------------------
 

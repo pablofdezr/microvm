@@ -11,6 +11,21 @@ const (
 	BearerAuthScopes bearerAuthContextKey = "bearerAuth.Scopes"
 )
 
+// Defines values for DirectoryObject.
+const (
+	DirectoryObjectDirectory DirectoryObject = "directory"
+)
+
+// Valid indicates whether the value is a known member of the DirectoryObject enum.
+func (e DirectoryObject) Valid() bool {
+	switch e {
+	case DirectoryObjectDirectory:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ErrorType.
 const (
 	ErrorTypeApiError            ErrorType = "api_error"
@@ -107,6 +122,21 @@ const (
 func (e FileObject) Valid() bool {
 	switch e {
 	case FileObjectFile:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for FileListObject.
+const (
+	FileListObjectList FileListObject = "list"
+)
+
+// Valid indicates whether the value is a known member of the FileListObject enum.
+func (e FileListObject) Valid() bool {
+	switch e {
+	case FileListObjectList:
 		return true
 	default:
 		return false
@@ -376,17 +406,36 @@ func (e TenantFullPolicy) Valid() bool {
 
 // Defines values for TenantListObject.
 const (
-	List TenantListObject = "list"
+	TenantListObjectList TenantListObject = "list"
 )
 
 // Valid indicates whether the value is a known member of the TenantListObject enum.
 func (e TenantListObject) Valid() bool {
 	switch e {
-	case List:
+	case TenantListObjectList:
 		return true
 	default:
 		return false
 	}
+}
+
+// Directory A directory in the sandbox. Deliberately not a `File`: a directory has no
+// bytes, and a `size_bytes: 0` on one would be a number a caller could
+// believe.
+type Directory struct {
+	Object DirectoryObject `json:"object"`
+	Path   string          `json:"path"`
+}
+
+// DirectoryObject defines model for Directory.Object.
+type DirectoryObject string
+
+// DirectoryCreateParams defines model for DirectoryCreateParams.
+type DirectoryCreateParams struct {
+	// Path Absolute path inside the sandbox. Parents are created. Validated
+	// before it reaches the guest: a relative path, or one containing `..`,
+	// is refused rather than resolved into whatever it would have meant.
+	Path string `json:"path"`
 }
 
 // Error defines model for Error.
@@ -527,6 +576,10 @@ type ExecutionStatus string
 
 // File defines model for File.
 type File struct {
+	// Mode The permission bits the file ended up with, octal. Set explicitly
+	// rather than left to whatever umask the guest happens to have, so this
+	// is what was asked for and not an approximation of it.
+	Mode      *string    `json:"mode,omitempty"`
 	Object    FileObject `json:"object"`
 	Path      string     `json:"path"`
 	SizeBytes int        `json:"size_bytes"`
@@ -535,14 +588,52 @@ type File struct {
 // FileObject defines model for File.Object.
 type FileObject string
 
+// FileBatchCreateParams defines model for FileBatchCreateParams.
+type FileBatchCreateParams struct {
+	// Files The files to write, in the order they will be written. An entry is
+	// exactly a single-file upload, so a path or mode this route refuses is
+	// one the single-file route refuses too -- there is one set of rules,
+	// not two.
+	Files []FileCreateParams `json:"files"`
+}
+
 // FileCreateParams defines model for FileCreateParams.
 type FileCreateParams struct {
 	// Content The file's bytes, base64 encoded so binary survives the trip.
 	Content []byte `json:"content"`
 
+	// Mode Permission bits, octal -- `0755` for something you intend to execute.
+	// Defaults to `0644`, so an upload is readable and not runnable unless
+	// you say otherwise.
+	//
+	// Three digits, with an optional leading zero. setuid, setgid and the
+	// sticky bit are refused with an `invalid_request_error` on `mode`: the
+	// host writes this file as root, and the one thing an upload must never
+	// be able to do is leave a root-owned setuid binary behind for whatever
+	// runs in the guest next. Code inside the sandbox can still chmod its
+	// own files -- then it is the guest's own doing, and stays inside the
+	// guest.
+	Mode *string `json:"mode,omitempty"`
+
 	// Path Absolute path inside the sandbox. Parent directories are created.
 	Path string `json:"path"`
 }
+
+// FileList defines model for FileList.
+type FileList struct {
+	Data []File `json:"data"`
+
+	// HasMore Whether more objects exist past this page. Page on with
+	// `starting_after` set to the last ID in `data`.
+	HasMore bool           `json:"has_more"`
+	Object  FileListObject `json:"object"`
+
+	// Url The endpoint this list came from.
+	Url string `json:"url"`
+}
+
+// FileListObject defines model for FileList.Object.
+type FileListObject string
 
 // Frame One event in an execution's stream, sent as an SSE data payload.
 type Frame struct {
@@ -644,7 +735,10 @@ type QueueObject string
 type Sandbox struct {
 	Created time.Time `json:"created"`
 
-	// Expires When the TTL kills it, whatever it is doing.
+	// Expires When the TTL kills it, whatever it is doing. Movable with
+	// `POST /sandboxes/{sandbox}/extend`, but only up to the host's maximum
+	// lifetime counted from `created`, so this field can be pushed back and
+	// never removed.
 	Expires time.Time `json:"expires"`
 	Id      string    `json:"id"`
 	Image   string    `json:"image"`
@@ -667,7 +761,15 @@ type Sandbox struct {
 	// Storage Where this sandbox's files persist, when the node has object storage
 	// configured. Absent when it does not.
 	Storage *SandboxStorage `json:"storage,omitempty"`
-	Vcpus   *int            `json:"vcpus,omitempty"`
+
+	// Tags The labels set at create time, returned exactly as they were given.
+	//
+	// Unlike `env`, tags **are** returned -- here, and in every list that
+	// includes this sandbox. Never put a credential in one. A secret that
+	// needs to reach the guest is what `env` is for, and `env` is
+	// write-only precisely so this mistake cannot be made by accident.
+	Tags  *map[string]string `json:"tags,omitempty"`
+	Vcpus *int               `json:"vcpus,omitempty"`
 }
 
 // SandboxObject defines model for Sandbox.Object.
@@ -713,9 +815,43 @@ type SandboxCreateParams struct {
 	// yours to choose, and only to tighten.
 	Storage *SandboxStorageParams `json:"storage,omitempty"`
 
-	// TtlSeconds Maximum lifetime. The sandbox is killed when it elapses.
+	// Tags Labels of your own, for finding this sandbox again: filter
+	// `GET /sandboxes` by `tag`, or read them back off the object.
+	//
+	// At most 10 pairs, keys at most 64 bytes and values at most 256. Bytes
+	// rather than characters, so a key written in emoji runs out about four
+	// times sooner than its length suggests. A key may not be empty and may
+	// not contain `:`, which is the character the `tag` filter splits on.
+	//
+	// Node-local, like the list they are filtered on: they live in the
+	// daemon's memory beside the sandbox and go when it is forgotten. They
+	// are not written into the guest and nothing inside it can read them,
+	// which is what separates them from `env` -- a tag names a sandbox, it
+	// does not configure one.
+	//
+	// **Returned by the API, unlike `env`.** Anything that can read this
+	// sandbox can read its tags -- which is its own tenant, and an admin key
+	// -- so a tag is a label and never a secret.
+	Tags *map[string]string `json:"tags,omitempty"`
+
+	// TtlSeconds Maximum lifetime. The sandbox is killed when it elapses. Capped by
+	// the host's own maximum, and extensible later within that cap with
+	// `POST /sandboxes/{sandbox}/extend`.
 	TtlSeconds *int `json:"ttl_seconds,omitempty"`
 	Vcpus      *int `json:"vcpus,omitempty"`
+}
+
+// SandboxExtendParams defines model for SandboxExtendParams.
+type SandboxExtendParams struct {
+	// TtlSeconds How much longer the sandbox should live, counted from now rather than
+	// from its current deadline -- a heartbeat says "give me ten more
+	// minutes", and repeating it does not stack.
+	//
+	// What you get is the later of the existing deadline and this one. More
+	// than the host's maximum lifetime from creation still has left is
+	// refused, not trimmed. The reply's `expires` is the answer; this number
+	// is a request.
+	TtlSeconds int `json:"ttl_seconds"`
 }
 
 // SandboxList defines model for SandboxList.
@@ -797,6 +933,26 @@ type Stats struct {
 
 	// MemoryPeakBytes The high-water mark, which is what a memory limit must be sized against.
 	MemoryPeakBytes int `json:"memory_peak_bytes"`
+
+	// NetworkRxBytes Bytes the guest received.
+	//
+	// Read from the host's TAP device, where the direction necessarily
+	// inverts: what the guest sends is what the host receives. Both network
+	// fields are named from the **guest's** point of view, so `rx` is what
+	// came into the sandbox and `tx` is what it sent out. Do not line them
+	// up with host-side counters of the same name -- those are the other way
+	// round, and the mistake is invisible until an egress bill or an abuse
+	// report says otherwise.
+	//
+	// Absent when the sandbox has no network device: with `network: false`
+	// there is no TAP, and "nothing to count" is not the same claim as
+	// zero bytes.
+	NetworkRxBytes *int64 `json:"network_rx_bytes,omitempty"`
+
+	// NetworkTxBytes Bytes the guest sent. This is the egress number -- the one a bandwidth
+	// cap limits and an abuse complaint is about. Counted at the host's TAP
+	// and named from the guest's side, like `network_rx_bytes`.
+	NetworkTxBytes *int64 `json:"network_tx_bytes,omitempty"`
 
 	// WallMs How long the sandbox has existed.
 	WallMs int `json:"wall_ms"`
@@ -1003,6 +1159,18 @@ type ListSandboxesParams struct {
 
 	// State Only sandboxes in this state.
 	State *SandboxState `form:"state,omitempty" json:"state,omitempty"`
+
+	// Tag Only sandboxes carrying this tag, written `key:value`. Repeat the
+	// parameter to require several: they AND, so `?tag=env:ci&tag=owner:me`
+	// returns the sandboxes carrying both. The split is at the first colon,
+	// so a value may contain colons and a key may not.
+	//
+	// The filter is node-local, because the list is: it searches the
+	// sandboxes this node holds, not the fleet's. On more than one node you
+	// get this node's answer, and finding a tagged sandbox anywhere means
+	// asking each node. A tag nobody set is an empty page, not an error --
+	// there is no registry of known keys to be wrong about.
+	Tag *[]string `form:"tag,omitempty" json:"tag,omitempty"`
 }
 
 // CreateSandboxParams defines parameters for CreateSandbox.
@@ -1073,14 +1241,23 @@ type CreateTaskParams struct {
 // CreateSandboxJSONRequestBody defines body for CreateSandbox for application/json ContentType.
 type CreateSandboxJSONRequestBody = SandboxCreateParams
 
+// CreateDirJSONRequestBody defines body for CreateDir for application/json ContentType.
+type CreateDirJSONRequestBody = DirectoryCreateParams
+
 // CreateExecutionJSONRequestBody defines body for CreateExecution for application/json ContentType.
 type CreateExecutionJSONRequestBody = ExecutionCreateParams
 
 // CancelExecutionJSONRequestBody defines body for CancelExecution for application/json ContentType.
 type CancelExecutionJSONRequestBody = ExecutionCancelParams
 
+// ExtendSandboxJSONRequestBody defines body for ExtendSandbox for application/json ContentType.
+type ExtendSandboxJSONRequestBody = SandboxExtendParams
+
 // CreateFileJSONRequestBody defines body for CreateFile for application/json ContentType.
 type CreateFileJSONRequestBody = FileCreateParams
+
+// CreateFilesJSONRequestBody defines body for CreateFiles for application/json ContentType.
+type CreateFilesJSONRequestBody = FileBatchCreateParams
 
 // CreateTaskJSONRequestBody defines body for CreateTask for application/json ContentType.
 type CreateTaskJSONRequestBody = TaskCreateParams

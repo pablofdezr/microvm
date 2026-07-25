@@ -71,7 +71,7 @@ func (s *Server) handleRetrieveTenant(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Tenants == nil {
 		writeJSON(w, http.StatusOK, apitypes.TenantList{
-			Object:  apitypes.List,
+			Object:  apitypes.TenantListObjectList,
 			Url:     "/" + APIVersion + "/tenants",
 			HasMore: false,
 			Data:    []apitypes.Tenant{},
@@ -90,7 +90,7 @@ func (s *Server) handleListTenants(w http.ResponseWriter, r *http.Request) {
 		data = append(data, toAPITenant(rec.Tenant, rec.Policy, nil))
 	}
 	writeJSON(w, http.StatusOK, apitypes.TenantList{
-		Object:  apitypes.List,
+		Object:  apitypes.TenantListObjectList,
 		Url:     "/" + APIVersion + "/tenants",
 		HasMore: false,
 		Data:    data,

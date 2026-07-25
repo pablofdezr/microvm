@@ -354,3 +354,40 @@ func TestRejectsUnknownPolicy(t *testing.T) {
 		t.Errorf("an unknown policy was accepted: got %d, want 400", res.StatusCode)
 	}
 }
+
+// TestTenantListIsEnveloped pins the discriminator to the wire value rather than
+// to the generated constant that carries it. Adding a schema to the spec renames
+// those constants, so the handler must be repointed at a new identifier -- and
+// the compiler only catches the rename, not a repoint at a constant holding some
+// other value.
+func TestTenantListIsEnveloped(t *testing.T) {
+	h, _ := newAdminHarness(t)
+
+	res := h.req(t, http.MethodPut, "/v1/tenants/t_user", "sk_admin",
+		`{"max_bytes":1000,"policy":"preserve"}`)
+	res.Body.Close()
+
+	res = h.req(t, http.MethodGet, "/v1/tenants", "sk_admin", "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("list tenants returned %d", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"object":"list"`) {
+		t.Errorf("the envelope is not object=list: %s", body)
+	}
+
+	var list apitypes.TenantList
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Url != "/v1/tenants" {
+		t.Errorf("url = %q, want /v1/tenants", list.Url)
+	}
+	if len(list.Data) != 1 {
+		t.Errorf("data has %d items, want the one configured tenant", len(list.Data))
+	}
+}

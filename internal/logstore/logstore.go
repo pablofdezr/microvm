@@ -270,6 +270,30 @@ func (s *Store) SandboxGone(sandboxID string) {
 	}
 }
 
+// ForgetSandbox drops every record belonging to a sandbox, returning how many
+// went.
+//
+// Called when the manager forgets the sandbox itself, because the sandbox is the
+// only handle these records have: an exec is reached through its sandbox, so a
+// record whose sandbox is gone is memory that no route can reach. Sweep is not
+// enough on its own -- a store with no retention window keeps records forever,
+// which on a node that does reap sandboxes is a leak for the daemon's whole life.
+//
+// Their subscribers were already closed when the sandbox stopped: SandboxGone
+// finishes every still-running exec, and a stopped sandbox is the only kind the
+// manager forgets.
+func (s *Store) ForgetSandbox(sandboxID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := s.bySandbox[sandboxID]
+	for _, id := range ids {
+		delete(s.entries, id)
+	}
+	delete(s.bySandbox, sandboxID)
+	return len(ids)
+}
+
 // Sweep drops records whose retention has elapsed, returning how many went.
 // Without it the store grows for the daemon's whole life.
 func (s *Store) Sweep() int {
@@ -303,6 +327,14 @@ func (s *Store) Sweep() int {
 	}
 	return dropped
 }
+
+// Retention is how long a finished exec's output is kept once its sandbox is
+// gone, or zero when nothing is ever dropped.
+//
+// Exported for the sandbox manager, which must not forget a sandbox sooner than
+// this: every exec record is reached through its sandbox, so the two windows are
+// one decision. No lock -- it is set in New and never moves.
+func (s *Store) Retention() time.Duration { return s.retention }
 
 func (s *Store) entry(execID string) *entry {
 	s.mu.RLock()

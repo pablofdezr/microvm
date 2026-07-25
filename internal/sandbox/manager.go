@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,12 +74,100 @@ type Spec struct {
 	// Zero uses DefaultIdleTimeout; negative disables it.
 	IdleTimeout time.Duration
 
+	// Tenant is who the sandbox is attributed to, or empty for nobody. Like
+	// Storage it comes from the caller's authenticated identity and never from a
+	// request body: it is what MaxConcurrent is counted against, and a tenant a
+	// body could choose is a limit a body could dodge.
+	//
+	// Empty means uncounted, which covers two real cases: a daemon with no auth,
+	// and a queued task. A task's submitter is known at enqueue time, so that
+	// second case is a limitation rather than a tidy rule: this count is one node's
+	// and a task is leased by whichever node has room, so charging it here would
+	// refuse work on the node that read the count and admit the same work on the
+	// next. Task load is bounded by slots and by the scheduler's resource packing
+	// instead. See DEPLOY.md.
+	Tenant string
+
+	// MaxConcurrent bounds how many sandboxes Tenant may have running at once.
+	// Zero is unlimited. It is carried per create rather than held on the Manager
+	// because it belongs to the caller's identity, and two callers on one node do
+	// not share one.
+	MaxConcurrent int
+
 	// Storage is where this sandbox's files go, or nil to fall back to a
 	// per-sandbox namespace. It is set by the layer that knows who the caller is,
 	// from the caller's authenticated identity and never from the request body:
 	// the prefix names a tenant, and letting a body choose it would let one
 	// tenant name another's. See the API's create handler.
 	Storage *storage.Mount
+
+	// Tags are the caller's own labels, for finding this sandbox again. They stay
+	// host-side -- nothing about them reaches the guest, which is what separates
+	// them from Env: a tag names a sandbox, it does not configure one. They are
+	// also reported back, so they are labels and never secrets.
+	//
+	// Pass them through ValidateTags first. They are held for as long as the
+	// sandbox is, so the caps are the whole reason a caller cannot make this
+	// map big.
+	Tags map[string]string
+}
+
+// Tag limits.
+//
+// A tag is caller-controlled memory the manager holds until the sandbox is
+// forgotten, so these bound it: without them a create call is a way to park
+// megabytes in the daemon's heap per sandbox and pay for a VM's worth of
+// nothing. The lengths are in bytes because that is what is being spent.
+const (
+	MaxTags          = 10
+	MaxTagKeyBytes   = 64
+	MaxTagValueBytes = 256
+)
+
+// ValidateTags checks a caller's labels against the limits above.
+//
+// The rule lives beside the map it bounds rather than in the API, because every
+// caller of Create pays the memory. The returned error reads as the reason a
+// value was refused, so a caller-facing layer can quote it verbatim.
+func ValidateTags(tags map[string]string) error {
+	if len(tags) > MaxTags {
+		return fmt.Errorf("at most %d tags, and this is %d", MaxTags, len(tags))
+	}
+	for k, v := range tags {
+		switch {
+		case k == "":
+			return errors.New("a tag key cannot be empty")
+		case len(k) > MaxTagKeyBytes:
+			// Bytes, not characters: a key written in emoji runs out about four
+			// times sooner than its length suggests, and the difference is exactly
+			// what the cap is spending.
+			return fmt.Errorf("the key %q is %d bytes, and a key may be at most %d",
+				elide(k), len(k), MaxTagKeyBytes)
+		case strings.Contains(k, ":"):
+			return fmt.Errorf("the key %q contains \":\", which is where the tag filter splits", elide(k))
+		case len(v) > MaxTagValueBytes:
+			return fmt.Errorf("the value of %q is %d bytes, and a value may be at most %d",
+				elide(k), len(v), MaxTagValueBytes)
+		}
+	}
+	return nil
+}
+
+// elide shortens a caller's string for an error message. Quoting the key back is
+// how a caller knows which tag was refused, and a key that broke the length
+// limit is by definition too long to repeat. It cuts on a rune boundary, so the
+// message stays valid UTF-8 for whatever renders it.
+func elide(s string) string {
+	const max = 32
+	if len(s) <= max {
+		return s
+	}
+	for i := range s {
+		if i > max {
+			return s[:i] + "..."
+		}
+	}
+	return s
 }
 
 // Info is a sandbox's status.
@@ -94,7 +184,8 @@ type Info struct {
 	CreatedAt time.Time
 	StoppedAt time.Time
 
-	// ExpiresAt is when the TTL will kill it.
+	// ExpiresAt is when the TTL will kill it. Extend moves it, so it is read at
+	// the moment Info is called and not before.
 	ExpiresAt time.Time
 
 	Image   string
@@ -105,6 +196,11 @@ type Info struct {
 	// Storage describes where this sandbox's files go, or nil when the node has
 	// no object storage and the sandbox therefore has none.
 	Storage *StorageInfo
+
+	// Tags are the labels the sandbox was created with, or nil when it was created
+	// with none. Reported, unlike Env: they are what a caller filters a list by,
+	// so they have to come back out.
+	Tags map[string]string
 
 	Stats runtime.Stats
 }
@@ -140,12 +236,22 @@ type Sandbox struct {
 	mgr  *Manager
 
 	createdAt time.Time
-	expiresAt time.Time
 
 	// cancelSupervisor stops the goroutine enforcing TTL and idle.
 	cancelSupervisor context.CancelFunc
 
+	// ttlNudge wakes the supervisor when the deadline moves, so the one TTL
+	// timer is re-armed rather than joined by a second one still armed for the
+	// old deadline. Sent to without blocking: a nudge that does not fit is a
+	// nudge already pending, and the supervisor re-reads the deadline when it
+	// wakes rather than trusting what woke it.
+	ttlNudge chan struct{}
+
 	mu sync.Mutex
+	// expiresAt is when the TTL kills it. Extend moves it, so it is guarded like
+	// everything else here -- it was read without the lock while it was
+	// write-once, and reading it that way now is a race.
+	expiresAt time.Time
 	// running counts execs in flight. The sandbox is idle at zero, and the
 	// idle clock only runs then.
 	running int
@@ -155,6 +261,14 @@ type Sandbox struct {
 	state      State
 	reason     StopReason
 	stoppedAt  time.Time
+
+	// stopping is set the moment the supervisor decides the TTL is up, which is
+	// earlier than the state saying stopped: stop samples the meters -- a cgroup
+	// read plus two sysfs reads for the TAP counters -- before it takes this lock,
+	// so the gap between the two is filesystem-IO wide rather than instruction
+	// wide. Extend refuses in that gap, because granting an hour to a sandbox that
+	// dies a millisecond later is the one outcome extension exists to prevent.
+	stopping bool
 
 	// storageInfo is the mount this sandbox actually got, set once by
 	// serveStorage when storage is served and nil otherwise. It is read back out
@@ -187,8 +301,21 @@ type Manager struct {
 	// rule, since each pooled VM is a distinct VM that has run no code.
 	warm *warmPool
 
+	// retention is how long a stopped sandbox is remembered before Sweep forgets
+	// it. Zero remembers forever. Set in NewManager and never moved, so it is read
+	// without the lock. See reap.go.
+	retention time.Duration
+
 	mu        sync.RWMutex
 	sandboxes map[string]*Sandbox
+
+	// live counts each tenant's sandboxes that are still running, including the
+	// ones still booting. A counter rather than a walk of sandboxes: the walk
+	// would have to read every sandbox's state under its own lock while holding
+	// this one, and stopped sandboxes stay in the map for the retention window,
+	// so most of what it read would not count. An entry is deleted at zero, which
+	// is what stops this growing with every tenant that ever called.
+	live map[string]int
 }
 
 // Option configures a Manager.
@@ -228,10 +355,13 @@ func NewManager(rt runtime.Runtime, logs *logstore.Store, log *slog.Logger, opts
 		logs:      logs,
 		log:       log,
 		sandboxes: make(map[string]*Sandbox),
+		live:      make(map[string]int),
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
+	// After the options, because the floor is not the operator's to lower.
+	m.retention = retentionFloor(m.retention, logs.Retention())
 	m.warm.start() // no-op when unconfigured or nil
 	return m
 }
@@ -275,9 +405,86 @@ func (m *Manager) TenantUsage(ctx context.Context, tenant string) (int64, error)
 	return storage.UsageBytes(ctx, m.storage, TenantPrefix(tenant))
 }
 
+// ConcurrencyLimitError is a create refused because the tenant already has as
+// many sandboxes running as it may.
+//
+// Typed, so the layer facing the caller can say whose limit was reached: "the
+// node is full" and "you are full" both stop the same call, and only one of them
+// is fixed by waiting for someone else.
+type ConcurrencyLimitError struct {
+	// Live is how many the tenant has running, counting sandboxes still booting.
+	Live int
+	// Max is how many it may have at once.
+	Max int
+}
+
+func (e *ConcurrencyLimitError) Error() string {
+	return fmt.Sprintf("this tenant has %d sandboxes running and may have %d at once", e.Live, e.Max)
+}
+
+// reserve takes one of the tenant's concurrency slots, or reports the cap.
+//
+// The count is incremented whether or not there is a limit, because the cheap
+// bookkeeping is what makes the limit exact when one is set. An unlimited tenant
+// costs one int.
+func (m *Manager) reserve(tenant string, limit int) error {
+	if tenant == "" {
+		// Nobody to charge. Said out loud when a limit was asked for, because this
+		// is the one place a cap is silently not applied: a caller that set
+		// MaxConcurrent and left Tenant empty gets no limit and, without this, no
+		// hint that it asked for one.
+		if limit > 0 {
+			m.log.Warn("a concurrency limit was set with no tenant to charge it to, so it does not apply",
+				"limit", limit)
+		}
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if n := m.live[tenant]; limit > 0 && n >= limit {
+		return &ConcurrencyLimitError{Live: n, Max: limit}
+	}
+	m.live[tenant]++
+	return nil
+}
+
+// release gives a tenant's slot back. Called when a sandbox stops, and when a
+// create that reserved one never got a VM.
+func (m *Manager) release(tenant string) {
+	if tenant == "" {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if n := m.live[tenant]; n > 1 {
+		m.live[tenant] = n - 1
+		return
+	}
+	// Deleted rather than left at zero: the map would otherwise hold an entry per
+	// tenant that has ever created a sandbox, for the daemon's whole life.
+	delete(m.live, tenant)
+}
+
 // Create starts a sandbox and begins enforcing its lifetime.
 func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 	spec.applyDefaults()
+
+	// Reserved before the VM boots, not counted after it has. Two creates that
+	// both read a count and then raised it would both pass, so the cap would hold
+	// everywhere except under the concurrency that makes it matter.
+	if err := m.reserve(spec.Tenant, spec.MaxConcurrent); err != nil {
+		return nil, err
+	}
+
+	// Take the tags rather than borrow them. The caps were checked against this
+	// map before the call, and a map the caller still holds can grow afterwards
+	// -- which would make the check theatre, since what is kept here is kept for
+	// the sandbox's whole life.
+	spec.Tags = maps.Clone(spec.Tags)
 
 	// The guest is told about storage on its kernel command line, which the
 	// runtime builds inside Create -- so the decision has to be made now, before
@@ -295,6 +502,10 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 		var err error
 		inst, err = m.rt.Create(ctx, spec.Spec)
 		if err != nil {
+			// Nothing booted, so the slot reserved above is nobody's. Holding it
+			// would let a node that is failing to boot VMs slowly lock a tenant out
+			// of the cap it never spent.
+			m.release(spec.Tenant)
 			return nil, err
 		}
 	}
@@ -310,6 +521,7 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 		expiresAt:  now.Add(spec.TTL),
 		lastActive: now,
 		state:      StateRunning,
+		ttlNudge:   make(chan struct{}, 1),
 	}
 
 	// The supervisor outlives this call, so it gets its own context rather than
@@ -484,7 +696,7 @@ func (m *Manager) Close(ctx context.Context) error {
 // supervise enforces the TTL and the idle timeout. It exits when the sandbox
 // stops.
 func (s *Sandbox) supervise(ctx context.Context) {
-	ttl := time.NewTimer(time.Until(s.expiresAt))
+	ttl := time.NewTimer(time.Until(s.deadline()))
 	defer ttl.Stop()
 
 	// The idle check polls rather than arming a timer per exec: an exec that
@@ -498,8 +710,26 @@ func (s *Sandbox) supervise(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
+		case <-s.ttlNudge:
+			// The deadline moved. Re-arm this timer instead of arming another:
+			// a second one would still fire at the old deadline and kill the
+			// sandbox the extension just bought time for. Reset alone is enough
+			// -- a timer's channel holds no stale value to drain.
+			ttl.Reset(time.Until(s.deadline()))
+
 		case <-ttl.C:
-			s.log.Info("sandbox reached its ttl", "ttl", s.spec.TTL)
+			// A nudge and this firing can be ready in the same select, which
+			// picks either. Re-read the deadline rather than trusting the wakeup,
+			// and claim the kill in the same breath: killing a sandbox whose
+			// extension was already granted is the one outcome extension exists
+			// to prevent.
+			remaining, expired := s.claimExpiry()
+			if !expired {
+				ttl.Reset(remaining)
+				continue
+			}
+			s.log.Info("sandbox reached its ttl",
+				"lifetime", time.Since(s.createdAt).Round(time.Second))
 			// Its own context: the supervisor's is about to be cancelled by the
 			// very stop we are calling.
 			stopCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
@@ -540,6 +770,147 @@ func (s *Sandbox) idleFor(d time.Duration) bool {
 		return false
 	}
 	return time.Since(s.lastActive) >= d
+}
+
+// deadline is when the TTL will kill the sandbox.
+func (s *Sandbox) deadline() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.expiresAt
+}
+
+// claimExpiry reports whether the TTL is up, and claims the kill when it is.
+//
+// Deciding and claiming are one critical section because Extend moves the
+// deadline under this same lock. Read the deadline, decide, then flip the state
+// as three separate steps and there is a window in between where Extend still
+// sees a running sandbox with a deadline it may move: the caller is told 200 with
+// an hour on the clock, and the sandbox they were promised is killed immediately
+// afterwards. Claiming here means Extend's own guard refuses everything from this
+// moment on, and stop overwrites the claim with StateStopped as it already does.
+func (s *Sandbox) claimExpiry() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if remaining := time.Until(s.expiresAt); remaining > 0 {
+		return remaining, false
+	}
+	s.stopping = true
+	return 0, true
+}
+
+// TTLLimitError is an extension refused for reaching past the sandbox's maximum
+// lifetime, with the room that is left.
+//
+// Refused rather than clamped: a caller told 200 for an hour they did not get
+// plans for an hour, and finds out when their work is killed halfway. An error
+// they can read is worse news, delivered while they can still act on it.
+type TTLLimitError struct {
+	// Requested is the extension asked for, counted from now.
+	Requested time.Duration
+	// Remaining is the largest extension that would be accepted: Max less the
+	// time the sandbox has already lived. Zero once the sandbox has lived Max.
+	Remaining time.Duration
+	// Max is the maximum lifetime, measured from creation.
+	Max time.Duration
+}
+
+func (e *TTLLimitError) Error() string {
+	return fmt.Sprintf("an extension of %s would outlive the maximum lifetime of %s from creation; %s remains",
+		e.Requested, e.Max, e.Remaining)
+}
+
+// ExpiredError is an extension refused because the deadline had already passed
+// and the supervisor had claimed the kill.
+//
+// Typed because the caller-facing layer cannot work this out by reading the
+// state: the state still says running for as long as the kill takes, and that gap
+// is exactly the window this error reports. It means the same thing to a caller as
+// extending an already-stopped sandbox, which is what they would have got a
+// millisecond later.
+type ExpiredError struct{ ID string }
+
+func (e *ExpiredError) Error() string {
+	return fmt.Sprintf("sandbox %s reached its ttl and is stopping", e.ID)
+}
+
+// Extend pushes the TTL deadline out and re-arms the timer enforcing it.
+//
+// It never brings a deadline forward: the new one is the later of what it
+// already was and now+ttl. Two callers heartbeating the same sandbox at
+// different intervals would otherwise have the shorter one cut the longer one
+// short, and it is what makes a retry of this call harmless.
+//
+// The deadline is bounded by MaxTTL measured from creation, never from now,
+// which is what makes extension buy time and never immortality: a caller that
+// heartbeats forever still ends up with a sandbox that dies. Measured from now
+// the bound would move with every call and the lifetime hostile code is held to
+// would stop existing. Asking past it returns *TTLLimitError.
+//
+// Extending a stopped sandbox is refused, not quietly accepted -- there is no
+// deadline left to move, and a caller heartbeating something already gone
+// should learn it here rather than from an exec that has nowhere to run.
+//
+// The idle timeout is untouched. A long TTL does not keep an idle sandbox alive.
+func (s *Sandbox) Extend(ttl time.Duration) (time.Time, error) {
+	s.mu.Lock()
+	if s.state != StateRunning {
+		state, reason := s.state, s.reason
+		s.mu.Unlock()
+		return time.Time{}, fmt.Errorf("sandbox %s is %s (%s)", s.id, state, reason)
+	}
+	// Claimed by the supervisor and not yet stopped. Refused rather than granted,
+	// because the deadline this would move belongs to a sandbox already on its way
+	// out: see claimExpiry.
+	if s.stopping {
+		s.mu.Unlock()
+		return time.Time{}, &ExpiredError{ID: s.id}
+	}
+	expires, err := extendedDeadline(time.Now(), s.createdAt, s.expiresAt, ttl, MaxTTL)
+	if err != nil {
+		s.mu.Unlock()
+		return time.Time{}, fmt.Errorf("sandbox %s: %w", s.id, err)
+	}
+	s.expiresAt = expires
+	s.mu.Unlock()
+
+	select {
+	case s.ttlNudge <- struct{}{}:
+	default: // one is already pending, and it will read the deadline set above
+	}
+
+	s.log.Info("sandbox ttl extended", "requested", ttl, "expires", expires)
+	return expires, nil
+}
+
+// extendedDeadline is the deadline an extension produces, or *TTLLimitError when
+// the request reaches past the maximum lifetime.
+//
+// It is separate from Extend because it is the whole of the rule and none of the
+// plumbing, and because it takes created and now as arguments rather than
+// reading the clock: the bound is measured from creation, and that is only worth
+// asserting from partway through a sandbox's life.
+func extendedDeadline(now, created, expires time.Time, ttl, maxLifetime time.Duration) (time.Time, error) {
+	if ttl <= 0 {
+		return time.Time{}, fmt.Errorf("an extension must be positive, got %s", ttl)
+	}
+
+	limit := created.Add(maxLifetime)
+	wanted := now.Add(ttl)
+	if wanted.After(limit) {
+		return time.Time{}, &TTLLimitError{
+			Requested: ttl,
+			Remaining: max(limit.Sub(now), 0).Round(time.Second),
+			Max:       maxLifetime,
+		}
+	}
+
+	// Later of the two, never the shorter: a caller asking for less than the
+	// sandbox already has is asking for a floor, not a ceiling.
+	if wanted.Before(expires) {
+		return expires, nil
+	}
+	return wanted, nil
 }
 
 // Exec runs a command, streaming frames to onFrame and recording everything in
@@ -712,27 +1083,61 @@ func (s *Sandbox) endExec() {
 	s.lastActive = time.Now()
 }
 
+// A transfer counts as activity, exactly like an exec.
+//
+// Bracketing these with beginExec/endExec is what stops the idle reclaim killing a
+// sandbox that is busy: staging a project is minutes of uploads with nothing run
+// in between, and a sandbox measured only by its execs is idle for all of it. It
+// also resets the idle clock when the transfer ends, so the two minutes start from
+// the last file rather than from before the first.
+
 // WriteFile uploads content into the sandbox.
 func (s *Sandbox) WriteFile(ctx context.Context, path string, content io.Reader, mode string) error {
-	if err := s.requireRunning(); err != nil {
+	if err := s.beginExec(); err != nil {
 		return err
 	}
+	defer s.endExec()
 	return s.inst.Client().WriteFile(ctx, path, content, mode)
 }
 
 // ReadFile downloads a file from the sandbox. The caller must close the reader.
+//
+// The sandbox stays busy until that Close rather than until this returns: the
+// transfer is the reading, and a multi-gigabyte artifact takes longer to stream
+// than the idle timeout allows. Returning here and calling it finished would have
+// the VM reclaimed out from under the response body.
 func (s *Sandbox) ReadFile(ctx context.Context, path string) (io.ReadCloser, error) {
-	if err := s.requireRunning(); err != nil {
+	if err := s.beginExec(); err != nil {
 		return nil, err
 	}
-	return s.inst.Client().ReadFile(ctx, path)
+	rc, err := s.inst.Client().ReadFile(ctx, path)
+	if err != nil {
+		s.endExec()
+		return nil, err
+	}
+	return &activeRead{ReadCloser: rc, sb: s}, nil
+}
+
+// activeRead holds the sandbox busy for as long as its caller is still reading.
+type activeRead struct {
+	io.ReadCloser
+	sb   *Sandbox
+	once sync.Once
+}
+
+func (a *activeRead) Close() error {
+	// Once: a second Close would decrement the in-flight count twice, and a count
+	// below zero is a sandbox nothing can ever reclaim.
+	a.once.Do(a.sb.endExec)
+	return a.ReadCloser.Close()
 }
 
 // Mkdir creates a directory inside the sandbox.
 func (s *Sandbox) Mkdir(ctx context.Context, path string) error {
-	if err := s.requireRunning(); err != nil {
+	if err := s.beginExec(); err != nil {
 		return err
 	}
+	defer s.endExec()
 	return s.inst.Client().Mkdir(ctx, path)
 }
 
@@ -770,6 +1175,7 @@ func (s *Sandbox) Info() Info {
 	s.mu.Lock()
 	state, reason, stoppedAt, final := s.state, s.reason, s.stoppedAt, s.finalStats
 	storageInfo := s.storageInfo
+	expiresAt := s.expiresAt
 	s.mu.Unlock()
 
 	info := Info{
@@ -778,12 +1184,13 @@ func (s *Sandbox) Info() Info {
 		Reason:    reason,
 		CreatedAt: s.createdAt,
 		StoppedAt: stoppedAt,
-		ExpiresAt: s.expiresAt,
+		ExpiresAt: expiresAt,
 		Image:     s.spec.Image,
 		VCPUs:     s.spec.VCPUs,
 		MemMiB:    s.spec.MemMiB,
 		Network:   s.spec.Network,
 		Storage:   storageInfo,
+		Tags:      s.Tags(),
 	}
 
 	if state == StateRunning {
@@ -824,6 +1231,13 @@ func (s *Sandbox) stop(ctx context.Context, reason StopReason) error {
 	}
 	s.mu.Unlock()
 
+	// The tenant's slot goes back here, not when the record is forgotten: the
+	// sandbox stays listed for the retention window, and a caller who deleted one
+	// must be able to create the next immediately. Stop runs once (stopOnce), so
+	// this cannot double-release. Called with s.mu released, since it takes the
+	// manager's lock and nothing else in this package holds the two together.
+	s.mgr.release(s.spec.Tenant)
+
 	// Any exec still streaming is about to have its VM pulled out from under
 	// it. Mark those records now so a caller polling for a result is told the
 	// sandbox vanished rather than waiting for an exit that will never come.
@@ -855,4 +1269,24 @@ func (s *Sandbox) Reason() StopReason {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.reason
+}
+
+// Tenant is who the sandbox is attributed to, or empty for nobody.
+//
+// Fixed at creation and never from a request body, so no lock, like Tags. It is
+// what a caller-facing layer compares an authenticated identity against before it
+// hands the sandbox over: a sandbox ID is not a capability, and a sandbox with no
+// tenant belongs to no caller.
+func (s *Sandbox) Tenant() string { return s.spec.Tenant }
+
+// Tags returns the sandbox's labels, or nil when it has none.
+//
+// A copy, and no lock: tags are fixed at creation, so there is nothing to guard,
+// but the map behind them is the one every tag filter reads. Handing it out
+// would let anyone holding the result relabel the sandbox for everybody.
+func (s *Sandbox) Tags() map[string]string {
+	if len(s.spec.Tags) == 0 {
+		return nil
+	}
+	return maps.Clone(s.spec.Tags)
 }

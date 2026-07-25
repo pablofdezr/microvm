@@ -214,6 +214,16 @@ Two things worth knowing:
   with it and the cost is unrecoverable, so "what did this run cost?" is
   answered from a snapshot taken while it still existed.
 
+Transfer is metered too: `network_rx_bytes` and `network_tx_bytes` come from the
+sandbox's TAP device, sampled next to the cgroup and for the same reason — stop
+deletes the TAP and its counters go with it. They are reported from the *guest's*
+point of view, so what the host received off the TAP is the guest's `tx`; naming
+them from the host's side would report a sandbox's egress as its ingress, and the
+first you would hear of it is an abuse complaint blaming the wrong direction. A
+sandbox created with `network: false` reports neither field rather than zero: it
+transferred nothing measurable, which is a different statement from having measured
+nothing.
+
 ## Logs survive the VM
 
 Output is buffered on the **host**, not in the guest. The moment you most need a
@@ -339,9 +349,10 @@ Use a sandbox for several commands sharing state, a task for throughput.
 
 ```
 POST   /v1/sandboxes                                   create
-GET    /v1/sandboxes                                   list (cursor paginated)
+GET    /v1/sandboxes                                   list (cursor paginated), ?tag=k:v narrows it
 GET    /v1/sandboxes/{sb}                              state + live stats
 DELETE /v1/sandboxes/{sb}                              destroy, returns the final cost
+POST   /v1/sandboxes/{sb}/extend                       buy more time, bounded from creation
 
 POST   /v1/sandboxes/{sb}/executions                   start a command, returns at once
 GET    /v1/sandboxes/{sb}/executions                   list
@@ -350,6 +361,8 @@ GET    /v1/sandboxes/{sb}/executions/{exe}/stream      SSE: replays, then follow
 POST   /v1/sandboxes/{sb}/executions/{exe}/cancel      signal the process group
 
 POST   /v1/sandboxes/{sb}/files                        upload
+POST   /v1/sandboxes/{sb}/files/batch                  upload up to 100, in order
+POST   /v1/sandboxes/{sb}/dirs                         mkdir -p, for the empty one
 GET    /v1/sandboxes/{sb}/files?path=...               download
 
 POST   /v1/tasks                                       queue work
@@ -385,6 +398,69 @@ the work twice) or not to (and maybe never run it). A key gives them a third:
 retry and get the original answer. Reusing a key with a different body is an
 `idempotency_error` rather than a silent replay of the wrong reply.
 
+Four routes take no key and are still safe to retry, because repeating them is a
+no-op by construction rather than by bookkeeping: `extend` never brings a deadline
+forward, a file write is an overwrite, and `dirs` is `mkdir -p`. All three SDKs
+retry them for that reason — otherwise they would be the routes where a rate
+limit's 429 reaches your code as a hard failure, which is to say the routes you
+upload a project with.
+
+### Buying more time
+
+`POST /v1/sandboxes/{sb}/extend` pushes the TTL out, for work that turned out
+longer than you guessed at create time. The alternative is creating a second
+sandbox, which does not have the first one's state.
+
+The new deadline is bounded by the host's maximum lifetime measured **from
+creation**, never from now. That is the whole design: extension buys time and can
+never buy immortality, so a caller heartbeating in a forgotten loop still ends up
+with a sandbox that dies rather than a slot pinned for a week. Measured from now
+the bound would move with every call and the lifetime hostile code is held to
+would stop existing.
+
+Asking past the bound is a `400` naming the seconds that are left, not a silent
+trim to the maximum: a caller told `200` for an hour they did not get plans for an
+hour and finds out when their work is killed halfway. Read `expires` off the reply
+either way — the request says how long you want, the reply says what you have.
+
+It deliberately does **not** touch the idle timeout. A long TTL is not a reason to
+keep an idle VM's memory reserved; nothing except running something is.
+
+### Tags
+
+`tags` on create, and a repeatable `?tag=key:value` on the list, ANDing so a
+second tag narrows the page rather than widening it. At most 10 pairs, keys 64
+bytes and values 256 — they are held for the sandbox's whole life, so the caps are
+the reason a create call is not a way to park megabytes in the daemon's heap.
+
+Two things they deliberately are not. They are **node-local**, like the list they
+filter: this searches the sandboxes one node holds, not the fleet's, so finding a
+tagged sandbox across a fleet means asking each node. And nothing about them
+reaches the guest — that is what separates a tag from `env`. A tag names a sandbox;
+it does not configure one. Which is also why they are returned and `env` is not: a
+tag is a label, never a secret.
+
+### Uploading a project
+
+`POST /v1/sandboxes/{sb}/files/batch` writes up to 100 files in one request, and
+`POST /v1/sandboxes/{sb}/dirs` creates a directory and its parents.
+
+Validation is all-or-nothing and writing is not, because writing cannot be: there
+is no unwriting the third file. So every entry is checked before the first byte
+reaches the guest — a batch with one bad mode writes nothing — the files go in the
+order given, and a batch that fails partway names the entry it stopped at. That
+ordering is what lets you say which files landed. Each path may be named once,
+since two entries for one path would report two sizes for one file.
+
+`dirs` exists for the directory that stays empty: an upload already creates its
+parents, so the only ones you have to ask for are the ones nothing is written into
+— somewhere a command puts its output, or a layout a build tool expects before it
+starts.
+
+A transfer counts as activity, so staging a project for minutes without running
+anything does not look idle. It used to: only executions touched the idle clock,
+and the reclaim took the VM away mid-batch.
+
 ### CLI
 
 ```
@@ -395,6 +471,7 @@ microvm submit python job.py          # queue it instead; prints a task ID
 microvm result tsk_01JZ8...           # wait for it and print the output
 microvm queue                         # depth and this node's slots
 microvm ps
+microvm ps -tag env=ci                # only sandboxes carrying that tag
 microvm logs sb_01JZ8... exe_01JZ8... # an execution's recorded output
 ```
 
@@ -476,7 +553,7 @@ a `vanished` execution means we took your sandbox, not that your program failed.
 launches does not — the jailer drops it to the uid you pass.
 
 ```
-microvmd \
+MICROVM_TOKENS="$TOKEN" microvmd \
   -addr 127.0.0.1:8080 \
   -image-dir /var/lib/microvm/images \
   -kernel /var/lib/microvm/vmlinux \
@@ -484,13 +561,56 @@ microvmd \
   -slots 10 \
   -redis redis:6379 \
   -ceiling-cores 8 -ceiling-mem-mb 16384 \
-  -tokens "$TOKEN"
+  -tenant-max-sandboxes 20 -tenant-max-rps 20
 ```
 
 The queue and the slots are separate decisions, which is what lets a fleet be
 shaped rather than cloned. `-redis` with `-slots 0` is an API front end that
 takes work and runs none; slots without an exposed address is a pure worker;
 both is the single-box case. No node needs to know the others exist.
+
+Tokens come from `MICROVM_TOKENS`, from `-tokens-file` (one per line, `#`
+comments allowed), or from `-tokens`. The sources add up, so moving off the flag
+is a rotation and not a cutover. Prefer either of the first two: a secret on a
+command line is a secret in `ps`, in shell history, and in whatever unit file
+started the daemon. `-tokens` and `-admin-tokens` still work and are deprecated.
+
+`-tenant-max-sandboxes` and `-tenant-max-rps` are per-token ceilings, unlike
+`-slots` and `-ceiling-*` which bound the host. Without them any one valid token
+can hold every slot on the node and call as fast as VMs boot. Both default to
+unlimited; over either, a caller gets the usual `capacity_error` 429 — the same
+type a full node answers with, deliberately, because the caller's move is the same
+and that is the pair every SDK already backs off on.
+
+Only the rate limit adds `Retry-After`, and that asymmetry is the point: a token
+bucket knows to the second when it will have another request, whereas when one of
+your sandboxes ends is up to you, and a number invented here would be a guess
+dressed as a fact.
+
+Both are charged to a *tenant* rather than to an address, because an address is not
+an identity: one tenant behind a NAT would be charged for its neighbours, and one
+with a pool of egress addresses for almost none of its own. This daemon derives a
+tenant per token, so here a ceiling is per key — **two keys are two allowances**, and
+a caller who wants one allowance across several keys needs them to share a tenant,
+which is a `Principals` configuration these flags do not expose yet.
+
+`-tenant-max-sandboxes` bounds sandboxes, not tasks, and that is a limitation
+rather than a decision worth defending: the counter is one node's, and a task is
+scheduled across the fleet, so a task enqueued here may run on a node where the
+counter says nothing. Bound task-driven load with `-slots`, `-cpu` and `-mem`,
+which bound the box whoever the work belongs to.
+
+A sandbox belongs to the tenant that created it. Every route naming one resolves
+it against the caller, so another tenant's sandbox is a `404` — not a `403`, which
+would confirm which of a guessed range exist — and the list is scoped the same way.
+An admin key keeps the node-wide view, since it is the operator's own.
+
+`-sandbox-retention` is how long a stopped sandbox stays listed and retrievable
+before the daemon forgets it. It defaults to forever, which is a slow leak on a
+node that never restarts. Set it lower than `-log-retention` and it is raised to
+it: the stopped record carries the final metering, and every exec record is
+reached through its sandbox. Past the window the ID answers the ordinary
+`sandbox_not_found`.
 
 `-addr` defaults to loopback on purpose: this API creates VMs that run arbitrary
 code, so an open one is an open shell. Put a TLS terminator in front of it.

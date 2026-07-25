@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pablofdezr/microvm/internal/guestclient"
 	"github.com/pablofdezr/microvm/internal/protocol"
 	"github.com/pablofdezr/microvm/internal/runtime"
 	"github.com/pablofdezr/microvm/internal/vmgenid"
@@ -41,6 +42,13 @@ type Runtime struct {
 
 	// Stats is what every instance reports.
 	Stats runtime.Stats
+
+	// OnStats runs at the start of every Stats call, or nil for none. It is how a
+	// test wedges itself into the window a real sample takes: the cgroup and the TAP
+	// byte counters are files, so a stop that samples them before killing the VM sits
+	// there for as long as the host's filesystem does, and anything racing that
+	// window is unobservable without a way to hold it open.
+	OnStats func(id string)
 
 	mu        sync.Mutex
 	instances map[string]*Instance
@@ -98,6 +106,7 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 		id:       spec.ID,
 		rt:       r,
 		files:    make(map[string][]byte),
+		modes:    make(map[string]string),
 		stopped:  make(chan struct{}),
 		listener: NewListener(),
 	}
@@ -157,6 +166,7 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 		id:       spec.ID,
 		rt:       r,
 		files:    make(map[string][]byte),
+		modes:    make(map[string]string),
 		stopped:  make(chan struct{}),
 		listener: NewListener(),
 	}
@@ -191,8 +201,11 @@ type Instance struct {
 	// destroy the isolation that makes the socket an identity.
 	listener *Listener
 
-	mu      sync.Mutex
-	files   map[string][]byte
+	mu    sync.Mutex
+	files map[string][]byte
+	// modes records the mode each upload asked for, so a test can assert that the
+	// mode a caller sent reached the guest rather than being dropped on the way.
+	modes   map[string]string
 	stopped chan struct{}
 	isDown  bool
 
@@ -228,6 +241,13 @@ func (i *Instance) HostListener() net.Listener { return i.listener }
 func (i *Instance) Guest() *Listener { return i.listener }
 
 func (i *Instance) Stats() (runtime.Stats, error) {
+	// Outside the lock, like the real one: reading meters takes no instance lock,
+	// and a hook that held one would be testing a mutex the production code has not
+	// got.
+	if i.rt.OnStats != nil {
+		i.rt.OnStats(i.id)
+	}
+
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.isDown {
@@ -349,6 +369,7 @@ func (c *client) WriteFile(ctx context.Context, path string, content io.Reader, 
 	c.inst.mu.Lock()
 	defer c.inst.mu.Unlock()
 	c.inst.files[path] = body
+	c.inst.modes[path] = mode
 	return nil
 }
 
@@ -371,6 +392,12 @@ func (c *client) Mkdir(ctx context.Context, path string) error {
 	if c.inst.isDown {
 		return fmt.Errorf("sandbox %s is gone", c.inst.id)
 	}
+	// A file standing where the directory should go is the real agent's conflict,
+	// and the layers above are meant to answer it differently from a broken VM.
+	// Directories are the keys ending in "/", so an exact hit is a file.
+	if _, isFile := c.inst.files[path]; isFile && !strings.HasSuffix(path, "/") {
+		return fmt.Errorf("mkdir %s: %w", path, guestclient.ErrNotDirectory)
+	}
 	if !strings.HasSuffix(path, "/") {
 		path += "/"
 	}
@@ -384,6 +411,25 @@ func (i *Instance) File(path string) ([]byte, bool) {
 	defer i.mu.Unlock()
 	body, ok := i.files[path]
 	return body, ok
+}
+
+// FileMode returns the mode an upload asked for, as the host sent it.
+func (i *Instance) FileMode(path string) (string, bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	mode, ok := i.modes[path]
+	return mode, ok
+}
+
+// Dir reports whether a directory was created at path.
+func (i *Instance) Dir(path string) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	_, ok := i.files[path]
+	return ok
 }
 
 // Instance returns a created sandbox by ID.

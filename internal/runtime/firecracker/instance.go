@@ -56,6 +56,12 @@ type instance struct {
 	group *cgroup.Group
 	lease *netpool.Lease
 
+	// tapName is the host interface backing the guest's NIC, empty for a sandbox
+	// with no network. It duplicates lease.TapName on purpose: Stats reads it
+	// while stop clears the lease, and metering must not race teardown for the
+	// one number that cannot be re-derived afterwards.
+	tapName string
+
 	stopOnce sync.Once
 	stopErr  error
 }
@@ -78,6 +84,12 @@ func (i *instance) HostListener() net.Listener { return i.hostListener }
 // A sandbox that sat waiting on a network call for a minute shows a minute of
 // wall and almost no active CPU, which is exactly the distinction that makes
 // usage-based billing possible.
+//
+// The network counters are sampled here, next to the cgroup, because both meters
+// die with the VM: stop deletes the TAP and /sys/class/net/<tap> goes with it,
+// exactly as the cgroup does. That is why the layer above samples once before the
+// kill -- reading either afterwards yields nothing, and nothing reported as zero
+// tells a caller their transfer was free.
 func (i *instance) Stats() (runtime.Stats, error) {
 	s, err := i.group.Stats()
 	if err != nil {
@@ -93,13 +105,46 @@ func (i *instance) Stats() (runtime.Stats, error) {
 		idle = 0
 	}
 
-	return runtime.Stats{
+	out := runtime.Stats{
 		ActiveCPU:     s.ActiveCPU,
 		Wall:          wall,
 		Idle:          idle,
 		MemoryCurrent: s.MemoryCurrent,
 		MemoryPeak:    s.MemoryPeak,
-	}, nil
+	}
+	i.sampleNetwork(&out)
+	return out, nil
+}
+
+// sampleNetwork fills in the transfer counters from the sandbox's TAP device.
+//
+// The counters are the host's view of that device, so they arrive the other way
+// round: what the host received off the TAP is what the guest sent. runtime.Stats
+// is named from the guest's side, which is why the reading goes through
+// Counters.Guest rather than being copied across field by field -- rx to rx would
+// report a sandbox's egress as its ingress, invisible until an abuse complaint
+// blames the wrong direction.
+//
+// A failure leaves both fields nil rather than failing the sample, for the same
+// reason cgroup.Stats tolerates a missing memory file: a broken meter must not
+// take the billable CPU number down with it.
+func (i *instance) sampleNetwork(out *runtime.Stats) {
+	if i.tapName == "" {
+		return // network: false -- there is no device, so there is nothing to count
+	}
+
+	c, ok, err := netpool.ReadCounters(i.tapName)
+	if err != nil {
+		i.log.Warn("read tap counters failed", "tap", i.tapName, "err", err)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	rx, tx := c.Guest()
+	out.NetworkRxBytes = &rx
+	out.NetworkTxBytes = &tx
 }
 
 // Stop shuts the sandbox down and releases everything it held.
@@ -135,6 +180,9 @@ func (i *instance) stop(ctx context.Context) error {
 	}
 
 	if i.lease != nil {
+		// The device's byte counters go with it, so the final transfer must
+		// already have been sampled: the layer above calls Stats before Stop, the
+		// same ordering the cgroup needs.
 		if err := i.runtime.taps.Delete(i.lease.TapName); err != nil {
 			errs = append(errs, fmt.Errorf("delete tap: %w", err))
 		}

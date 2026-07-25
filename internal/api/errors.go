@@ -3,7 +3,10 @@ package api
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/pablofdezr/microvm/internal/api/apitypes"
 )
@@ -28,6 +31,10 @@ type apiError struct {
 	message string
 	// param names the request field at fault, when one is.
 	param string
+	// retryAfter becomes the Retry-After header, when we know how long. Only the
+	// rate limiter does: a full node has no idea when a slot frees, and a header
+	// guessing at it would send every refused caller back at the same moment.
+	retryAfter time.Duration
 	// cause is kept for the log and never sent: it is our internals, and a
 	// caller who can read them is a caller who can probe them.
 	cause error
@@ -163,6 +170,60 @@ func capacityError(cause error) *apiError {
 	}
 }
 
+// rateLimitError means the caller is asking faster than their key allows.
+//
+// The same 429 and the same capacity_error as a full node, deliberately. That
+// pair is the API's existing "no room right now, back off" and it is what all
+// three SDKs switch on to retry; a new type or code would mean a wire vocabulary
+// the SDKs do not know, for a condition they already handle correctly. What is
+// new is Retry-After, and only here: this is the one refusal whose end we can
+// name to the second.
+func rateLimitError(rps float64, retryAfter time.Duration) *apiError {
+	return &apiError{
+		status:  http.StatusTooManyRequests,
+		errType: apitypes.ErrorTypeCapacityError,
+		code:    CodeNodeAtCapacity,
+		message: fmt.Sprintf(
+			"Too many requests: this token may make %s per second. Retry in %s.",
+			plural(rps, "request"), plural(retryAfter.Seconds(), "second")),
+		retryAfter: retryAfter,
+	}
+}
+
+// tenantConcurrencyError means the caller's own sandboxes are the limit, not the
+// node's.
+//
+// Reported as capacity, like a full node, because the caller's move is the same
+// -- wait, then retry -- and because that is the type their SDK already backs
+// off on. The message is the part that differs, and it has to: a caller told
+// "this node is full" would keep retrying against a node with plenty of room,
+// when what they need is to delete a sandbox of their own.
+//
+// No Retry-After. When one of their sandboxes ends is up to them, and a number
+// invented here would be a guess dressed as a fact.
+func tenantConcurrencyError(cause error, live, limit int) *apiError {
+	return &apiError{
+		status:  http.StatusTooManyRequests,
+		errType: apitypes.ErrorTypeCapacityError,
+		code:    CodeNodeAtCapacity,
+		message: fmt.Sprintf(
+			"This token may have %d sandboxes running at once and already has %d. "+
+				"Delete one, or wait for one to expire.", limit, live),
+		cause: cause,
+	}
+}
+
+// plural renders a count with its unit, for a message a human reads.
+func plural(n float64, unit string) string {
+	// 'g' with -1 precision so 10 is "10" and 0.5 is "0.5": a limit printed as
+	// "10.000000 requests" reads like a bug in the daemon.
+	s := strconv.FormatFloat(n, 'g', -1, 64) + " " + unit
+	if math.Abs(n-1) > 1e-9 {
+		s += "s"
+	}
+	return s
+}
+
 // queueUnreachableError means we could not ask the queue.
 //
 // 503, not 404. "It does not exist" and "we cannot find out" demand opposite
@@ -239,6 +300,14 @@ func (s *Server) writeAPIError(w http.ResponseWriter, r *http.Request, err error
 			"request_id", reqID,
 			"method", r.Method, "path", r.URL.Path,
 			"code", apiErr.code, "err", apiErr.Error())
+	}
+
+	// Before the body, because writeJSON writes the status and headers are gone
+	// after that. Seconds rather than a date: a clock skewed by a minute turns an
+	// HTTP-date into either an instant retry or a minute of silence, and all three
+	// SDKs already honour the numeric form.
+	if apiErr.retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(apiErr.retryAfter.Seconds()))))
 	}
 
 	body := apitypes.ErrorEnvelope{

@@ -320,6 +320,7 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 			return err
 		}
 		inst.lease = &lease
+		inst.tapName = lease.TapName
 		if err := r.taps.Create(lease); err != nil {
 			return fmt.Errorf("create tap: %w", err)
 		}

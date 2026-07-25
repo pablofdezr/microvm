@@ -35,6 +35,7 @@ Usage:
   microvm exec <image> <cmd> [args...]   run a command in a fresh sandbox
   microvm ps                             list sandboxes on the node
   microvm rm <sandbox-id>                destroy a sandbox
+  microvm extend <sandbox-id> <dur>      buy a running sandbox more time
   microvm logs <sandbox-id> <exec-id>    an exec's recorded output
   microvm submit <image> <file>          queue a task, print its ID
   microvm result <task-id>               a task's result
@@ -49,6 +50,7 @@ Flags:
   -cpu float       CPU cores, may be fractional
   -timeout dur     kill the process after this long (default 5m)
   -env key=value   set an environment variable; repeatable
+  -tag key=value   label the sandbox; repeatable, and narrows microvm ps
   -json            print the raw result as JSON
 
 Exit code mirrors the program's own, so this composes with the shell:
@@ -69,16 +71,20 @@ type options struct {
 	mem     int
 	cpu     float64
 	timeout time.Duration
-	env     envFlag
+	env     kvFlag
+	tags    kvFlag
 	asJSON  bool
 }
 
-// envFlag collects repeated -env key=value flags.
-type envFlag map[string]string
+// kvFlag collects a repeated key=value flag. Both -env and -tag take one, and
+// they are written the same way on purpose: two separators for one shape is a
+// paper cut for nothing, even though the tag filter travels as key:value on the
+// wire.
+type kvFlag map[string]string
 
-func (e envFlag) String() string { return "" }
+func (e kvFlag) String() string { return "" }
 
-func (e envFlag) Set(v string) error {
+func (e kvFlag) Set(v string) error {
 	key, value, found := strings.Cut(v, "=")
 	if !found || key == "" {
 		return fmt.Errorf("expected key=value, got %q", v)
@@ -99,7 +105,7 @@ func run() error {
 		return nil
 	}
 
-	opts := options{env: envFlag{}}
+	opts := options{env: kvFlag{}, tags: kvFlag{}}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.StringVar(&opts.url, "url", envOr("MICROVM_URL", microvm.DefaultBaseURL), "daemon address")
 	fs.StringVar(&opts.token, "token", os.Getenv("MICROVM_TOKEN"), "bearer token")
@@ -108,6 +114,7 @@ func run() error {
 	fs.Float64Var(&opts.cpu, "cpu", 0, "CPU cores")
 	fs.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "process timeout")
 	fs.Var(opts.env, "env", "environment variable, key=value; repeatable")
+	fs.Var(opts.tags, "tag", "label, key=value; repeatable")
 	fs.BoolVar(&opts.asJSON, "json", false, "print raw JSON")
 	fs.Usage = func() { fmt.Print(usage) }
 
@@ -134,6 +141,8 @@ func run() error {
 		return cmdPs(ctx, client, opts)
 	case "rm":
 		return cmdRm(ctx, client, args)
+	case "extend":
+		return cmdExtend(ctx, client, opts, args)
 	case "logs":
 		return cmdLogs(ctx, client, opts, args)
 	case "submit":
@@ -217,7 +226,7 @@ func cmdRun(ctx context.Context, client *microvm.Client, opts options, args []st
 
 	return streamAndExit(ctx, client, sb.Id, cmd, microvm.ExecutionCreateParams{
 		Args:           &cmdArgs,
-		Env:            envParam(opts.env),
+		Env:            mapParam(opts.env),
 		TimeoutSeconds: seconds(opts.timeout),
 	}, opts)
 }
@@ -258,7 +267,7 @@ func cmdExec(ctx context.Context, client *microvm.Client, opts options, args []s
 	cmdArgs := args[2:]
 	return streamAndExit(ctx, client, sb.Id, args[1], microvm.ExecutionCreateParams{
 		Args:           &cmdArgs,
-		Env:            envParam(opts.env),
+		Env:            mapParam(opts.env),
 		TimeoutSeconds: seconds(opts.timeout),
 	}, opts)
 }
@@ -267,7 +276,8 @@ func newSandbox(ctx context.Context, client *microvm.Client, image string, opts 
 	params := microvm.SandboxCreateParams{
 		Image:   image,
 		Network: &opts.network,
-		Env:     envParam(opts.env),
+		Env:     mapParam(opts.env),
+		Tags:    mapParam(opts.tags),
 		// Outlive the process by a margin, so a run that finishes normally is
 		// never racing its own sandbox's TTL.
 		TtlSeconds: seconds(opts.timeout + time.Minute),
@@ -362,8 +372,17 @@ func exitWith(exe *microvm.Execution) error {
 	return nil
 }
 
+// cmdPs lists the node's sandboxes, narrowed by -tag when given.
+//
+// The tags AND, so repeating the flag asks for the sandboxes carrying all of
+// them. A tag nobody set lists nothing rather than everything: the filter is
+// there to answer "which of mine are these", and silently ignoring it would
+// answer a different question.
 func cmdPs(ctx context.Context, client *microvm.Client, opts options) error {
-	page, err := client.Sandboxes.List(ctx, microvm.SandboxListParams{Limit: 100})
+	page, err := client.Sandboxes.List(ctx, microvm.SandboxListParams{
+		Limit: 100,
+		Tags:  opts.tags,
+	})
 	if err != nil {
 		return err
 	}
@@ -371,6 +390,12 @@ func cmdPs(ctx context.Context, client *microvm.Client, opts options) error {
 		return printJSON(page)
 	}
 	if len(page.Data) == 0 {
+		if len(opts.tags) > 0 {
+			// Name the filter. "no sandboxes" from a filtered list reads as an
+			// empty node, and someone will go looking for the wrong problem.
+			fmt.Println("no sandboxes carrying those tags")
+			return nil
+		}
 		fmt.Println("no sandboxes")
 		return nil
 	}
@@ -414,6 +439,38 @@ func cmdRm(ctx context.Context, client *microvm.Client, args []string) error {
 		short(time.Duration(sb.Stats.ActiveCpuMs)*time.Millisecond),
 		short(time.Duration(sb.Stats.IdleMs)*time.Millisecond),
 		mib(uint64(sb.Stats.MemoryPeakBytes)))
+	return nil
+}
+
+// cmdExtend buys a running sandbox more time.
+//
+// It takes a duration rather than seconds because that is what the rest of the
+// CLI takes, and prints the deadline the server settled on: the argument is a
+// request, and a sandbox close to its maximum lifetime gets less than it asked
+// for -- or a refusal, which is the point of printing what happened.
+func cmdExtend(ctx context.Context, client *microvm.Client, opts options, args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: microvm extend <sandbox-id> <duration>, e.g. microvm extend sb_x 10m")
+	}
+	d, err := time.ParseDuration(args[1])
+	if err != nil {
+		return fmt.Errorf("%q is not a duration: %w", args[1], err)
+	}
+	if d < time.Second {
+		return fmt.Errorf("%s is shorter than a second, which buys nothing", d)
+	}
+
+	sb, err := client.Sandboxes.Extend(ctx, args[0], int(d.Seconds()))
+	if err != nil {
+		return err
+	}
+	if opts.asJSON {
+		return printJSON(sb)
+	}
+
+	fmt.Printf("%s expires in %s (%s)\n", sb.Id,
+		short(time.Until(sb.Expires).Round(time.Second)),
+		sb.Expires.Local().Format(time.RFC3339))
 	return nil
 }
 
@@ -467,7 +524,7 @@ func cmdSubmit(ctx context.Context, client *microvm.Client, opts options, args [
 		Cmd:            cmd,
 		Args:           &cmdArgs,
 		Files:          &files,
-		Env:            envParam(opts.env),
+		Env:            mapParam(opts.env),
 		TimeoutSeconds: seconds(opts.timeout),
 		Network:        &opts.network,
 	}
@@ -594,13 +651,13 @@ func seconds(d time.Duration) *int {
 	return &n
 }
 
-// envParam passes the env map through, or nil when empty. An empty map and an
-// absent one mean the same to the server, and nil is the cheaper of the two.
-func envParam(env map[string]string) *map[string]string {
-	if len(env) == 0 {
+// mapParam passes an env or tag map through, or nil when empty. An empty map and
+// an absent one mean the same to the server, and nil is the cheaper of the two.
+func mapParam(kv map[string]string) *map[string]string {
+	if len(kv) == 0 {
 		return nil
 	}
-	return &env
+	return &kv
 }
 
 func deref[T any](p *T) T {

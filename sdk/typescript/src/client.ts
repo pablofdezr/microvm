@@ -35,6 +35,9 @@ export type ExecutionStatus = Schemas["ExecutionStatus"];
 export type ExecutionCreateParams = Schemas["ExecutionCreateParams"];
 export type ExecutionCancelParams = Schemas["ExecutionCancelParams"];
 export type File = Schemas["File"];
+export type FileList = Schemas["FileList"];
+export type FileCreateParams = Schemas["FileCreateParams"];
+export type Directory = Schemas["Directory"];
 export type Task = Schemas["Task"];
 export type TaskStatus = Schemas["TaskStatus"];
 export type TaskCreateParams = Omit<Schemas["TaskCreateParams"], "files"> & {
@@ -202,15 +205,28 @@ export class Client {
     path: string,
     init: {
       body?: unknown;
-      query?: Record<string, string | number | undefined>;
+      query?: Record<string, string | number | string[] | undefined>;
       opts?: RequestOptions;
       /** Streams manage their own lifetime, so no timeout is imposed. */
       noTimeout?: boolean;
+      /**
+       * Marks a POST whose repetition is a no-op by construction, so it may be
+       * retried without an Idempotency-Key. Set by the resource method and never
+       * by a caller: whether replaying a route is safe is a fact about the route.
+       */
+      replayable?: boolean;
     } = {},
   ): Promise<Response> {
     const url = new URL(this.#baseURL + "/v1" + path);
     for (const [k, v] of Object.entries(init.query ?? {})) {
-      if (v !== undefined) url.searchParams.set(k, String(v));
+      if (v === undefined) continue;
+      // Appended, not set: the tag filter repeats its key and the server ANDs
+      // them, so collapsing them would silently return the last filter's answer.
+      if (Array.isArray(v)) {
+        for (const one of v) url.searchParams.append(k, one);
+      } else {
+        url.searchParams.set(k, String(v));
+      }
     }
 
     const headers: Record<string, string> = {
@@ -224,13 +240,18 @@ export class Client {
     const body =
       init.body === undefined ? undefined : JSON.stringify(init.body);
 
-    // Retrying a request that is not idempotent could run the work twice.
+    // Retrying a request that is not idempotent could run the work twice. A POST is
+    // safe with a key the server can recognise the repeat by, or when repeating it
+    // is a no-op by construction — see `replayable`. Without the second, the four
+    // routes that take no key are the ones where a 429 from a per-tenant rate limit
+    // reaches user code as a hard failure.
     const idempotent =
       method === "GET" ||
       method === "HEAD" ||
       method === "PUT" ||
       method === "DELETE" ||
-      !!init.opts?.idempotencyKey;
+      !!init.opts?.idempotencyKey ||
+      !!init.replayable;
 
     let lastErr: unknown;
     for (let attempt = 1; attempt <= this.#maxRetries + 1; attempt++) {
@@ -378,6 +399,30 @@ export type ListParams = {
   ending_before?: string;
 };
 
+export type SandboxListParams = ListParams & {
+  state?: SandboxState;
+  /**
+   * Only sandboxes carrying every one of these labels. They AND, so a second tag
+   * narrows the result rather than widening it. The filter is node-local, like the
+   * list itself: it searches the sandboxes this node holds, not the fleet's.
+   */
+  tags?: Record<string, string>;
+};
+
+/**
+ * Renders a tag filter as the repeated `tag=key:value` the server splits at the
+ * first colon — which is why a key may not contain one and a value may.
+ *
+ * In key order, because object order is insertion order: a filter that produced a
+ * different URL on every identical call is one nobody can cache, compare, or read
+ * in a log.
+ */
+function encodeTagFilter(tags?: Record<string, string>): string[] | undefined {
+  if (!tags) return undefined;
+  const keys = Object.keys(tags).sort();
+  return keys.length === 0 ? undefined : keys.map((k) => `${k}:${tags[k]}`);
+}
+
 class SandboxResource {
   constructor(private readonly c: Client) {}
 
@@ -407,11 +452,33 @@ class SandboxResource {
     return this.c.json<Sandbox>("DELETE", `/sandboxes/${id}`, { opts });
   }
 
+  /**
+   * Push the TTL deadline out to `ttlSeconds` from now, for work that turned out
+   * longer than you guessed at create time.
+   *
+   * It never brings a deadline forward, so heartbeating it on a timer is safe and
+   * so is retrying it. Read `expires` off the reply rather than computing it: the
+   * request says how long you want, the reply says what you have. Lifetimes are
+   * bounded from creation rather than from now, so extending buys time and never
+   * immortality — asking past the bound throws rather than being trimmed to it.
+   */
+  extend(id: string, ttlSeconds: number, opts?: RequestOptions): Promise<Sandbox> {
+    return this.c.json<Sandbox>("POST", `/sandboxes/${id}/extend`, {
+      body: { ttl_seconds: ttlSeconds },
+      replayable: true,
+      opts,
+    });
+  }
+
   list(
-    params: ListParams & { state?: SandboxState } = {},
+    params: SandboxListParams = {},
     opts?: RequestOptions,
   ): Promise<SandboxList> {
-    return this.c.json<SandboxList>("GET", "/sandboxes", { query: params, opts });
+    const { tags, ...rest } = params;
+    return this.c.json<SandboxList>("GET", "/sandboxes", {
+      query: { ...rest, tag: encodeTagFilter(tags) },
+      opts,
+    });
   }
 
   /**
@@ -422,7 +489,7 @@ class SandboxResource {
    * time, so it lives here rather than in every caller.
    */
   async *all(
-    params: ListParams & { state?: SandboxState } = {},
+    params: SandboxListParams = {},
     opts?: RequestOptions,
   ): AsyncGenerator<Sandbox> {
     let cursor = params.starting_after;
@@ -596,6 +663,68 @@ class FileResource {
   ): Promise<File> {
     return this.c.json<File>("POST", `/sandboxes/${sandboxID}/files`, {
       body: { path, content: encodeContent(content) },
+      replayable: true,
+      opts,
+    });
+  }
+
+  /**
+   * Write a set of files in one request, in the order given.
+   *
+   * One round trip instead of one per file, which is the difference between
+   * staging a project and staging it slowly. Validation is all-or-nothing and
+   * writing is not, because writing cannot be: a batch with one bad mode writes
+   * nothing, and a batch that fails partway names the entry it stopped at, so the
+   * order tells you which files landed. Each path may be named only once.
+   */
+  writeBatch(
+    sandboxID: string,
+    files: Record<string, string | Uint8Array>,
+    opts?: RequestOptions,
+  ): Promise<FileList> {
+    return this.c.json<FileList>("POST", `/sandboxes/${sandboxID}/files/batch`, {
+      body: {
+        files: Object.entries(files).map(([path, content]) => ({
+          path,
+          content: encodeContent(content),
+        })),
+      },
+      replayable: true,
+      opts,
+    });
+  }
+
+  /**
+   * Write a set of files with per-file modes.
+   *
+   * `writeBatch` covers the common case; this is for the batch that contains
+   * something meant to be executable, since a mode is the one thing a path-keyed
+   * map cannot carry.
+   */
+  create(
+    sandboxID: string,
+    files: FileCreateParams[],
+    opts?: RequestOptions,
+  ): Promise<FileList> {
+    return this.c.json<FileList>("POST", `/sandboxes/${sandboxID}/files/batch`, {
+      body: { files },
+      replayable: true,
+      opts,
+    });
+  }
+
+  /**
+   * Create a directory and its parents.
+   *
+   * Uploading a file already creates its parents, so this is for the directory
+   * that stays empty: somewhere a command writes its output, or a layout a build
+   * tool expects before it starts. It is `mkdir -p`, so a directory that already
+   * exists is success and a retry is safe; a *file* in the way is a conflict.
+   */
+  mkdir(sandboxID: string, path: string, opts?: RequestOptions): Promise<Directory> {
+    return this.c.json<Directory>("POST", `/sandboxes/${sandboxID}/dirs`, {
+      body: { path },
+      replayable: true,
       opts,
     });
   }

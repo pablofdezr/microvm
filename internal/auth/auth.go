@@ -42,6 +42,22 @@ type Principal struct {
 	// read-only whatever the body says.
 	ReadOnly bool
 
+	// MaxConcurrent bounds how many sandboxes this principal may have running at
+	// once. Zero is unlimited, which is what a flat token list gives: without a
+	// cap one token can hold every slot on a node, and the other tenants find out
+	// as a node that is permanently full.
+	MaxConcurrent int
+
+	// MaxRequestsPerSecond bounds how fast this principal may call the control
+	// plane. Zero is unlimited.
+	//
+	// Per principal, not per token: a tenant with three keys has one allowance,
+	// so rotating keys cannot multiply it. And not per address, because an
+	// address is not an identity -- one tenant behind a NAT would be charged for
+	// its neighbours, and one tenant with a proxy pool would be charged for
+	// nothing.
+	MaxRequestsPerSecond float64
+
 	// Admin lets this principal set tenant policies -- storage caps and eviction
 	// rules -- for anyone. It is a separate power from creating sandboxes, and a
 	// dangerous one: an admin key decides what every tenant may store and whether

@@ -27,7 +27,10 @@ type harness struct {
 	mgr *sandbox.Manager
 }
 
-func newHarness(t *testing.T) *harness {
+// newHarness returns a server over a fake runtime. The options are the
+// manager's, for the few tests whose subject is what the manager was configured
+// to do -- forgetting a stopped sandbox, above all.
+func newHarness(t *testing.T, opts ...sandbox.Option) *harness {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -35,7 +38,7 @@ func newHarness(t *testing.T) *harness {
 	rt.Script["python3"] = runtimetest.Output{Stdout: "hello\n"}
 
 	logs := logstore.New(logstore.Config{})
-	mgr := sandbox.NewManager(rt, logs, log)
+	mgr := sandbox.NewManager(rt, logs, log, opts...)
 	q := queue.NewMemory(queue.MemoryConfig{}, log)
 
 	api := NewServer(Config{

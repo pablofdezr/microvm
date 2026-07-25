@@ -73,6 +73,11 @@ type Server struct {
 	log  *slog.Logger
 	idem *idempotencyStore
 
+	// limiter meters requests per principal. Always present, and inert unless a
+	// principal carries a rate: the alternative is a nil check at every call site
+	// that would have to agree with itself forever.
+	limiter *rateLimiter
+
 	// dir resolves a token to who is behind it. Nil when authentication is
 	// disabled, which is the one case where there is no identity to resolve --
 	// and, not coincidentally, the one case where storage falls back to a
@@ -94,7 +99,12 @@ func NewServer(cfg Config, mgr *sandbox.Manager, q queue.Queue, p *pool.Pool, lo
 		log.Warn("no API tokens configured: every caller is authorised",
 			"hint", "only safe when bound to loopback")
 	}
-	return &Server{cfg: cfg, mgr: mgr, q: q, pool: p, log: log, idem: newIdempotencyStore(), dir: dir}
+	return &Server{
+		cfg: cfg, mgr: mgr, q: q, pool: p, log: log,
+		idem:    newIdempotencyStore(),
+		limiter: newRateLimiter(),
+		dir:     dir,
+	}
 }
 
 // Handler returns the routes.
@@ -106,23 +116,34 @@ func (s *Server) Handler() http.Handler {
 	// it reveals nothing a caller could not guess.
 	mux.Handle("GET "+p+"/health", http.HandlerFunc(s.handleHealth))
 
+	// Every route below is auth then rate limit, in that order: the limiter
+	// charges a resolved principal, and running it second is also what keeps its
+	// bucket map bounded. See withRateLimit.
+	//
+	// The limiter sits outside the idempotency store so a refused request never
+	// claims a key -- being told to slow down must not burn the key the caller
+	// will retry with.
+	//
 	// Creating things is where retries are dangerous, so those are the routes
 	// that take an Idempotency-Key. A GET is already repeatable and a stream
 	// cannot be replayed out of a buffer.
 	create := func(h http.HandlerFunc) http.Handler {
-		return s.auth(s.withIdempotency(h))
+		return s.auth(s.withRateLimit(s.withIdempotency(h)))
 	}
 	read := func(h http.HandlerFunc) http.Handler {
-		return s.auth(h)
+		return s.auth(s.withRateLimit(h))
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
-		return s.auth(s.requireAdmin(h))
+		return s.auth(s.withRateLimit(s.requireAdmin(h)))
 	}
 
 	mux.Handle("POST "+p+"/sandboxes", create(s.handleCreateSandbox))
 	mux.Handle("GET "+p+"/sandboxes", read(s.handleListSandboxes))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}", read(s.handleRetrieveSandbox))
 	mux.Handle("DELETE "+p+"/sandboxes/{sandbox}", read(s.handleDeleteSandbox))
+	// No Idempotency-Key: extending never brings a deadline forward, so a retry
+	// of the same call is already a no-op. Same reason as /cancel.
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/extend", read(s.handleExtendSandbox))
 
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/executions", create(s.handleCreateExecution))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/executions", read(s.handleListExecutions))
@@ -132,6 +153,8 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/files", read(s.handleCreateFile))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/files", read(s.handleRetrieveFile))
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/files/batch", read(s.handleCreateFiles))
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/dirs", read(s.handleCreateDir))
 
 	mux.Handle("POST "+p+"/tasks", create(s.handleCreateTask))
 	mux.Handle("GET "+p+"/tasks/{task}", read(s.handleRetrieveTask))
@@ -269,6 +292,48 @@ func decodeBody(w http.ResponseWriter, r *http.Request, into any) error {
 		return invalidBodyError(err)
 	}
 	return nil
+}
+
+// overMembers reports whether a raw JSON array or object holds more members than
+// limit, without materialising any of them.
+//
+// It exists because the limits it guards were checked after the decode, and the
+// decode is where a caller's money is spent. The smallest legal batch entry is
+// three bytes of JSON and the struct it becomes is forty-eight, so a body inside
+// the 32 MiB cap names eleven million files: half a gigabyte of live heap and three
+// gigabytes of churn, allocated only to be refused, and two concurrent requests
+// take the daemon and every VM on the node with them. A map of tags is the same
+// shape with a smaller multiplier. Reading one member past the limit and stopping
+// costs the limit rather than the body.
+//
+// A malformed value reports false. The decode that follows says what is wrong with
+// it, and says it better than a counting pass could.
+func overMembers(raw json.RawMessage, limit int) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	open, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	// An object's members are two tokens each -- the key, then its value -- and
+	// Decode reads one value at a time. Counting both would refuse a map at half its
+	// documented limit.
+	object := open == json.Delim('{')
+
+	var discard json.RawMessage
+	for n := 0; dec.More(); n++ {
+		if n >= limit {
+			return true
+		}
+		if object {
+			if _, err := dec.Token(); err != nil {
+				return false
+			}
+		}
+		if err := dec.Decode(&discard); err != nil {
+			return false
+		}
+	}
+	return false
 }
 
 // decodeOptionalBody parses a body that may legitimately be absent.

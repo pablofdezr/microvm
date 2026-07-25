@@ -311,7 +311,18 @@ func (c *Client) ReadFile(ctx context.Context, path string) (io.ReadCloser, erro
 	return resp.Body, nil
 }
 
+// ErrNotDirectory means something that is not a directory already stands where
+// Mkdir was asked to create one.
+//
+// A sentinel because the layers above have to tell it from a transport failure:
+// one is the caller's mistake and the other is ours, and they are owed opposite
+// answers.
+var ErrNotDirectory = errors.New("path exists and is not a directory")
+
 // Mkdir creates a directory and its parents inside the guest.
+//
+// An existing directory is success -- mkdir -p, so a retry costs nothing. A file
+// in the way is ErrNotDirectory.
 func (c *Client) Mkdir(ctx context.Context, path string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("%s/v1/mkdir?path=%s", c.baseURL, queryEscape(path)), nil)
@@ -325,6 +336,9 @@ func (c *Client) Mkdir(ctx context.Context, path string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("mkdir %s: %w", path, ErrNotDirectory)
+	}
 	return checkStatus(resp, http.StatusNoContent)
 }
 

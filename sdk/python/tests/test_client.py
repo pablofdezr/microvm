@@ -207,6 +207,60 @@ def test_observer_sees_every_attempt():
         srv.shutdown()
 
 
+def test_tag_filter_repeats_the_key():
+    """The server splits each value at its first colon and ANDs the repeats, so a
+    joined value would name a tag nobody set."""
+    seen = {}
+
+    def behaviour(h):
+        seen["query"] = h.path
+        h.json(200, {"data": [], "has_more": False})
+
+    srv, url = serve(behaviour)
+    try:
+        c = Client(url)
+        c.sandboxes.list(limit=10, tags={"owner": "me", "env": "ci"})
+        # Sorted by key, so the same filter always produces the same URL.
+        assert seen["query"] == "/v1/sandboxes?limit=10&tag=env%3Aci&tag=owner%3Ame", seen["query"]
+
+        c.sandboxes.list(limit=10)
+        assert seen["query"] == "/v1/sandboxes?limit=10", seen["query"]
+    finally:
+        srv.shutdown()
+
+
+def test_routes_idempotent_by_design_are_retried():
+    """These four take no Idempotency-Key, so without being marked replayable a 429
+    from a per-tenant rate limit reaches calling code unretried. Repeating them is a
+    no-op by construction: extend never brings a deadline forward, a write is an
+    overwrite, mkdir -p on an existing directory is success."""
+    state = {"n": 0}
+
+    def behaviour(h):
+        state["n"] += 1
+        h.empty(429, {"Retry-After": "1"})
+
+    srv, url = serve(behaviour)
+    try:
+        c = Client(url, max_retries=2)
+        calls = [
+            lambda: c.sandboxes.extend("sb_1", 600),
+            lambda: c.files.write("sb_1", "/app/main.py", "x = 1\n"),
+            lambda: c.files.write_batch("sb_1", {"/app/main.py": "x = 1\n"}),
+            lambda: c.files.mkdir("sb_1", "/app/out"),
+        ]
+        for call in calls:
+            state["n"] = 0
+            try:
+                call()
+                assert False, "expected an APIError"
+            except APIError:
+                pass
+            assert state["n"] == 3, state["n"]
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     # A dependency-free runner, so the suite works without pytest installed.
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

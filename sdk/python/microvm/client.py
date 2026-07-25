@@ -157,10 +157,11 @@ class Client:
         body: Any = None,
         query: Optional[dict] = None,
         idempotency_key: Optional[str] = None,
+        replayable: bool = False,
     ) -> Any:
         """Perform a request and return the decoded JSON (or None for an empty
         reply). Transient failures are retried per the client's policy."""
-        with self._open(method, path, body, query, idempotency_key) as resp:
+        with self._open(method, path, body, query, idempotency_key, replayable=replayable) as resp:
             raw = resp.read()
         if not raw:
             return None
@@ -190,12 +191,16 @@ class Client:
         query: Optional[dict],
         idempotency_key: Optional[str],
         no_timeout: bool = False,
+        replayable: bool = False,
     ):
         url = self._base + "/v1" + path
         if query:
             pairs = {k: v for k, v in query.items() if v is not None}
             if pairs:
-                url += "?" + urllib.parse.urlencode(pairs)
+                # doseq, so a list value becomes a repeated key: the tag filter
+                # repeats `tag` and the server ANDs them, and one joined value
+                # would name a tag nobody set.
+                url += "?" + urllib.parse.urlencode(pairs, doseq=True)
 
         data = None
         headers = {"User-Agent": f"microvm-python/{__version__}"}
@@ -207,7 +212,12 @@ class Client:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
 
-        idempotent = method in _IDEMPOTENT_METHODS or idempotency_key is not None
+        # A POST is safe to retry with a key the server can recognise the repeat by,
+        # or when repeating it is a no-op by construction -- extending never brings a
+        # deadline forward, a write is an overwrite, mkdir -p on an existing directory
+        # is success. Without the second, those routes take no key and so a 429 from a
+        # per-tenant rate limit reaches calling code as a hard failure.
+        idempotent = method in _IDEMPOTENT_METHODS or idempotency_key is not None or replayable
         # A stream has no timeout: a command may run for hours. None tells urllib
         # to block, which is what "no timeout" means at the socket layer.
         req_timeout = None if no_timeout else self._timeout
@@ -263,15 +273,37 @@ class Sandboxes:
     def delete(self, sandbox_id: str) -> dict:
         return self._c._request("DELETE", f"/sandboxes/{sandbox_id}")
 
-    def list(self, **params: Any) -> dict:
-        return self._c._request("GET", "/sandboxes", query=params)
+    def extend(self, sandbox_id: str, ttl_seconds: int) -> dict:
+        """Push the TTL deadline out to ttl_seconds from now, for work that turned
+        out longer than you guessed at create time.
 
-    def all(self, **params: Any) -> Iterator[dict]:
+        It never brings a deadline forward, so heartbeating it on a timer is safe
+        and so is retrying it. Read ``expires`` off the reply rather than computing
+        it: the request says how long you want, the reply says what you have.
+        Lifetimes are bounded from creation rather than from now, so extending buys
+        time and never immortality -- asking past the bound raises rather than being
+        trimmed to it."""
+        return self._c._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/extend",
+            body={"ttl_seconds": ttl_seconds},
+            replayable=True,
+        )
+
+    def list(self, *, tags: Optional[dict] = None, **params: Any) -> dict:
+        """One page of sandboxes, newest first.
+
+        ``tags`` narrows the page to the sandboxes carrying every one of the pairs:
+        they AND, so a second tag narrows rather than widens. The filter is
+        node-local, like the list itself."""
+        return self._c._request("GET", "/sandboxes", query=_with_tag_filter(params, tags))
+
+    def all(self, *, tags: Optional[dict] = None, **params: Any) -> Iterator[dict]:
         """Iterate every sandbox, following has_more so no cursor is threaded by
         hand."""
         params = dict(params)
         while True:
-            page = self.list(**params)
+            page = self.list(tags=tags, **params)
             data = page.get("data", [])
             for sb in data:
                 yield sb
@@ -361,6 +393,50 @@ class Files:
             "POST",
             f"/sandboxes/{sandbox_id}/files",
             body={"path": path, "content": _encode_file_content(content)},
+            replayable=True,
+        )
+
+    def write_batch(self, sandbox_id: str, files: dict) -> dict:
+        """Write a set of files in one request, keyed by path, in the order given.
+
+        One round trip instead of one per file, which is the difference between
+        staging a project and staging it slowly. Validation is all-or-nothing and
+        writing is not, because writing cannot be: a batch with one bad mode writes
+        nothing, and a batch that fails partway names the entry it stopped at, so
+        the order tells you which files landed. Each path may be named once.
+
+        For per-file modes -- a batch containing something meant to be executable --
+        use ``create``, since a mode is the one thing a path-keyed map cannot
+        carry."""
+        entries = [
+            {"path": path, "content": _encode_file_content(content)}
+            for path, content in files.items()
+        ]
+        return self.create(sandbox_id, entries)
+
+    def create(self, sandbox_id: str, files: list) -> dict:
+        """Write a batch of already-shaped entries: ``path``, ``content`` (base64),
+        and an optional ``mode``."""
+        return self._c._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/files/batch",
+            body={"files": files},
+            replayable=True,
+        )
+
+    def mkdir(self, sandbox_id: str, path: str) -> dict:
+        """Create a directory and its parents.
+
+        Uploading a file already creates its parents, so this is for the directory
+        that stays empty: somewhere a command writes its output, or a layout a build
+        tool expects before it starts. It is ``mkdir -p``, so a directory that
+        already exists is success and a retry is safe; a *file* in the way is a
+        conflict."""
+        return self._c._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/dirs",
+            body={"path": path},
+            replayable=True,
         )
 
     def read(self, sandbox_id: str, path: str) -> bytes:
@@ -454,6 +530,18 @@ def _encode_file_content(content: bytes | str) -> str:
     tasks."""
     data = content.encode("utf-8") if isinstance(content, str) else content
     return base64.b64encode(data).decode("ascii")
+
+
+def _with_tag_filter(params: dict, tags: Optional[dict]) -> dict:
+    """Adds the repeated ``tag=key:value`` the server splits at the first colon --
+    which is why a key may not contain one and a value may.
+
+    In key order, because a filter that produced a different URL on every identical
+    call is one nobody can cache, compare, or read in a log."""
+    query = dict(params)
+    if tags:
+        query["tag"] = [f"{k}:{tags[k]}" for k in sorted(tags)]
+    return query
 
 
 def _encode_files(files: dict) -> dict:

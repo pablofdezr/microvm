@@ -13,8 +13,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pablofdezr/microvm/internal/protocol"
@@ -183,13 +185,14 @@ func (a *Agent) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mode := os.FileMode(0o644)
+	asked := false
 	if m := r.URL.Query().Get("mode"); m != "" {
 		parsed, err := parseFileMode(m)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		mode = parsed
+		mode, asked = parsed, true
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
@@ -198,6 +201,19 @@ func (a *Agent) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+
+	// OpenFile's mode is masked by the umask and ignored outright for a file that
+	// already exists, so the bits asked for are not the bits on disk: 0777 lands
+	// as 0755 under the usual umask, and re-uploading a script keeps whatever
+	// mode the old one had. The host reports the effective mode back to its
+	// caller, so a mode that was asked for is set rather than requested. On the
+	// fd, not the path -- nothing in the guest gets to swap the file underneath.
+	if asked {
+		if err := f.Chmod(mode); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 
 	n, err := io.Copy(f, io.LimitReader(r.Body, maxUploadSize+1))
 	if err != nil {
@@ -255,6 +271,13 @@ func (a *Agent) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
+		// ENOTDIR means a file stands where a directory was asked for, here or in
+		// a parent. That is the caller confusing two things rather than anything
+		// broken in here, so it is a conflict and not a 500.
+		if errors.Is(err, syscall.ENOTDIR) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -280,12 +303,17 @@ func (a *Agent) resolve(path string) (string, error) {
 }
 
 func parseFileMode(s string) (os.FileMode, error) {
-	var mode uint32
-	if _, err := fmt.Sscanf(s, "%o", &mode); err != nil {
+	// ParseUint rather than Sscanf: Sscanf takes "644junk" and reads 0o644 out of
+	// it, which is a caller's typo answered with 204.
+	mode, err := strconv.ParseUint(s, 8, 32)
+	if err != nil {
 		return 0, fmt.Errorf("invalid mode %q: %w", s, err)
 	}
-	if mode > 0o7777 {
-		return 0, fmt.Errorf("invalid mode %q", s)
+	// The agent is root, so a setuid bit here leaves a root-owned setuid binary
+	// for whatever runs in the guest next. Refused here as well as at the API,
+	// because the host is not the only thing that can reach this route.
+	if mode > 0o777 {
+		return 0, fmt.Errorf("invalid mode %q: the setuid, setgid and sticky bits are not permitted", s)
 	}
 	return os.FileMode(mode), nil
 }

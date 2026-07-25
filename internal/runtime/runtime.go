@@ -109,6 +109,19 @@ type Stats struct {
 
 	MemoryCurrent uint64
 	MemoryPeak    uint64
+
+	// NetworkRxBytes and NetworkTxBytes are cumulative transfer, from the
+	// GUEST's point of view: Tx is what the sandbox sent out. A backend measuring
+	// them on a host-side device has to turn them round, because a host receives
+	// what the guest sends -- get it backwards and a sandbox's egress, the number
+	// a bandwidth cap and an abuse report are about, lands in the field nobody
+	// reads.
+	//
+	// Nil when the sandbox has no network device at all. That is not zero:
+	// "nothing to count" and "counted nothing" are different claims, and only one
+	// of them can be billed.
+	NetworkRxBytes *uint64
+	NetworkTxBytes *uint64
 }
 
 // Instance is a running sandbox.
@@ -174,7 +187,9 @@ type GuestClient interface {
 	// ReadFile downloads a file. The caller closes the reader.
 	ReadFile(ctx context.Context, path string) (io.ReadCloser, error)
 
-	// Mkdir creates a directory inside the guest.
+	// Mkdir creates a directory and its parents inside the guest. An existing
+	// directory is success; a non-directory in the way is
+	// guestclient.ErrNotDirectory.
 	Mkdir(ctx context.Context, path string) error
 }
 

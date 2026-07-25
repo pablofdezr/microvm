@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,10 +20,32 @@ import (
 
 func testAgent(t *testing.T) *httptest.Server {
 	t.Helper()
-	a := New(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return testAgentIn(t, t.TempDir())
+}
+
+// testAgentIn returns an agent rooted at workdir, for a test that has to look at
+// the files it wrote.
+func testAgentIn(t *testing.T, workdir string) *httptest.Server {
+	t.Helper()
+	a := New(workdir, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(a.Handler())
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// putFile uploads content, with query naming the path and any mode.
+func putFile(t *testing.T, srv *httptest.Server, query, content string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/v1/files?"+query, strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
 }
 
 // execFrames posts an exec and collects every frame until the stream ends.
@@ -523,6 +546,14 @@ func TestParseFileMode(t *testing.T) {
 		{in: "0600", want: 0o600},
 		{in: "notoctal", wantErr: true},
 		{in: "99999", wantErr: true},
+		// Trailing junk is a typo, and reading 0o644 out of it would answer 204
+		// to a request the caller did not make.
+		{in: "644junk", wantErr: true},
+		// The agent is root. Anything above 0777 would leave a root-owned setuid
+		// binary for whatever runs in the guest next.
+		{in: "4755", wantErr: true},
+		{in: "2755", wantErr: true},
+		{in: "1777", wantErr: true},
 	}
 	for _, tc := range tests {
 		got, err := parseFileMode(tc.in)
@@ -539,5 +570,97 @@ func TestParseFileMode(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("parseFileMode(%q) = %o, want %o", tc.in, got, tc.want)
 		}
+	}
+}
+
+// The host reports the effective mode back to its caller, so the mode has to be
+// set and not merely requested: OpenFile's is masked by the umask, and ignored
+// outright for a file that already exists.
+func TestUploadedModeIsExact(t *testing.T) {
+	dir := t.TempDir()
+	srv := testAgentIn(t, dir)
+
+	if resp := putFile(t, srv, "path=prog.sh&mode=0777", "#!/bin/sh\n"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("put returned %d, want 204", resp.StatusCode)
+	}
+	info, err := os.Stat(filepath.Join(dir, "prog.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o777 {
+		t.Errorf("mode = %o, want 777: the umask was allowed to have an opinion", got)
+	}
+
+	// Re-uploading is where OpenFile's mode is ignored altogether.
+	if resp := putFile(t, srv, "path=prog.sh&mode=0600", "#!/bin/sh\n"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("re-put returned %d, want 204", resp.StatusCode)
+	}
+	info, err = os.Stat(filepath.Join(dir, "prog.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %o, want 600: an existing file kept the bits it had", got)
+	}
+}
+
+func TestUploadRefusesASetuidMode(t *testing.T) {
+	dir := t.TempDir()
+	srv := testAgentIn(t, dir)
+
+	resp := putFile(t, srv, "path=prog.sh&mode=4755", "#!/bin/sh\n")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("put returned %d, want 400", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "prog.sh")); err == nil {
+		t.Error("a refused upload left the file behind")
+	}
+}
+
+func TestMkdir(t *testing.T) {
+	dir := t.TempDir()
+	srv := testAgentIn(t, dir)
+
+	// Twice: mkdir -p semantics are what makes a retry safe.
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.URL+"/v1/mkdir?path=out/nested", "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("mkdir %d returned %d, want 204", i, resp.StatusCode)
+		}
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "out", "nested"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("not a directory")
+	}
+	// A directory without its execute bit cannot be entered, which is why there
+	// is no mode knob on this route.
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("mode = %o, want 755", got)
+	}
+}
+
+// A file in the way is the caller confusing two things, not the host failing.
+func TestMkdirOverAFileConflicts(t *testing.T) {
+	srv := testAgent(t)
+
+	if resp := putFile(t, srv, "path=out", "x"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("put returned %d, want 204", resp.StatusCode)
+	}
+
+	resp, err := http.Post(srv.URL+"/v1/mkdir?path=out", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("mkdir returned %d, want 409", resp.StatusCode)
 	}
 }
