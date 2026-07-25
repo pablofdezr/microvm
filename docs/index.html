@@ -147,12 +147,7 @@
   .btn-ghost:hover { background: var(--hover); }
 
   /* ---- Hero ---- */
-  .hero { padding: 92px 0 72px; text-align: center; }
-  .tagline {
-    display: inline-flex; align-items: center; gap: 7px;
-    font-size: 0.8rem; color: var(--muted); margin: 0 0 22px;
-  }
-  .tagline .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex: none; }
+  .hero { padding: 104px 0 76px; text-align: center; }
   .subtitle { font-size: 1.03rem; color: var(--muted); max-width: 46ch; margin: 0 auto 30px; text-wrap: pretty; }
   .cta-row { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 
@@ -280,15 +275,14 @@
   <!-- Hero -->
   <section class="hero">
     <div class="wrap">
-      <p class="tagline rise d1"><span class="dot"></span>Verified boot with dm-verity</p>
-      <h1 class="rise d2">Run untrusted code in Firecracker microVMs</h1>
-      <p class="subtitle rise d3">A real VM per sandbox, on your own hardware. One Go daemon, a CLI, and SDKs for TypeScript, Python and Go generated from a single OpenAPI spec.</p>
-      <div class="cta-row rise d4">
+      <h1 class="rise d1">Run untrusted code in Firecracker microVMs</h1>
+      <p class="subtitle rise d2">A real VM per sandbox, on your own hardware. One Go daemon, a CLI, and SDKs for TypeScript, Python and Go generated from a single OpenAPI spec.</p>
+      <div class="cta-row rise d3">
         <a class="btn btn-primary" href="#quickstart">Get started</a>
         <a class="btn btn-ghost" href="https://github.com/pablofdezr/microvm">GitHub</a>
       </div>
 
-      <div class="install rise d5">
+      <div class="install rise d4">
         <div class="cmd">
           <code id="inst-cmd"><span class="muted">$</span> npm install @pablofdezr/microvm</code>
           <button class="copy" id="inst-copy" aria-label="Copy install command" title="Copy">
