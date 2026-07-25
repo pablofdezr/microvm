@@ -4,6 +4,9 @@ TypeScript client for the microvm daemon: run untrusted code in Firecracker
 microVMs. ESM, Node ≥ 18, zero runtime dependencies (it uses the built-in
 `fetch`). Types are generated from the same OpenAPI spec as the server.
 
+Website: <https://pablofdezr.github.io/microvm/> ·
+Source: <https://github.com/pablofdezr/microvm>
+
 ```
 npm install @pablofdezr/microvm
 ```
