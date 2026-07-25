@@ -31,6 +31,7 @@ import (
 	"github.com/pablofdezr/microvm/internal/queue"
 	fcruntime "github.com/pablofdezr/microvm/internal/runtime/firecracker"
 	"github.com/pablofdezr/microvm/internal/sandbox"
+	"github.com/pablofdezr/microvm/internal/source"
 	"github.com/pablofdezr/microvm/internal/storage"
 	"github.com/pablofdezr/microvm/internal/tenant"
 )
@@ -81,6 +82,21 @@ type config struct {
 	// is what a shared-tenant configuration would use, and there is not one yet.
 	tenantMaxSandboxes int
 	tenantMaxRPS       float64
+
+	// Seeding a sandbox from a URL the caller names. Off unless -source-fetch is
+	// set AND at least one host is allowlisted, because this is the one feature
+	// where the daemon makes an outbound request on a caller's behalf -- from
+	// outside the firewall it installs for its guests. The allowlist is the
+	// control; the caps bound what an allowlisted host can spend.
+	sourceFetch            bool
+	sourceHosts            repeatedFlag
+	sourceCredentials      repeatedFlag
+	sourceMaxBytes         int64
+	sourceMaxExpandedBytes int64
+	sourceMaxFileBytes     int64
+	sourceMaxFiles         int
+	sourceTimeout          time.Duration
+	sourceTempDir          string
 
 	logLevel string
 
@@ -156,12 +172,42 @@ func main() {
 		"max sandboxes ONE token may have running at once (0 = unlimited). Without it a single token can hold every slot on the node. Does not cover POST /v1/tasks: the count is this node's and a task is scheduled across the fleet, so bound task load with -slots/-cpu/-mem")
 	flag.Float64Var(&cfg.tenantMaxRPS, "tenant-max-rps", 0,
 		"max API requests per second per token, bursting one second's worth (0 = unlimited). One allowance per tenant, and this daemon derives a tenant per token, so two keys are two allowances")
+	flag.BoolVar(&cfg.sourceFetch, "source-fetch", false,
+		"allow a create to seed a sandbox from a URL the caller names. Off by default, and deliberately: the daemon fetches that URL itself, from outside the firewall it installs for guests, so it is the operator's decision and not something an upgrade turns on. It names no host on its own -- without -source-allow-host every source is still refused. A git source additionally needs the git binary on PATH; a host without git serves tarballs only, and says so at startup")
+	flag.Var(&cfg.sourceHosts, "source-allow-host",
+		"a host a source may be fetched from; repeatable, and commas in one value are split. An exact name (codeload.github.com) or a leading-dot suffix (.githubusercontent.com), which matches subdomains but not the bare domain. Empty allows nothing, which is what stops -source-fetch alone from reaching every host on the internet. Allowlisting a name does not allowlist an address: where it resolves is checked again at connect time against the private, loopback, link-local and metadata ranges")
+	flag.Int64Var(&cfg.sourceMaxBytes, "source-max-bytes", 0,
+		"largest compressed source body to download, in bytes (0 = the built-in 64 MiB)")
+	flag.Int64Var(&cfg.sourceMaxExpandedBytes, "source-max-expanded-bytes", 0,
+		"largest expanded source to write into a sandbox, in bytes (0 = the built-in 256 MiB). This is what bounds a decompression bomb. It is not the sandbox's own limit: a tree that passes here and does not fit the guest's writable layer is refused per sandbox, with both numbers named")
+	flag.Int64Var(&cfg.sourceMaxFileBytes, "source-max-file-bytes", 0,
+		"largest single file inside a source, in bytes (0 = the built-in 64 MiB). Separate from the total because an archive under the total cap can still hold one member the guest refuses, which fails a write halfway through an expansion that had already validated. Raise it with -source-max-expanded-bytes; the guest itself takes 256 MiB per file")
+	flag.IntVar(&cfg.sourceMaxFiles, "source-max-files", 0,
+		"most members one source may hold (0 = the built-in 20000). Separate from the byte caps because a 10 KB tar of a million empty files passes both of them. It also bounds what the member names may total, at 256 bytes per member")
+	flag.DurationVar(&cfg.sourceTimeout, "source-timeout", 0,
+		"how long a fetch or a clone may take (0 = the built-in 60s). It bounds everything a third party controls, and the sandbox is not booted until it is over, so a slow origin costs the caller no VM time")
+	flag.StringVar(&cfg.sourceTempDir, "source-temp-dir", "",
+		"where a source is buffered or cloned before it is written into the guest (default the system temporary directory). Point it at a real disk if /tmp is a tmpfs on this host: what is staged there is bounded by -source-max-bytes plus -source-max-expanded-bytes per seed, and that would otherwise be memory competing with the VMs")
+	flag.Var(&cfg.sourceCredentials, "source-credential",
+		"a git credential, as name@https://host/prefix/=/path/to/file; repeatable. The prefix is required and is the only place the credential may be sent: without it any caller could name any credential on any allowlisted URL, which spends the operator's token on repositories the caller was never given and hands the token to whatever host answers. Callers select one by name with credential_ref and never see the value; the file holds a token, or username:token for a forge that wants a real username. A path rather than the secret, for the same reason as -tokens-file: a secret on a command line is a secret in ps, in shell history and in the unit file. Keep it root-owned and 0600")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug, info, warn or error")
 	flag.DurationVar(&cfg.logRetention, "log-retention", time.Hour,
 		"how long an exec's output is kept after it finishes")
 	flag.DurationVar(&cfg.sandboxRetention, "sandbox-retention", 0,
 		"how long a stopped sandbox stays listed and retrievable before the daemon forgets it (0 = forever, which is what every node did before this flag and a slow leak on one that never restarts). Raised to -log-retention when set below it: the stopped record carries the final metering, and every exec record is reached through its sandbox")
 	flag.Parse()
+
+	// Refuse a stray argument instead of ignoring it. Go's flag package stops
+	// parsing at the first non-flag word, so one typo -- `-source-fetch git`,
+	// where -source-fetch is a bool -- silently discards every flag after it.
+	// The daemon then starts with a security posture nobody chose: in that exact
+	// case an empty -source-allow-host, which the log reports honestly while the
+	// operator reads their own command line and sees hosts they named.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "microvmd: unexpected argument %q; every setting is a flag, and flags must come before it\n", flag.Arg(0))
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	log := newLogger(cfg.logLevel)
 
@@ -265,6 +311,17 @@ func run(cfg config, log *slog.Logger) error {
 		// reading.
 		log.Warn("stopped sandboxes are never forgotten: the list grows for the daemon's whole life",
 			"hint", "set -sandbox-retention (it is raised to -log-retention if lower) to reap them")
+	}
+
+	if cfg.sourceFetch {
+		// Before anything boots, like the tokens: a credential file that cannot be
+		// read should stop the daemon where an operator is watching, not fail the
+		// first create that needed a private repository hours later.
+		seeder, err := newSeeder(cfg, log)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, sandbox.WithSource(seeder))
 	}
 
 	if specs := parseWarmSpecs(cfg.warm, log); len(specs) > 0 {
@@ -426,6 +483,211 @@ func sweep(ctx context.Context, what string, retention time.Duration, reap func(
 	}
 }
 
+// repeatedFlag is a flag that may be given more than once, keeping every value.
+//
+// Repeated rather than comma-separated because one of its users is a filesystem
+// path, and a path may legitimately contain a comma. -source-allow-host splits on
+// commas anyway, since a hostname cannot.
+type repeatedFlag []string
+
+func (r *repeatedFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatedFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
+}
+
+// newSeeder builds the source fetcher from the -source-* flags.
+//
+// Every limit is passed as given, zero included: the package's own defaults are
+// deliberately conservative, and a flag nobody set must not become "unbounded".
+func newSeeder(cfg config, log *slog.Logger) (*source.Seeder, error) {
+	hosts := parseSourceHosts(cfg.sourceHosts)
+	creds, err := readCredentials(cfg.sourceCredentials, log)
+	if err != nil {
+		return nil, err
+	}
+
+	seeder, err := source.NewSeeder(source.Config{
+		AllowHosts:       hosts,
+		MaxBytes:         cfg.sourceMaxBytes,
+		MaxExpandedBytes: cfg.sourceMaxExpandedBytes,
+		MaxFileBytes:     cfg.sourceMaxFileBytes,
+		MaxFiles:         cfg.sourceMaxFiles,
+		Timeout:          cfg.sourceTimeout,
+		TempDir:          cfg.sourceTempDir,
+		Credentials:      creds,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure source fetching: %w", err)
+	}
+
+	if len(hosts) == 0 {
+		// Not fatal: an operator staging the flags should not have the daemon refuse
+		// to start. But it does nothing until a host is named, and that is invisible
+		// until the first create is refused.
+		log.Warn("-source-fetch is set with an empty -source-allow-host, so every source is still refused",
+			"hint", "name each host a sandbox may be seeded from, e.g. -source-allow-host codeload.github.com")
+	}
+	for name, cred := range creds {
+		// A credential bound to a host no source may be fetched from can never
+		// resolve. Warned rather than refused: an operator may be staging one flag
+		// ahead of the other.
+		if u, err := source.ParseCredentialPrefix(cred.URLPrefix); err == nil && !hostAllowed(hosts, u.Hostname()) {
+			log.Warn("a source credential is bound to a host that is not allowlisted, so it can never be used",
+				"credential", name, "host", u.Hostname(),
+				"hint", "add -source-allow-host "+u.Hostname())
+		}
+	}
+	if seeder.GitPath() == "" {
+		log.Warn("a git source is refused on this host", "reason", seeder.GitNote(),
+			"hint", "tarball sources are unaffected")
+	}
+	sweepSourceLeftovers(cfg.sourceTempDir, log)
+	log.Info("source seeding enabled",
+		"hosts", len(hosts), "credentials", len(creds), "git", seeder.GitPath())
+	return seeder, nil
+}
+
+// hostAllowed mirrors the allowlist match in internal/source, for a startup
+// warning only. It is not a control: the control is in the package that dials.
+func hostAllowed(hosts []string, host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, entry := range hosts {
+		entry = strings.ToLower(strings.TrimSuffix(entry, "."))
+		if strings.HasPrefix(entry, ".") {
+			if strings.HasSuffix(host, entry) {
+				return true
+			}
+			continue
+		}
+		if host == entry {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepSourceLeftovers removes git checkouts a previous run did not finish with.
+//
+// A clone lives in a named temporary directory until the create that asked for it
+// returns, and a SIGKILL in between -- systemd's TimeoutStopSec while a seed is in
+// flight is the realistic one -- leaves the whole tree behind with nobody to
+// remove it. Swept at startup, like the orphaned TAP devices the runtime clears,
+// and for the same reason: nothing else ever will.
+//
+// Only this daemon's own prefix, and only at startup, so there is no window in
+// which it could take a directory a running clone is using.
+func sweepSourceLeftovers(tempDir string, log *slog.Logger) {
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	matches, err := filepath.Glob(filepath.Join(tempDir, "microvm-git-*"))
+	if err != nil || len(matches) == 0 {
+		return
+	}
+	for _, dir := range matches {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Warn("could not remove a leftover source checkout", "path", dir, "err", err)
+		}
+	}
+	log.Info("removed leftover source checkouts from a previous run", "count", len(matches))
+}
+
+// parseSourceHosts flattens the repeated -source-allow-host into one list. A
+// hostname holds no comma, so a value carrying several is split rather than
+// refused.
+func parseSourceHosts(entries []string) []string {
+	var out []string
+	for _, entry := range entries {
+		for _, host := range strings.Split(entry, ",") {
+			if host = strings.TrimSpace(host); host != "" {
+				out = append(out, host)
+			}
+		}
+	}
+	return out
+}
+
+// readCredentials reads the -source-credential files into the map a caller's
+// credential_ref resolves against.
+//
+// The name is the operator's label and is returned on the sandbox; the value never
+// leaves this process except into git's environment. Nothing here quotes a value:
+// a credential in a startup error is a credential in the journal.
+//
+// The URL prefix is not optional, and the flag would be a confused deputy without
+// it: every caller shares this map, so a credential resolved by name alone is the
+// operator's token spent on any repository a caller names and handed to any
+// allowlisted host that asks for it. See source.Credential.
+func readCredentials(entries []string, log *slog.Logger) (map[string]source.Credential, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	out := make(map[string]source.Credential, len(entries))
+	for _, entry := range entries {
+		bound, path, ok := strings.Cut(entry, "=")
+		name, prefix, scoped := strings.Cut(bound, "@")
+		name, prefix, path = strings.TrimSpace(name), strings.TrimSpace(prefix), strings.TrimSpace(path)
+		if !ok || !scoped || name == "" || prefix == "" || path == "" {
+			return nil, fmt.Errorf(
+				"-source-credential %q is not name@https://host/prefix/=/path/to/file", entry)
+		}
+		if _, err := source.ParseCredentialPrefix(prefix); err != nil {
+			return nil, fmt.Errorf("-source-credential %q: %w", name, err)
+		}
+		if _, dup := out[name]; dup {
+			// Refused rather than resolved to the last one: two files for one name is
+			// an operator meaning two different things, and guessing which would hand a
+			// caller the wrong credential.
+			return nil, fmt.Errorf("-source-credential %q is given twice", name)
+		}
+		secret, err := readSecretFile(path, log)
+		if err != nil {
+			return nil, fmt.Errorf("read the credential %q: %w", name, err)
+		}
+		out[name] = source.Credential{URLPrefix: prefix, Secret: secret}
+	}
+	return out, nil
+}
+
+// readSecretFile reads one credential file.
+//
+// The whole file less its trailing newline, so a token written with `echo` works
+// and one with a leading space is not silently corrected. An empty file is fatal
+// for the same reason an empty token file is: it means the operator intended a
+// secret to be there.
+func readSecretFile(path string, log *slog.Logger) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	warnIfShared(path, info.Mode().Perm(), log)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	secret := strings.TrimRight(string(raw), "\r\n")
+	if secret == "" {
+		return "", fmt.Errorf("%s holds no credential", path)
+	}
+	return secret, nil
+}
+
+// warnIfShared says so when a file holding a secret is readable beyond its owner.
+//
+// Warned and not refused: the file is the operator's, and a daemon that will not
+// start over a permission bit is worse than one that says so loudly.
+func warnIfShared(path string, mode os.FileMode, log *slog.Logger) {
+	if mode&0o077 == 0 {
+		return
+	}
+	log.Warn("a file holding a secret is readable beyond its owner",
+		"path", path, "mode", fmt.Sprintf("%04o", mode), "hint", "chmod 600, root-owned")
+}
+
 // parseWarmSpecs turns the -warm flag ("image:vcpus:mem:count,...") into warm
 // pool shapes. A malformed entry is logged and skipped rather than failing the
 // daemon: a typo in a performance knob should not stop it serving. Warm VMs are
@@ -543,13 +805,8 @@ func readTokenFile(path string, log *slog.Logger) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read the token file: %w", err)
 	}
-	// A token file anyone else on the box can read is a shared secret. Warned and
-	// not refused: the file is the operator's, and a daemon that will not start
-	// over a permission bit is worse than one that says so loudly.
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		log.Warn("token file is readable beyond its owner",
-			"path", path, "mode", fmt.Sprintf("%04o", mode), "hint", "chmod 600, root-owned")
-	}
+	// A token file anyone else on the box can read is a shared secret.
+	warnIfShared(path, info.Mode().Perm(), log)
 
 	raw, err := os.ReadFile(path)
 	if err != nil {

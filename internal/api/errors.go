@@ -70,6 +70,9 @@ const (
 	CodeNodeAtCapacity   = "node_at_capacity"
 	CodeQueueUnreachable = "queue_unreachable"
 
+	CodeSourceNotPermitted = "source_not_permitted"
+	CodeSourceFetchFailed  = "source_fetch_failed"
+
 	CodeTokenMissing = "token_missing"
 	CodeTokenInvalid = "token_invalid"
 	CodeForbidden    = "forbidden"
@@ -201,14 +204,20 @@ func rateLimitError(rps float64, retryAfter time.Duration) *apiError {
 //
 // No Retry-After. When one of their sandboxes ends is up to them, and a number
 // invented here would be a guess dressed as a fact.
+//
+// The count includes a create still in progress, which is said out loud because
+// otherwise the number contradicts every other endpoint: a create is charged its
+// slot before it boots -- and, with -source-fetch, before its source is even
+// downloaded -- so a caller can be told they hold one while GET /v1/sandboxes
+// returns an empty list and there is nothing for them to delete.
 func tenantConcurrencyError(cause error, live, limit int) *apiError {
 	return &apiError{
 		status:  http.StatusTooManyRequests,
 		errType: apitypes.ErrorTypeCapacityError,
 		code:    CodeNodeAtCapacity,
 		message: fmt.Sprintf(
-			"This token may have %d sandboxes running at once and already has %d. "+
-				"Delete one, or wait for one to expire.", limit, live),
+			"This token may have %d sandboxes running at once and already has %d, counting "+
+				"any create still in progress. Delete one, or wait for one to expire.", limit, live),
 		cause: cause,
 	}
 }
@@ -222,6 +231,54 @@ func plural(n float64, unit string) string {
 		s += "s"
 	}
 	return s
+}
+
+// sourceNotPermittedError is a seed refused before a byte left this host.
+//
+// One code and one message for every reason: fetching is not enabled, the host is
+// not on the operator's allowlist, the scheme is not https, the credential_ref
+// names nothing, or the name resolves somewhere the daemon may not go. Told apart,
+// they would be a port scanner with the host's routing table -- the daemon runs
+// outside the firewall it installs for guests, so "that host does not resolve" and
+// "that address is private" are facts about the operator's network. The detail is
+// carried for the log, where the operator who set the policy is the one reading.
+//
+// A 400, because retrying it unchanged fails identically: the policy is not going
+// to move in the next minute.
+func sourceNotPermittedError(cause error) *apiError {
+	return &apiError{
+		status:  http.StatusBadRequest,
+		errType: apitypes.ErrorTypeInvalidRequestError,
+		code:    CodeSourceNotPermitted,
+		message: "This source cannot be fetched. The operator names the hosts a sandbox may be " +
+			"seeded from, https is the only scheme, and a credential must be one the operator configured.",
+		// The object rather than a field inside it: naming source.url would be wrong
+		// half the time -- an unconfigured credential_ref is the same refusal -- and
+		// which of them it was is the answer this error exists not to give.
+		param: "source",
+		cause: cause,
+	}
+}
+
+// sourceFetchFailedError is a seed that was reached and did not survive.
+//
+// 502 and api_error rather than a 400: the URL is not necessarily wrong, the
+// origin may answer in a minute, and "retry, possibly with the same
+// Idempotency-Key" is exactly what api_error already tells a client to do.
+//
+// The detail is quoted, unlike the refusal above. Which hosts are reachable is the
+// operator's own choice, so an HTTP status or a rejected archive member gives away
+// nothing about the network that the allowlist did not already publish. The stage
+// is named because it says whose problem it is: a fetch is the origin, an expand is
+// the archive.
+func sourceFetchFailedError(stage string, cause error) *apiError {
+	return &apiError{
+		status:  http.StatusBadGateway,
+		errType: apitypes.ErrorTypeApiError,
+		code:    CodeSourceFetchFailed,
+		message: fmt.Sprintf("This sandbox's source failed at the %s stage: %v.", stage, cause),
+		cause:   cause,
+	}
 }
 
 // queueUnreachableError means we could not ask the queue.

@@ -16,7 +16,14 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-__all__ = ["Client", "APIError", "RequestInfo", "__version__"]
+__all__ = [
+    "Client",
+    "APIError",
+    "RequestInfo",
+    "tarball_source",
+    "git_source",
+    "__version__",
+]
 
 __version__ = "0.1.0"
 
@@ -74,6 +81,33 @@ class APIError(Exception):
     def is_forbidden(self) -> bool:
         """The key lacks permission -- an ordinary token on an admin-only route."""
         return self.status == 403
+
+    @property
+    def is_source_not_permitted(self) -> bool:
+        """A create whose ``source`` was refused before anything was fetched.
+
+        One error covers every reason -- seeding is not enabled on the node, the
+        host is not on the operator's allowlist, the scheme is not https, the
+        ``credential_ref`` names nothing, or the URL resolves somewhere the daemon
+        may not go. They are not told apart on purpose: the daemon fetches from
+        outside the firewall it installs for guests, so a caller able to
+        distinguish "no such host" from "that is a private address" would have a
+        port scanner with the host's routing table.
+
+        Not worth retrying. An operator has to act."""
+        return self.code == "source_not_permitted"
+
+    @property
+    def is_source_fetch_failed(self) -> bool:
+        """A ``source`` that was reached and did not survive: the origin answered
+        badly, it timed out, the body was past the operator's cap, or the archive
+        holds a member that cannot be written into a guest.
+
+        Worth retrying, unlike a refusal -- the URL is not necessarily wrong and the
+        origin may answer in a minute. No sandbox exists either way: seeding is
+        all-or-nothing, so a failed seed destroys the VM before the reply, and
+        nothing half-seeded is returned, listed or billed."""
+        return self.code == "source_fetch_failed"
 
 
 class RequestInfo:
@@ -519,6 +553,55 @@ class Tenants:
 
     def list(self) -> dict:
         return self._c._request("GET", "/tenants")
+
+
+# -- source params -------------------------------------------------------
+
+
+def tarball_source(url: str, strip_components: int = 0) -> dict:
+    """The ``source`` of a create that seeds the sandbox from a tar or tar.gz
+    archive.
+
+    ``strip_components`` is almost always 1: a release tarball wraps everything in
+    one directory named after the version, and without dropping it the project
+    arrives a level deeper than every path inside it expects. Zero is left out of
+    the request rather than sent, since it is the server's own default.
+
+    The daemon fetches and expands the archive on the host and writes the tree in
+    over the endpoints an upload uses, so nothing in the guest touches the network
+    and a sandbox created with ``network=False`` is seeded just the same. It is
+    refused until an operator enables fetching and allowlists the host -- see
+    ``APIError.is_source_not_permitted``.
+
+        client.sandboxes.create("python", source=tarball_source(url, 1))
+    """
+    src = {"type": "tarball", "url": url}
+    if strip_components > 0:
+        src["strip_components"] = strip_components
+    return src
+
+
+def git_source(url: str, ref: Optional[str] = None) -> dict:
+    """The ``source`` of a create that seeds the sandbox from a git clone. No
+    ``ref`` takes the remote's default branch.
+
+    Prefer a commit SHA: it is the only one of branch, tag and SHA that resolves to
+    the same code twice, and the sandbox reports back the commit it actually got in
+    ``source["commit"]``.
+
+    For a private repository add a ``credential_ref`` naming a credential the
+    operator configured. The name travels and the secret never does -- the clone
+    happens on the host and only the working tree is copied in, ``.git`` and
+    credential both left behind, which is the whole reason this is not a clone
+    inside the guest.
+
+        source = {**git_source(url, "main"), "credential_ref": "github-ci"}
+        client.sandboxes.create("node", source=source)
+    """
+    src = {"type": "git", "url": url}
+    if ref:
+        src["ref"] = ref
+    return src
 
 
 # -- content helpers -----------------------------------------------------

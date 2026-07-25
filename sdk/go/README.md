@@ -68,6 +68,43 @@ client.Tasks.Create(ctx, microvm.TaskCreateParams{
 })
 ```
 
+## Seeding a sandbox with a project
+
+`Source` on create has the sandbox arrive with the project already in it, instead
+of one upload per file:
+
+```go
+sb, _ := client.Sandboxes.Create(ctx, microvm.SandboxCreateParams{
+    Image:  "go",
+    Source: microvm.GitSource("https://github.com/acme/widgets", "main"),
+})
+
+// A release tarball wraps everything in one directory, hence the 1:
+microvm.TarballSource("https://host/acme/widgets/v1.2.3.tar.gz", 1)
+```
+
+The **daemon** fetches and expands it, then writes the tree in over the same
+endpoints an upload uses. So it works with `Network` false, and a private
+repository's token never enters the VM — set `CredentialRef` on the result to a
+name the operator configured with `-source-credential`; the name travels and the
+secret does not.
+
+It is refused until an operator has enabled fetching *and* allowlisted the host,
+because the daemon fetches from outside the firewall it installs for guests:
+
+```go
+if microvm.IsSourceNotPermitted(err) {
+    // Not enabled, not allowlisted, not https, or it resolves somewhere the
+    // daemon may not go. One error for all of them, on purpose. No retry helps.
+}
+if microvm.IsSourceFetchFailed(err) {
+    // The origin was reached and misbehaved. Worth retrying.
+}
+```
+
+Seeding is all-or-nothing: a failure destroys the VM and fails the create, so
+there is never a half-seeded sandbox to clean up.
+
 ## Streaming output
 
 ```go

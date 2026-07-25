@@ -193,6 +193,36 @@ func IsForbidden(err error) bool {
 	return errors.As(err, &e) && e.StatusCode == http.StatusForbidden
 }
 
+// IsSourceNotPermitted reports whether err is a create whose Source the daemon
+// refused before fetching anything.
+//
+// One error covers every reason -- seeding is not enabled on the node, the host is
+// not on the operator's allowlist, the scheme is not https, the CredentialRef
+// names nothing, or the URL resolves somewhere the daemon may not go. They are not
+// told apart on purpose: the daemon fetches from outside the firewall it installs
+// for guests, so a caller able to distinguish "no such host" from "that is a
+// private address" would have a port scanner with the host's routing table.
+//
+// Not worth retrying. An operator has to act.
+func IsSourceNotPermitted(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.Code == "source_not_permitted"
+}
+
+// IsSourceFetchFailed reports whether err is a Source that was reached and did
+// not survive: the origin answered badly, it timed out, the body was past the
+// operator's cap, or the archive holds a member that cannot be written into a
+// guest.
+//
+// Worth retrying, unlike a refusal: the URL is not necessarily wrong and the
+// origin may answer in a minute. No sandbox exists either way -- seeding is
+// all-or-nothing, so a failed seed destroys the VM before the reply, and nothing
+// half-seeded is returned, listed or billed.
+func IsSourceFetchFailed(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.Code == "source_fetch_failed"
+}
+
 // requestOptions are the per-call knobs.
 type requestOptions struct {
 	idempotencyKey string

@@ -461,12 +461,75 @@ A transfer counts as activity, so staging a project for minutes without running
 anything does not look idle. It used to: only executions touched the idle clock,
 and the reclaim took the VM away mid-batch.
 
+### Seeding from a repo or a tarball
+
+`source` on create seeds the sandbox before the call returns, so the first
+execution already has the project:
+
+```json
+{"image": "python",
+ "source": {"type": "tarball",
+            "url": "https://github.com/acme/widgets/archive/refs/tags/v1.2.3.tar.gz",
+            "strip_components": 1}}
+```
+
+`{"type":"git","url":"...","ref":"main","credential_ref":"github-ci"}` clones
+instead. Without it, getting code in is one request per file, or a clone inside the
+guest — which needs `network: true`, is impossible for a network-isolated sandbox,
+and puts your credential inside a VM that is untrusted by design.
+
+**The fetch happens on the host.** The daemon downloads the source, expands it, and
+writes the tree in over the same file endpoints an upload uses. Nothing in the guest
+reaches the network to do it, which is why it works with `network: false` and why a
+private repository's token never enters the VM: the clone is host-side, only the
+working tree is copied in, and `.git` is not written at all. `credential_ref` names a
+credential the operator configured — the name travels, the secret does not.
+
+**A credential is bound to a URL prefix, by the operator, and a `credential_ref`
+outside it is refused.** Otherwise it would be a confused deputy: the map is shared
+by every caller, so naming a credential on some other repository would spend the
+operator's token on code they never handed over — and naming it on a host the caller
+influences would hand over the token itself, since git offers its credential to
+anything that challenges for one.
+
+**It is off until an operator allowlists hosts**, with `-source-fetch` *and* at
+least one `-source-allow-host`; either one missing refuses every source. That gate
+is not paperwork, it is the feature. "Fetch this URL for me" hands a caller an
+outbound request made by the daemon, and the daemon runs *outside* the firewall it
+installs for its guests — nftables blocks RFC1918 and `169.254.169.254` for a
+sandbox and protects nothing here. Since the caller then reads the result out of
+their own sandbox, an unfiltered fetcher would be a full SSRF read primitive: the
+host's LAN, the daemon's own API on loopback, and the cloud metadata service that
+holds the host's identity. So it is https only, no proxy, every redirect hop
+re-checked against the allowlist, and where a name resolves vetted again on the
+syscall path — a name that rebinds to the metadata address between the check and
+the connect gets no socket.
+
+**Seeding is all-or-nothing.** A failure at any stage destroys the VM and fails the
+create, so no half-seeded sandbox is returned, listed or billed. Anything refused
+before a byte leaves the host is one `source_not_permitted` (400) with one message —
+a caller who could tell "no such host" from "that is a private address" would have a
+port scanner with the host's routing table — and an origin that was reached and
+misbehaved is `source_fetch_failed` (502), which is worth retrying with the same
+`Idempotency-Key`. A tree too big for the sandbox is refused before the VM boots
+naming `mem_mib` and `disk_mib`, rather than becoming an `ENOSPC` from somewhere
+inside the guest.
+
+**Seeding does not spend the TTL.** `ttl_seconds` is time to run things in, and the
+clock is restarted once the tree is in the guest, so a slow fetch cannot hand back a
+sandbox whose `expires_at` elapsed during the create. A `ttl_seconds` shorter than
+the seed itself is refused naming that field.
+
+DEPLOY.md §10 is the operator side.
+
 ### CLI
 
 ```
 microvm run python main.py            # upload, run, print output
 microvm run node app.ts -network      # with filtered internet
 microvm run python job.py -env KEY=v -timeout 30s
+microvm exec go go test ./... -source git=https://github.com/acme/widgets
+microvm exec node npm test -source tarball=https://host/v1.2.3.tar.gz -source-strip 1
 microvm submit python job.py          # queue it instead; prints a task ID
 microvm result tsk_01JZ8...           # wait for it and print the output
 microvm queue                         # depth and this node's slots
@@ -482,6 +545,11 @@ microvm run python test.py && deploy
 ```
 
 Ctrl-C aborts the process *inside the guest*, not just the CLI.
+
+`-source` spells the type out rather than guessing it from the URL: the same path
+can name a repository and a tarball, and a CLI that inferred the wrong one would
+seed the wrong thing and report success. `-source-ref`, `-source-strip` and
+`-source-credential` modify it.
 
 ### Go
 
@@ -546,6 +614,26 @@ Both SDKs give you `err(execution)` / `exe.Err()`, which returns nothing for a
 non-zero exit and an error for the endings that are **not** your code's doing —
 a timeout, a cancel, a VM taken away. That distinction is the one worth having:
 a `vanished` execution means we took your sandbox, not that your program failed.
+
+All three build a `source` for you, so a seeded create is one call:
+
+```go
+client.Sandboxes.Create(ctx, microvm.SandboxCreateParams{Image: "go",
+    Source: microvm.GitSource("https://github.com/acme/widgets", "main")})
+```
+```ts
+await client.sandboxes.create({ image: "go", source: gitSource(url, "main") });
+```
+```python
+client.sandboxes.create("go", source=git_source(url, "main"))
+```
+
+`TarballSource` / `tarballSource` / `tarball_source` is the other one, taking the
+`strip_components` a release archive needs. Seeding has two failures worth branching
+on and each SDK names both: `IsSourceNotPermitted` / `isSourceNotPermitted` /
+`is_source_not_permitted` for a source the operator has not allowed, which no retry
+will fix, and `IsSourceFetchFailed` and friends for an origin that misbehaved, which
+one might.
 
 ## Running it
 

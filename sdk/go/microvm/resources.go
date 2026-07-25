@@ -25,6 +25,46 @@ func (s *SandboxService) Create(ctx context.Context, params SandboxCreateParams,
 	return &out, err
 }
 
+// TarballSource builds the Source of a create that seeds the sandbox from a tar
+// or tar.gz archive.
+//
+// stripComponents is almost always 1: a release tarball wraps everything in one
+// directory named after the version, and without dropping it the project arrives
+// a level deeper than every path inside it expects. Zero is left out of the
+// request rather than sent, since it is the server's own default.
+//
+// The daemon fetches and expands the archive on the host and writes the tree in
+// over the endpoints an upload uses, so nothing in the guest touches the network
+// and a sandbox created with Network false is seeded just the same. It is refused
+// until an operator enables fetching and allowlists the host -- see
+// IsSourceNotPermitted.
+func TarballSource(url string, stripComponents int) *SandboxSourceParams {
+	p := &SandboxSourceParams{Type: SandboxSourceParamsTypeTarball, Url: url}
+	if stripComponents > 0 {
+		p.StripComponents = &stripComponents
+	}
+	return p
+}
+
+// GitSource builds the Source of a create that seeds the sandbox from a git
+// clone. An empty ref takes the remote's default branch.
+//
+// Prefer a commit SHA: it is the only one of branch, tag and SHA that resolves to
+// the same code twice, and the sandbox reports back the commit it actually got in
+// Source.Commit.
+//
+// For a private repository set CredentialRef on the result to a name the operator
+// configured. The name travels and the secret never does -- the clone happens on
+// the host and only the working tree is copied in, .git and credential both left
+// behind, which is the whole reason this is not a clone inside the guest.
+func GitSource(url, ref string) *SandboxSourceParams {
+	p := &SandboxSourceParams{Type: SandboxSourceParamsTypeGit, Url: url}
+	if ref != "" {
+		p.Ref = &ref
+	}
+	return p
+}
+
 // Retrieve returns a sandbox with live metering.
 func (s *SandboxService) Retrieve(ctx context.Context, sandboxID string, opts ...RequestOption) (*Sandbox, error) {
 	var out Sandbox

@@ -16,7 +16,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from microvm import APIError, Client, RequestInfo  # noqa: E402
+from microvm import APIError, Client, RequestInfo, git_source, tarball_source  # noqa: E402
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -257,6 +257,96 @@ def test_routes_idempotent_by_design_are_retried():
             except APIError:
                 pass
             assert state["n"] == 3, state["n"]
+    finally:
+        srv.shutdown()
+
+
+def test_source_helpers_build_the_wire_body():
+    """The helpers exist to spell the source out, so what reaches the wire is the
+    thing worth asserting: a field named wrongly is a seed the server refuses, and
+    a field sent when it should be absent is a default nobody chose."""
+    seen = {}
+
+    def behaviour(h):
+        length = int(h.headers.get("Content-Length", "0"))
+        seen["body"] = json.loads(h.rfile.read(length)) if length else None
+        h.json(200, {"id": "sb_1"})
+
+    srv, url = serve(behaviour)
+    try:
+        c = Client(url)
+
+        c.sandboxes.create("python", source=tarball_source("https://example.com/v1.tar.gz", 1))
+        assert seen["body"]["source"] == {
+            "type": "tarball",
+            "url": "https://example.com/v1.tar.gz",
+            "strip_components": 1,
+        }, seen["body"]
+
+        # Zero is the server's own default, so it is omitted rather than sent.
+        c.sandboxes.create("python", source=tarball_source("https://example.com/v1.tar.gz"))
+        assert seen["body"]["source"] == {
+            "type": "tarball",
+            "url": "https://example.com/v1.tar.gz",
+        }, seen["body"]
+
+        c.sandboxes.create("node", source=git_source("https://example.com/acme/widgets", "main"))
+        assert seen["body"]["source"] == {
+            "type": "git",
+            "url": "https://example.com/acme/widgets",
+            "ref": "main",
+        }, seen["body"]
+
+        # No ref means the remote's default branch, which is the server's choice to
+        # make: an empty string would be a ref resolving to nothing.
+        c.sandboxes.create("node", source=git_source("https://example.com/acme/widgets"))
+        assert seen["body"]["source"] == {
+            "type": "git",
+            "url": "https://example.com/acme/widgets",
+        }, seen["body"]
+
+        # A private repository names a credential the operator configured; the
+        # secret itself never travels.
+        source = {**git_source("https://example.com/acme/private", "v1.0.0"),
+                  "credential_ref": "github-ci"}
+        c.sandboxes.create("node", source=source)
+        assert seen["body"]["source"]["credential_ref"] == "github-ci", seen["body"]
+    finally:
+        srv.shutdown()
+
+
+def test_seeding_guards_match_their_code_only():
+    """The two seeding failures need opposite reactions -- one is retried, the other
+    needs an operator -- and they arrive as a 400 and a 502 that other things also
+    use. So the guards match the code, and nothing else must match with them."""
+    cases = [
+        (400, "invalid_request_error", "source_not_permitted", True, False),
+        (502, "api_error", "source_fetch_failed", False, True),
+        (400, "invalid_request_error", "invalid_parameter", False, False),
+        (502, "api_error", "internal_error", False, False),
+    ]
+    state = {}
+
+    def behaviour(h):
+        status, type_, code = state["reply"]
+        h.json(status, {"error": {"type": type_, "code": code, "message": "no"}})
+
+    srv, url = serve(behaviour)
+    try:
+        # No retries: a 502 is retryable, and this asserts the classification of the
+        # error rather than the retry policy.
+        c = Client(url, max_retries=0)
+        for status, type_, code, not_permitted, fetch_failed in cases:
+            state["reply"] = (status, type_, code)
+            try:
+                c.sandboxes.create("python", source=tarball_source("https://example.com/v1.tar.gz", 1))
+                assert False, "expected an APIError"
+            except APIError as e:
+                assert e.is_source_not_permitted is not_permitted, code
+                assert e.is_source_fetch_failed is fetch_failed, code
+                # Never capacity: reported as one, a caller would retry a URL that
+                # is never going to work, or queue a task instead.
+                assert not e.is_capacity, code
     finally:
         srv.shutdown()
 

@@ -11,6 +11,20 @@
         client.sandboxes.delete(sb["id"])
 """
 
-from .client import APIError, Client, RequestInfo, __version__
+from .client import (
+    APIError,
+    Client,
+    RequestInfo,
+    __version__,
+    git_source,
+    tarball_source,
+)
 
-__all__ = ["Client", "APIError", "RequestInfo", "__version__"]
+__all__ = [
+    "Client",
+    "APIError",
+    "RequestInfo",
+    "tarball_source",
+    "git_source",
+    "__version__",
+]

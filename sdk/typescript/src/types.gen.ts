@@ -35,6 +35,44 @@ export interface paths {
          *     deliberate: a sandbox is a reservation, so the caller is told
          *     immediately rather than left waiting. If you would rather wait, submit a
          *     task.
+         *
+         *     A `source` seeds the sandbox before this returns, so the first execution
+         *     already has the project. The daemon fetches and expands it host-side and
+         *     writes the result in over the same file endpoints an upload uses; nothing
+         *     in the guest reaches the network to do it, which is why it works with
+         *     `network: false` and why no credential has to be handed to a VM we assume
+         *     is hostile.
+         *
+         *     **Seeding is all-or-nothing.** If the fetch, the archive, or any write
+         *     fails, the VM is destroyed and this call fails: no sandbox comes back,
+         *     none is listed, and none is billed. That is create's existing contract --
+         *     it returns a sandbox ready to run commands, or it returns an error -- and
+         *     handing back a half-seeded sandbox in some new state would be a fourth
+         *     outcome for every caller to handle and a new `stop_reason` for three SDKs
+         *     to switch on. Retry with the same `Idempotency-Key`.
+         *
+         *     Two codes are specific to seeding:
+         *
+         *     - `source_not_permitted` (400, `invalid_request_error`) — the operator has
+         *       not enabled fetching, the host is not on their allowlist, the scheme is
+         *       not `https`, the `credential_ref` names nothing, or the URL resolves
+         *       somewhere the daemon may not go. One code and one message for all of
+         *       them, on purpose: a caller who could tell "no such host" from "that is a
+         *       private address" would have a port scanner with the host's routing table.
+         *     - `source_fetch_failed` (502, `api_error`) — the origin was reached and the
+         *       seed did not survive it: an HTTP error, a timeout, a body past the
+         *       operator's size cap, or an archive holding a member this cannot write.
+         *       An archive whose own members contradict each other -- a file and a
+         *       directory of one name -- is refused here too, rather than becoming a
+         *       failed write.
+         *
+         *     Seeding also shares two codes with the rest of the API. `node_at_capacity`
+         *     (429, `capacity_error`) means this node is already fetching as many sources
+         *     at once as it will; retry shortly, as for any other 429. And
+         *     `parameter_invalid` (400) names `ttl_seconds` when the lifetime asked for is
+         *     shorter than the seed took -- seeding does not spend the TTL, so that clock
+         *     starts once the tree is in the guest, but a sandbox cannot be seeded into a
+         *     lifetime that has already elapsed.
          */
         post: operations["createSandbox"];
         delete?: never;
@@ -687,6 +725,13 @@ export interface components {
              *     configured. Absent when it does not.
              */
             storage?: components["schemas"]["SandboxStorage"];
+            /**
+             * @description What this sandbox was seeded from, when it was seeded at all. Absent
+             *     otherwise -- a sandbox with no `source` has no empty source object.
+             *
+             *     Never the URL as it was sent. See `url_redacted`.
+             */
+            source?: components["schemas"]["SandboxSource"];
             stats: components["schemas"]["Stats"];
         };
         /**
@@ -720,6 +765,47 @@ export interface components {
             max_bytes?: number;
             /** @description What a write does when the cap is reached. Absent when there is no cap. */
             policy?: components["schemas"]["TenantFullPolicy"];
+        };
+        /**
+         * @description Where a sandbox was seeded from. Reported so that a sandbox found later can
+         *     be traced back to the code in it, which is otherwise unknowable from
+         *     outside the guest.
+         */
+        SandboxSource: {
+            /** @enum {string} */
+            type: "tarball" | "git";
+            /**
+             * @description The scheme, host and path of what was fetched. Userinfo, query and
+             *     fragment are cut off, and the field says so in its name so that nobody
+             *     passes it to a fetcher expecting it to work.
+             *
+             *     Cut down because a URL is routinely a credential: a presigned object
+             *     URL carries its signature in the query, and `https://user:token@host/`
+             *     carries a token in plain sight. Tags taught this -- everything the API
+             *     returns is readable by the tenant and by an admin key, so nothing the
+             *     API returns may be a secret. A URL is the first field where that rule
+             *     is not obvious, which is exactly why it is applied here.
+             * @example https://github.com/acme/widgets/archive/refs/tags/v1.2.3.tar.gz
+             */
+            url_redacted: string;
+            /**
+             * @description The git ref that was asked for. Absent for a tarball.
+             * @example main
+             */
+            ref?: string;
+            /**
+             * @description The commit that was actually checked out, resolved. A branch names a
+             *     moving target and a tag can be moved under you; this is the only field
+             *     here that says the same thing tomorrow. Absent for a tarball.
+             * @example 9f2b1c4e7a3d5f8091b2c3d4e5f60718293a4b5c
+             */
+            commit?: string;
+            /**
+             * @description The operator credential that was used, by name. Safe to return because
+             *     it was never the secret -- it is the name of one.
+             * @example github-ci
+             */
+            credential_ref?: string;
         };
         SandboxList: components["schemas"]["ListEnvelope"] & {
             data?: components["schemas"]["Sandbox"][];
@@ -846,6 +932,10 @@ export interface components {
              * @description Maximum lifetime. The sandbox is killed when it elapses. Capped by
              *     the host's own maximum, and extensible later within that cap with
              *     `POST /sandboxes/{sandbox}/extend`.
+             *
+             *     It is time to run things in, so seeding a `source` does not consume it:
+             *     the clock starts once the project is in the guest. A `ttl_seconds`
+             *     shorter than the seed takes is refused naming this field.
              * @default 900
              */
             ttl_seconds?: number;
@@ -860,6 +950,16 @@ export interface components {
              *     yours to choose, and only to tighten.
              */
             storage?: components["schemas"]["SandboxStorageParams"];
+            /**
+             * @description A project to seed the sandbox with, fetched by the daemon before this
+             *     create returns. Without it, getting a project in is one request per
+             *     file, or a clone inside the guest -- which needs `network: true`, is
+             *     impossible for a network-isolated sandbox, and puts your credential
+             *     inside a VM that is untrusted by design.
+             *
+             *     Off unless the operator enabled it. See `SandboxSourceParams`.
+             */
+            source?: components["schemas"]["SandboxSourceParams"];
         };
         /** @description What a create request may say about storage, which is very little. */
         SandboxStorageParams: {
@@ -877,6 +977,129 @@ export interface components {
              * @example /data
              */
             mount_path?: string;
+        };
+        /**
+         * @description Where to get the project this sandbox starts with.
+         *
+         *     The daemon fetches it, expands it host-side, and writes the result into the
+         *     guest's working directory over the same endpoints a file upload uses. It is
+         *     done before the create returns and it counts as activity, so a slow seed
+         *     cannot be reclaimed as idle halfway through.
+         *
+         *     **Off unless the operator turned it on.** Fetching needs `-source-fetch`,
+         *     and every host that may be fetched from must be named with
+         *     `-source-allow-host`; either one missing refuses every `source` with
+         *     `source_not_permitted`. An empty allowlist fetches nothing, so enabling the
+         *     flag alone changes nothing. The gate is the point rather than paperwork:
+         *     the daemon sits outside the firewall it installs for guests, so a URL it
+         *     will fetch on request is a URL an operator has to have agreed to.
+         *
+         *     Bounded by the operator too, with `-source-max-bytes` on what is
+         *     downloaded, `-source-max-expanded-bytes` on what is written, and
+         *     `-source-max-files` on how many members an archive may hold. Past any of
+         *     them is `source_fetch_failed`.
+         *
+         *     There is deliberately no destination field. The project lands in the
+         *     guest's working directory -- where a relative path in a file upload lands --
+         *     and a caller-chosen root would only be a way to write over the image's own
+         *     `/usr` and `/etc` before anything in the sandbox runs.
+         */
+        SandboxSourceParams: {
+            /**
+             * @description Which fetcher to use.
+             *
+             *     The remaining fields are per-type: `strip_components` belongs to a
+             *     tarball, and `ref`, `depth` and `credential_ref` to a git clone. One
+             *     sent with the wrong type is an `invalid_request_error` naming the field,
+             *     not a field quietly dropped -- a caller who set `ref` on a tarball meant
+             *     something by it, and seeding the default branch instead would be the
+             *     wrong project delivered silently.
+             * @enum {string}
+             */
+            type: "tarball" | "git";
+            /**
+             * Format: uri
+             * @description What to fetch.
+             *
+             *     `https` only. An `http` seed is a project any network attacker on the
+             *     path gets to rewrite before it runs, and `file://`, `ftp://`,
+             *     `gopher://` and git's own `ext::` -- which is a command, not a
+             *     transport -- are refused by the same check. They name things on the
+             *     host, and the host is the one place this URL must never reach.
+             *
+             *     The host must be on the operator's `-source-allow-host` list, and so
+             *     must every redirect hop: an allowlist checked once is an allowlist a
+             *     302 walks around. Where the name resolves is re-checked at connect
+             *     time on every hop, against the private, loopback, link-local and
+             *     IPv4-mapped ranges the guest firewall already blocks -- so a name that
+             *     resolves to `169.254.169.254`, or rebinds to it between the check and
+             *     the connect, does not get a socket.
+             *
+             *     Every one of those refusals is the same `source_not_permitted` with the
+             *     same message. Distinguishing them would turn this field into a port
+             *     scanner that reads the host's routing table.
+             *
+             *     No credential in here. `credential_ref` is where one goes, and this
+             *     value comes back on the sandbox with its userinfo and query removed
+             *     precisely because callers put them here anyway.
+             * @example https://github.com/acme/widgets/archive/refs/tags/v1.2.3.tar.gz
+             */
+            url: string;
+            /**
+             * @description Leading path elements to drop from every member, like `tar
+             *     --strip-components`. Tarball only.
+             *
+             *     `1` is the usual value: a release tarball wraps everything in a single
+             *     directory named after the version, and without this the project arrives
+             *     one level deeper than every path inside it expects.
+             *
+             *     A member with fewer elements than this is skipped rather than refused --
+             *     a `LICENSE` sitting beside the wrapper directory is normal. An archive
+             *     where every member is skipped is `source_fetch_failed`, because a
+             *     sandbox seeded with nothing is not what was asked for and an empty
+             *     working directory is the hardest kind of failure to debug later.
+             * @default 0
+             * @example 1
+             */
+            strip_components?: number;
+            /**
+             * @description Branch, tag or full commit SHA to check out. Git only. Defaults to the
+             *     remote's default branch.
+             *
+             *     Prefer a SHA. It is the only one of the three that resolves to the same
+             *     code twice, and the sandbox reports back the commit it actually got.
+             * @example main
+             */
+            ref?: string;
+            /**
+             * @description How much history to fetch, in commits. Git only.
+             *
+             *     Defaults to 1, because the sandbox needs a working tree and the commits
+             *     behind it are bytes nothing in there will read. Raise it only when
+             *     something you intend to run walks the history. The `.git` directory is
+             *     not written into the guest either way.
+             * @default 1
+             * @example 1
+             */
+            depth?: number;
+            /**
+             * @description The **name** of a credential the operator configured with
+             *     `-source-credential`, for a private repository. Git only.
+             *
+             *     Not the credential. A secret in a request body is a secret in an access
+             *     log, in a proxy, and in whatever retried the request -- the same
+             *     reasoning that made the storage namespace derive from your key instead
+             *     of arriving in the body. A name the operator did not configure is
+             *     `source_not_permitted`, like an unreachable URL, and for the same
+             *     reason: the difference is the operator's business, not the caller's.
+             *
+             *     The secret it names never enters the URL and never enters the guest. The
+             *     clone happens on the host and only the working tree is copied in, so
+             *     nothing in the sandbox can read the token that fetched it -- which is
+             *     the whole reason this is not a clone inside the guest.
+             * @example github-ci
+             */
+            credential_ref?: string;
         };
         SandboxExtendParams: {
             /**
@@ -1331,6 +1554,27 @@ export interface components {
                 "application/json": components["schemas"]["ErrorEnvelope"];
             };
         };
+        /**
+         * @description A sandbox's `source` was reachable and still could not be used: the origin
+         *     returned an error, took too long, sent more bytes than the operator allows,
+         *     or the archive holds a member that cannot be written into a guest.
+         *
+         *     An `api_error` rather than an `invalid_request_error`, because the caller's
+         *     move is the one an `api_error` already tells them: the URL is not
+         *     necessarily wrong, and the origin may answer in a minute. A URL that is
+         *     refused outright is a 400 instead, and never reaches the origin at all.
+         *
+         *     The sandbox does not exist. Seeding is all-or-nothing, so the VM was
+         *     destroyed before this reply.
+         */
+        SourceUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorEnvelope"];
+            };
+        };
     };
     parameters: {
         /**
@@ -1470,6 +1714,7 @@ export interface operations {
             409: components["responses"]["Conflict"];
             429: components["responses"]["CapacityExhausted"];
             500: components["responses"]["ApiError"];
+            502: components["responses"]["SourceUnavailable"];
         };
     };
     retrieveSandbox: {

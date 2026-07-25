@@ -21,6 +21,7 @@ import (
 	"github.com/pablofdezr/microvm/internal/logstore"
 	"github.com/pablofdezr/microvm/internal/protocol"
 	"github.com/pablofdezr/microvm/internal/runtime"
+	"github.com/pablofdezr/microvm/internal/source"
 	"github.com/pablofdezr/microvm/internal/storage"
 )
 
@@ -100,6 +101,15 @@ type Spec struct {
 	// the prefix names a tenant, and letting a body choose it would let one
 	// tenant name another's. See the API's create handler.
 	Storage *storage.Mount
+
+	// Source is a project to seed the sandbox's filesystem with before Create
+	// returns, or nil for an empty sandbox.
+	//
+	// Unlike Storage and Tenant this legitimately comes from the request body: it
+	// is a URL, and what decides whether it may be fetched is the operator's
+	// allowlist rather than the caller's identity. Nothing in it reaches the guest
+	// except the files -- see seed.go.
+	Source *source.Request
 
 	// Tags are the caller's own labels, for finding this sandbox again. They stay
 	// host-side -- nothing about them reaches the guest, which is what separates
@@ -197,6 +207,12 @@ type Info struct {
 	// no object storage and the sandbox therefore has none.
 	Storage *StorageInfo
 
+	// Source is what the sandbox was seeded from, or nil when it was not seeded.
+	// Reported so a sandbox found later can be traced back to the code inside it,
+	// which is otherwise unknowable from outside the guest. The URL in it is
+	// already redacted.
+	Source *source.Result
+
 	// Tags are the labels the sandbox was created with, or nil when it was created
 	// with none. Reported, unlike Env: they are what a caller filters a list by,
 	// so they have to come back out.
@@ -236,6 +252,13 @@ type Sandbox struct {
 	mgr  *Manager
 
 	createdAt time.Time
+
+	// source is what this sandbox was seeded from, or nil when it was not.
+	//
+	// Written before the sandbox is published in the manager's map and never
+	// afterwards, so it is read without the lock: every reader got the sandbox out
+	// of that map, under the manager's lock, which is after this was set.
+	source *source.Result
 
 	// cancelSupervisor stops the goroutine enforcing TTL and idle.
 	cancelSupervisor context.CancelFunc
@@ -296,6 +319,16 @@ type Manager struct {
 	// said which bucket to spend it in should not be guessing.
 	storage storage.Backend
 
+	// source fetches a caller's project, or nil when the node does not seed
+	// sandboxes. Nil is the default: the fetch is an outbound request the daemon
+	// makes on a caller's behalf, from outside the firewall it installs for its
+	// guests, so it exists only where an operator has asked for it.
+	source source.Preparer
+
+	// seeding bounds how many sources are being fetched at once, node-wide. Nil
+	// when source is nil, and created with it: see maxConcurrentSeeds.
+	seeding chan struct{}
+
 	// warm holds pre-booted pristine VMs, or nil when the pool is not configured.
 	// It amortizes cold-boot latency without weakening the one-sandbox-per-task
 	// rule, since each pooled VM is a distinct VM that has run no code.
@@ -328,6 +361,35 @@ type Option func(*Manager)
 // to its own prefix. See the storage package.
 func WithStorage(backend storage.Backend) Option {
 	return func(m *Manager) { m.storage = backend }
+}
+
+// maxConcurrentSeeds is how many sources this node fetches at once.
+//
+// A node-wide bound, because the per-tenant one is neither: -tenant-max-sandboxes
+// defaults to unlimited, and the node's own admission -- slots, cpu, memory -- is
+// inside rt.Create, which a seed happens before. Without this, one token holds N
+// concurrent creates that are each downloading to this host's disk before anything
+// has asked whether the node has room for a VM, and N is bounded by nothing.
+//
+// A small number on purpose. A seed is disk and bandwidth, and the node has one of
+// each: more fetches at once do not finish sooner, they only multiply what is in
+// flight when something goes wrong. Refused rather than queued, with the same 429
+// a full node answers, because a queue behind a 60-second fetch is a request
+// timeout dressed as progress.
+const maxConcurrentSeeds = 8
+
+// WithSource lets a create seed the sandbox from a caller-supplied URL.
+//
+// Off without it, and that is the default an upgrade keeps: the daemon fetching a
+// URL a caller chose is an outbound request made by a process that sits outside
+// the firewall it installs for its guests, so it is the operator's decision and
+// not a feature that appears on its own. The Preparer carries the allowlist, the
+// address policy and the size caps; nothing here second-guesses them.
+func WithSource(p source.Preparer) Option {
+	return func(m *Manager) {
+		m.source = p
+		m.seeding = make(chan struct{}, maxConcurrentSeeds)
+	}
 }
 
 // WithWarmPool pre-boots and maintains a stock of pristine VMs for the given
@@ -480,6 +542,20 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 		return nil, err
 	}
 
+	// The source is fetched here, before a VM exists, and the slot above is
+	// already held while it happens: a fetch is work done for this tenant, and one
+	// that cost nothing against their cap would be a way to have the daemon make
+	// unbounded outbound requests. See prepareSeed for why it is not done after
+	// boot.
+	seed, err := m.prepareSeed(ctx, spec)
+	if err != nil {
+		m.release(spec.Tenant)
+		return nil, err
+	}
+	if seed != nil {
+		defer seed.Close()
+	}
+
 	// Take the tags rather than borrow them. The caps were checked against this
 	// map before the call, and a map the caller still holds can grow afterwards
 	// -- which would make the check theatre, since what is kept here is kept for
@@ -499,7 +575,6 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 	// boot command line and a pre-booted VM cannot carry it.
 	inst := m.acquireWarm(spec)
 	if inst == nil {
-		var err error
 		inst, err = m.rt.Create(ctx, spec.Spec)
 		if err != nil {
 			// Nothing booted, so the slot reserved above is nobody's. Holding it
@@ -532,12 +607,78 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 
 	m.serveStorage(supervisorCtx, sb, inst)
 
+	// The seed goes in before the sandbox is published and before this returns, so
+	// there is no moment at which a half-seeded sandbox is listed, retrievable, or
+	// executable. A seeding failure destroys the VM: create's contract is a sandbox
+	// ready to run commands or an error, and a fourth outcome would be a new state
+	// for every caller and a new stop reason for three SDKs.
+	if seed != nil {
+		started := time.Now()
+		err := m.writeSeed(ctx, sb, seed)
+		if err != nil && sb.Reason() == ReasonExpired {
+			// The write failed because the TTL took the sandbox away underneath it.
+			// Reported as the ttl_seconds it is rather than as a write that broke,
+			// which carries no failure of source's own and would be answered 500.
+			err = &SeedExpiredError{TTL: spec.TTL, Elapsed: time.Since(started)}
+		}
+		if err == nil {
+			// The TTL is time to run things in, and none of it was. The clock was
+			// started at boot so a wedged seed still has a supervisor that will take
+			// the VM away; restarting it here is what stops the seed's own duration
+			// from being charged to the caller, who could otherwise be handed a
+			// sandbox with an expires_at that elapsed during their create.
+			err = sb.startTTLAfterSeed(spec.TTL, started)
+		}
+		if err != nil {
+			// Its own deadline, and not the caller's: a client that hung up
+			// mid-write must not leave a VM behind holding a TAP device and a
+			// network slot. Stop releases the tenant's slot, and the sandbox was
+			// never in the map, so nothing else has to be unwound.
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+			_ = sb.Stop(stopCtx, ReasonFailed)
+			cancel()
+			sb.log.Error("sandbox destroyed because seeding failed", "err", err)
+			return nil, err
+		}
+		sb.source = ptrTo(seed.Result())
+	}
+
 	m.mu.Lock()
 	m.sandboxes[spec.ID] = sb
 	m.mu.Unlock()
 
 	sb.log.Info("sandbox created", "ttl", spec.TTL, "idle_timeout", spec.IdleTimeout)
 	return sb, nil
+}
+
+// ptrTo keeps one copy of a seed's result on the sandbox. A value rather than the
+// Prepared it came from, which is closed the moment Create returns.
+func ptrTo[T any](v T) *T { return &v }
+
+// startTTLAfterSeed restarts the TTL clock now that the sandbox is the caller's,
+// and refuses if the sandbox did not survive the seed.
+//
+// Both under one lock, deliberately. Checking the state and then setting the
+// deadline as two steps leaves the window Create used to have: the TTL fires
+// between them, Stop runs, and Create publishes a stopped sandbox and answers 201
+// -- the fourth outcome create's contract says cannot exist. claimExpiry sets
+// stopping under this same lock, so seeing neither it nor a state change here means
+// the supervisor has not claimed the kill and cannot now, because the deadline it
+// would re-read has already moved.
+func (s *Sandbox) startTTLAfterSeed(ttl time.Duration, started time.Time) error {
+	s.mu.Lock()
+	if s.state != StateRunning || s.stopping {
+		s.mu.Unlock()
+		return &SeedExpiredError{TTL: ttl, Elapsed: time.Since(started)}
+	}
+	s.expiresAt = time.Now().Add(ttl)
+	s.mu.Unlock()
+
+	select {
+	case s.ttlNudge <- struct{}{}:
+	default: // one is already pending, and it will read the deadline set above
+	}
+	return nil
 }
 
 // applyStorageBoot decides, before the VM boots, whether the guest is told to
@@ -1190,6 +1331,7 @@ func (s *Sandbox) Info() Info {
 		MemMiB:    s.spec.MemMiB,
 		Network:   s.spec.Network,
 		Storage:   storageInfo,
+		Source:    s.source,
 		Tags:      s.Tags(),
 	}
 

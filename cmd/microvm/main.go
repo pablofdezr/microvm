@@ -53,6 +53,18 @@ Flags:
   -tag key=value   label the sandbox; repeatable, and narrows microvm ps
   -json            print the raw result as JSON
 
+Seed the sandbox with a project before the command runs, for run and exec — a
+task has no sandbox to seed. The daemon fetches it host-side, so this works with
+no -network and hands the guest no credential; the operator must have allowed the
+host with -source-fetch and -source-allow-host.
+
+  -source type=url        tarball=https://... or git=https://...
+  -source-ref name        branch, tag or commit for a git source
+  -source-strip int       leading path elements to drop from a tarball's members
+  -source-credential name operator credential for a private repository
+
+  microvm exec go go test ./... -source git=https://github.com/acme/widgets
+
 Exit code mirrors the program's own, so this composes with the shell:
   microvm run python test.py && echo passed
 `
@@ -74,6 +86,22 @@ type options struct {
 	env     kvFlag
 	tags    kvFlag
 	asJSON  bool
+
+	// Seeding. The three modifiers carry the -source- prefix because that is what
+	// says which flag they belong to, and it is the vocabulary the daemon's own
+	// -source-* flags already use, so an operator and a caller read one set of
+	// names.
+	source      string
+	sourceRef   string
+	sourceStrip int
+	sourceCred  string
+}
+
+// seedRequested reports whether any -source flag was given. One flagset serves
+// every command, so this is how a command that cannot seed says so rather than
+// dropping the flag.
+func (o options) seedRequested() bool {
+	return o.source != "" || o.sourceRef != "" || o.sourceStrip > 0 || o.sourceCred != ""
 }
 
 // kvFlag collects a repeated key=value flag. Both -env and -tag take one, and
@@ -115,6 +143,10 @@ func run() error {
 	fs.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "process timeout")
 	fs.Var(opts.env, "env", "environment variable, key=value; repeatable")
 	fs.Var(opts.tags, "tag", "label, key=value; repeatable")
+	fs.StringVar(&opts.source, "source", "", "seed the sandbox, type=url: tarball=https://... or git=https://...")
+	fs.StringVar(&opts.sourceRef, "source-ref", "", "branch, tag or commit for a git source")
+	fs.IntVar(&opts.sourceStrip, "source-strip", 0, "leading path elements to drop from a tarball's members")
+	fs.StringVar(&opts.sourceCred, "source-credential", "", "operator credential name, for a private repository")
 	fs.BoolVar(&opts.asJSON, "json", false, "print raw JSON")
 	fs.Usage = func() { fmt.Print(usage) }
 
@@ -272,12 +304,67 @@ func cmdExec(ctx context.Context, client *microvm.Client, opts options, args []s
 	}, opts)
 }
 
+// sourceParams turns -source and its modifiers into the create parameter, or nil
+// when no source was asked for.
+//
+// The type is written out rather than guessed from the URL. The same path can name
+// a repository and a tarball, and a CLI that inferred the wrong one would seed the
+// wrong thing and report success. The `type=url` shape is -env's and -tag's, so
+// there is one separator to remember even though nothing here is a key.
+//
+// A modifier belonging to the other type is sent anyway. The API refuses it naming
+// the field, and that refusal is the point: someone who passed -source-ref with a
+// tarball meant something by it, and seeding the archive as if they had not said it
+// is the wrong project delivered silently.
+func sourceParams(opts options) (*microvm.SandboxSourceParams, error) {
+	if opts.source == "" {
+		if opts.seedRequested() {
+			// A modifier with nothing to modify, refused for the reason above: someone
+			// who typed -source-ref meant to seed something, and running against an
+			// empty sandbox instead would look like it worked.
+			return nil, errors.New(
+				"-source-ref, -source-strip and -source-credential modify -source, which was not given")
+		}
+		return nil, nil
+	}
+	kind, url, found := strings.Cut(opts.source, "=")
+	if !found || url == "" {
+		return nil, fmt.Errorf("expected -source tarball=<url> or -source git=<url>, got %q", opts.source)
+	}
+
+	var params *microvm.SandboxSourceParams
+	switch kind {
+	case "tarball":
+		params = microvm.TarballSource(url, opts.sourceStrip)
+		if opts.sourceRef != "" {
+			params.Ref = &opts.sourceRef
+		}
+	case "git":
+		params = microvm.GitSource(url, opts.sourceRef)
+		if opts.sourceStrip > 0 {
+			params.StripComponents = &opts.sourceStrip
+		}
+	default:
+		return nil, fmt.Errorf("%q is not a source type; use tarball= or git=", kind)
+	}
+	if opts.sourceCred != "" {
+		params.CredentialRef = &opts.sourceCred
+	}
+	return params, nil
+}
+
 func newSandbox(ctx context.Context, client *microvm.Client, image string, opts options) (*microvm.Sandbox, error) {
+	src, err := sourceParams(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	params := microvm.SandboxCreateParams{
 		Image:   image,
 		Network: &opts.network,
 		Env:     mapParam(opts.env),
 		Tags:    mapParam(opts.tags),
+		Source:  src,
 		// Outlive the process by a margin, so a run that finishes normally is
 		// never racing its own sandbox's TTL.
 		TtlSeconds: seconds(opts.timeout + time.Minute),
@@ -293,6 +380,12 @@ func newSandbox(ctx context.Context, client *microvm.Client, image string, opts 
 	if err != nil {
 		if microvm.IsCapacity(err) {
 			return nil, fmt.Errorf("%w\nthe node is full; `microvm submit` queues the work instead of failing", err)
+		}
+		if microvm.IsSourceNotPermitted(err) {
+			// The one failure whose fix is on the daemon, not in this command line.
+			// The message deliberately does not say which of the reasons applied --
+			// see the SDK guard -- so name the flags instead of guessing for them.
+			return nil, fmt.Errorf("%w\nthe daemon fetches a source itself, so an operator must allow it: -source-fetch plus -source-allow-host for that host", err)
 		}
 		return nil, err
 	}
@@ -504,6 +597,13 @@ func cmdLogs(ctx context.Context, client *microvm.Client, opts options, args []s
 func cmdSubmit(ctx context.Context, client *microvm.Client, opts options, args []string) error {
 	if len(args) < 2 {
 		return errors.New("usage: microvm submit <image> <file>")
+	}
+	if opts.seedRequested() {
+		// A task has no sandbox to seed: its files travel inside the create body, and
+		// nothing on this path would honour -source. Refused rather than dropped -- a
+		// flag silently ignored is a project that never arrives.
+		return errors.New("a task cannot be seeded from a source; hold a sandbox instead: " +
+			"microvm exec <image> <cmd> -source ...")
 	}
 	image, path := args[0], args[1]
 

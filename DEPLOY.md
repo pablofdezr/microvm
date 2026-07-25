@@ -307,11 +307,152 @@ handed over their stored data with it.
 
 ---
 
-## 10. Run it under systemd
+## 10. Optional: seeding sandboxes from a source
 
-`microvmd` handles `SIGINT`/`SIGTERM` with a 30-second graceful shutdown (it stops
-every sandbox, then tears the firewall down, in that order). A systemd unit is the
-natural fit. `Delegate=yes` hands it a cgroup subtree to manage.
+A caller may ask for a sandbox that arrives with a project already in it — a
+tarball, or a git checkout — instead of uploading it one file at a time. **The
+daemon does the fetching**, expands the result host-side, and writes the tree in
+over the same file endpoints an upload uses. That is why it works for a sandbox
+with no network at all, and why a private repository's token never enters a VM.
+
+**It is off, and two flags are needed to turn it on:**
+
+```bash
+-source-fetch \
+-source-allow-host codeload.github.com \
+-source-allow-host .githubusercontent.com
+```
+
+Either one missing refuses every `source`. `-source-fetch` on its own names no
+host, so an upgrade changes nothing about a deployment that does not set both — the
+daemon logs a warning if you set the flag and leave the list empty, because that
+combination looks enabled and is not.
+
+### The allowlist is the security boundary
+
+Everything else here is a limit. This is the control.
+
+The daemon runs **outside the firewall it installs for its guests**. `internal/netpool`
+blocks RFC1918, link-local and `169.254.169.254` for a sandbox with nftables; none of
+that applies to the daemon's own sockets. So "fetch this URL for me" is an outbound
+request made by a process that can reach your LAN, the daemon's own API on loopback,
+and the cloud metadata service holding this host's identity — and the caller reads
+the result out of their own sandbox afterwards. Unallowlisted, that is a complete
+SSRF read primitive with the host's credentials at the end of it.
+
+**A wildcard defeats the whole thing.** An entry is either an exact host
+(`codeload.github.com`) or a leading-dot suffix (`.githubusercontent.com`, which
+matches subdomains and not the bare domain). A suffix broad enough to match anything
+— `.com`, `.net`, `.internal` — is the same as having no allowlist: any host an
+attacker controls now answers a redirect, or a DNS record, of their choosing. Name
+the hosts your callers actually fetch from. Two or three is normal.
+
+What the allowlist does *not* do is decide addresses. Where a name resolves is
+checked separately, at connect time, against the same blocked ranges a guest gets, on
+every redirect hop and again on the syscall path — so allowlisting a host does not
+allowlist an address, and a name that rebinds to the metadata address between the
+check and the connect does not get a socket. `https` only, and no proxy is honoured,
+not even the environment's.
+
+### The caps
+
+Each bounds something a hostile source would otherwise spend for free. Every one
+defaults to a conservative number rather than to unlimited, so a flag nobody wired
+up refuses a bad archive instead of admitting it.
+
+| Flag | Default | What it caps |
+|---|---|---|
+| `-source-max-bytes` | 64 MiB | The compressed body downloaded |
+| `-source-max-expanded-bytes` | 256 MiB | What is written into the guest — this is what stops a decompression bomb |
+| `-source-max-file-bytes` | 64 MiB | One file inside a source. Raise it with the total; the guest itself takes 256 MiB per file |
+| `-source-max-files` | 20000 | Members in one source, because a 10 KB tar of a million empty files passes both byte caps. It also bounds what the member names may total, at 256 bytes per member |
+| `-source-timeout` | 60s | The fetch or clone, which is everything a third party controls |
+
+The sandbox's own writable layer is smaller than these, and a tree that passes here
+and will not fit the guest is refused per sandbox with both numbers named — before
+the VM boots, rather than as an `ENOSPC` from inside a file transfer.
+
+**A git clone is bounded by the same two byte caps**, which takes explaining because
+git has no option for it: there is no `--max-bytes`, and `--depth 1` says nothing
+about how large the one commit it fetches is. So the clone's temporary directory is
+measured *while git is writing it*, and the clone is killed at
+`-source-max-bytes` + `-source-max-expanded-bytes` — the packfile bounded like a
+compressed body, the tree it expands to like an expanded archive. Measured during
+rather than after, because "the caps were satisfied" is worth nothing once the disk
+is full.
+
+That directory is `-source-temp-dir`, or the system temporary directory when it is
+unset. **Point it at a real disk if `/tmp` is a tmpfs here** (it is on Fedora, Arch
+and anything with `PrivateTmp`), or what a seed stages competes for memory with the
+VMs. Whatever is left there by a daemon killed mid-seed is swept at the next
+startup.
+
+Concurrency is bounded too, node-wide: this daemon fetches at most 8 sources at
+once and answers a ninth with the same `429 node_at_capacity` a full node gives.
+`-tenant-max-sandboxes` is not that bound — it defaults to unlimited, and a fetch
+happens before the node's own admission has been asked whether there is room for a
+VM at all.
+
+### Credentials for a private repository
+
+```bash
+-source-credential github-ci@https://github.com/acme-corp/=/etc/microvm/github-ci.token
+```
+
+Three parts: the **name** a caller selects with `credential_ref`, the **URL prefix**
+the credential may be sent to, and the **path** to the file holding it.
+
+The flag takes a **path, never the secret** — the same reason as `-tokens-file`: a
+secret on a command line is a secret in `ps`, in shell history and in the unit file.
+Keep the file root-owned and `0600`; the daemon warns if anyone else can read it, and
+refuses to start if the file is missing or empty, so a broken credential fails where
+you are watching rather than on some caller's create hours later.
+
+**The prefix is required, and it is a security boundary, not a convenience.** Every
+caller shares this map, so a credential resolved by name alone is a confused deputy
+twice over. It spends your token on any repository a caller names — git authenticates
+the clone, and the working tree lands in a sandbox the caller reads — and it hands the
+token *itself* to whatever server answers, because git sends its credential to any
+host that challenges for one and an allowlist entry may be a suffix a caller can
+choose a name under. With a prefix, `credential_ref: github-ci` on
+`https://github.com/someone-else/private` is refused before a socket is opened, in
+the same words as a credential that does not exist — so the names and the
+repositories behind them cannot be probed either.
+
+An `https` URL naming a host and as much path as you want to pin. Matching is on the
+host and then the path at a component boundary, so `.../acme` does not cover
+`.../acmecorp`. A prefix with no path (`https://git.example.com`) covers the whole
+host, which is what to write for a self-hosted forge you own outright.
+
+The file holds a token, or `username:token` for a forge that wants a real username.
+Callers never see the value: the clone happens on this host, only the working tree is
+copied into the guest, and `.git` is not written at all. The secret does not enter the
+URL or argv either (`/proc/<pid>/cmdline` is world-readable), so it reaches git
+through an askpass helper reading the environment.
+
+A `git` source also needs `git` on `PATH`, **version 2.31 or newer**. The address
+policy pins the clone to addresses it has vetted with `http.curloptResolve`, which
+landed in 2.31 — and an unrecognised `http.*` setting is accepted and silently
+ignored, so on an older git (Debian 11 ships 2.30.2) the pins would do nothing and
+git would do its own DNS, which is the rebinding window the tarball path exists to
+close. There is no safe degraded mode, so a host whose git is too old serves tarballs
+only and says so at startup, exactly like a host with no git.
+
+---
+
+## 11. Run it under systemd
+
+`microvmd` handles `SIGINT`/`SIGTERM` with a graceful shutdown in two 30-second
+phases: it drains in-flight requests, then stops every sandbox and tears the
+firewall down, in that order. A systemd unit is the natural fit. `Delegate=yes` hands
+it a cgroup subtree to manage.
+
+`TimeoutStopSec` has to sit above both phases, which is why the unit below says 120
+rather than 45. Draining waits for in-flight requests rather than cancelling them,
+and with `-source-fetch` on, the longest of those is no longer a boot: it is a create
+holding a `-source-timeout` fetch plus the write of the tree that came out of it.
+Cut short by `SIGKILL`, what leaks is the *other* sandboxes' jail directories and
+cgroups, because the phase doing that teardown is the one that gets killed.
 
 `/etc/systemd/system/microvmd.service`:
 
@@ -345,7 +486,7 @@ ExecStart=/usr/local/bin/microvmd \
 User=root
 Delegate=yes
 Restart=on-failure
-TimeoutStopSec=45
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target
@@ -375,7 +516,7 @@ what the *queue* packs onto the node and should reflect the host's real capacity
 
 ---
 
-## 11. Put TLS in front — this is not optional
+## 12. Put TLS in front — this is not optional
 
 `-addr` defaults to `127.0.0.1` on purpose: **this API creates VMs that run
 arbitrary code, so an open one is an open shell.** Never bind it to a public
@@ -395,7 +536,7 @@ disable proxy response buffering and any short read/idle timeout on that path.
 
 ---
 
-## 12. Verify the deployment
+## 13. Verify the deployment
 
 ```bash
 # Liveness needs no token:
@@ -424,7 +565,7 @@ from `image-dir`.
 
 ---
 
-## 13. Scaling to a fleet
+## 14. Scaling to a fleet
 
 The queue is the source of truth and nodes are dumb pullers, so the same binary is
 shaped by its flags into three roles. Add capacity by starting more workers
@@ -442,16 +583,18 @@ is the number that tells you whether the fleet is big enough.
 
 ---
 
-## 14. Operating it
+## 15. Operating it
 
 - **Adding an image:** drop a new `*.ext4` into `-image-dir` and restart the node.
 - **Upgrades / rolling restarts:** on a fleet, a worker that stops pulling has its
   leases expire and its in-flight work returned to the queue, so you can restart
   workers one at a time with no lost tasks. Drain a node by removing its public
   `-addr` from the load balancer first if it also serves the API.
-- **Graceful shutdown:** `systemctl stop` sends `SIGTERM`; the daemon stops every
-  sandbox and removes its firewall rules within 30s. Keep `TimeoutStopSec` above
-  that.
+- **Graceful shutdown:** `systemctl stop` sends `SIGTERM`; the daemon drains
+  in-flight requests for up to 30s, then stops every sandbox and removes its
+  firewall rules within another 30s. Keep `TimeoutStopSec` above both — and above
+  `-source-timeout` too if `-source-fetch` is on, since a create mid-seed is what
+  the drain is waiting for. The unit in §11 uses 120.
 - **Log retention:** exec output is kept `-log-retention` (default 1h) after a run
   finishes, then swept. Raise it if clients collect output late.
 - **Sandbox retention:** a stopped sandbox stays listed and retrievable so a caller
@@ -467,7 +610,7 @@ is the number that tells you whether the fleet is big enough.
 
 ---
 
-## 15. Security checklist
+## 16. Security checklist
 
 - [ ] `-addr` on loopback; a TLS terminator on the public edge.
 - [ ] Tokens set (never none on an exposed host); admin tokens only where an
@@ -478,6 +621,22 @@ is the number that tells you whether the fleet is big enough.
 - [ ] `-tenant-max-sandboxes` and `-tenant-max-rps` set wherever more than one
       tenant shares a node: without them one token can hold every slot and
       hammer the API as fast as VMs boot.
+- [ ] `-source-fetch` left **off** unless sandboxes need seeding from a URL, and
+      `-source-allow-host` naming every host that may be fetched from when it is
+      on. This is the one request that makes the daemon reach the network on a
+      caller's behalf, and the daemon sits outside the firewall it installs for
+      guests — the allowlist is what stands between a caller's URL and the host's
+      LAN, its own API on loopback, and the cloud metadata service. Where a name
+      resolves is checked again at connect time either way, so allowlisting a host
+      does not allowlist an address. No wildcard-shaped entry (`.com`, `.internal`)
+      — a suffix that matches anything is the same as no allowlist. See §10.
+- [ ] `-source-credential` values in `0600` root-owned files, each bound to the
+      **narrowest URL prefix that works** — the organisation, or the one repository.
+      The flag takes a path, never the secret, and callers select one by name and
+      never see it; the prefix is what stops any caller spending it on any repository
+      the token can reach, and handing it to any allowlisted host that asks.
+- [ ] `-source-temp-dir` on a real disk if `/tmp` is a tmpfs on this host and
+      `-source-fetch` is on.
 - [ ] `-uid`/`-gid` are a real non-root user.
 - [ ] `-ceiling-cores`/`-ceiling-mem-mb` set on any shared host.
 - [ ] Per-sandbox network cap left on (`-default-network-bps`, ~100 Mbit default):

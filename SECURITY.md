@@ -20,6 +20,18 @@ Of particular interest:
 - **Guest-to-host escapes** or any breach of VM isolation.
 - **Network firewall bypasses** — a sandbox reaching RFC1918, link-local, or the
   cloud metadata endpoint at `169.254.169.254`.
+- **SSRF through the source fetcher** — anything that makes the daemon connect
+  somewhere its policy should have refused when seeding a sandbox from a caller's
+  `source` URL (`-source-fetch`). The daemon fetches from *outside* the firewall it
+  installs for guests, and the caller reads the result out of their own sandbox, so
+  this reaches the host's LAN, the API on loopback, and the metadata service that
+  holds the host's identity. In scope: getting past the `-source-allow-host`
+  allowlist (a redirect, a name that resolves oddly, a URL parsed differently by the
+  check and the connect), reaching a blocked address (DNS rebinding between the
+  check and the dial, an IPv4-mapped or NAT64 form, a scheme other than `https`), or
+  making an operator credential leak into a guest, a log, a URL or `argv`. Also in
+  scope: an archive or checkout that writes outside the guest's working directory,
+  or past `-source-max-*`.
 - **Auth bypasses** — defeating bearer-token auth or crossing a tenant boundary.
 - **Metering, quota or admission bypasses** — escaping per-tenant storage
   quotas, usage accounting, or the per-tenant sandbox and request-rate limits

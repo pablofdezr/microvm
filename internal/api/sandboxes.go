@@ -68,6 +68,16 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 		spec.Tags = *params.Tags
 	}
+	// The shape of the source, not its policy: whether this host may be fetched
+	// from is the operator's answer and the core's to give. See source.go.
+	if params.Source != nil {
+		req, apiErr := validateSource(params.Source)
+		if apiErr != nil {
+			s.writeAPIError(w, r, apiErr)
+			return
+		}
+		spec.Source = req
+	}
 	// Idle needs care that TTL does not: zero means "use the default" and
 	// negative means "never reclaim", so an absent field and an explicit 0 are
 	// the same thing while an explicit -1 is not.
@@ -121,6 +131,15 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 	sb, err := s.mgr.Create(r.Context(), spec)
 	if err != nil {
+		// Seeding first, because a create that got as far as fetching failed for a
+		// reason of its own: a refused URL is the caller's, a bad origin is somebody
+		// else's server, and neither is this node being full. Reported as capacity
+		// they would send a caller into a retry loop against a URL that will never
+		// work.
+		if seedErr := sourceCreateError(err); seedErr != nil {
+			s.writeAPIError(w, r, seedErr)
+			return
+		}
 		// The caller's own cap, not the node's. Same 429 so their retry logic is
 		// unchanged, different message so they are not left waiting for room that
 		// is already there.
@@ -472,6 +491,7 @@ func toAPISandbox(sb *sandbox.Sandbox) apitypes.Sandbox {
 		}
 		out.Storage = st
 	}
+	out.Source = toAPISource(info.Source)
 	return out
 }
 

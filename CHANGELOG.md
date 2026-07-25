@@ -144,6 +144,131 @@ project aims for [Semantic Versioning](https://semver.org).
   reckoning and had the VM reclaimed underneath it. A download holds the sandbox
   open until its reader is closed, not until the call returns.
 
+### Seeding a sandbox from a source
+
+- **`source` on create** seeds the sandbox before the call returns, so the first
+  execution already has the project. Getting code in was otherwise one HTTP
+  request per file, or a clone inside the guest — which needs `network: true`, is
+  impossible for a network-isolated sandbox, and puts the caller's credential
+  inside a VM that is untrusted by design. Two types: `tarball` (`.tar`/`.tar.gz`,
+  with `strip_components`) and `git` (`ref`, `depth`, `credential_ref`).
+- **The daemon fetches and expands host-side, then writes the tree in over the
+  same file endpoints an upload uses.** Nothing was added to the guest agent and
+  no image changed: the agent is compiled into every rootfs, so a new guest
+  endpoint would mean rebuilding and redistributing every image before the feature
+  worked anywhere — and the existing write path already carries a mode and already
+  counts as activity, which is exactly what a seed needs.
+- **Off unless the operator turns it on**, with `-source-fetch` *and* at least one
+  `-source-allow-host`; either missing refuses every source. The gate is the
+  feature: the daemon runs outside the firewall it installs for its guests, so a
+  URL it will fetch on request is an SSRF primitive pointed at the host's LAN, its
+  own loopback API, and the cloud metadata service that holds the host's identity.
+  Two independent checks stand in front of every connection — the resolved
+  addresses are vetted before the dial, and vetted again inside the dialler's
+  `Control` on the syscall path, which closes the DNS-rebinding window between
+  them. The blocked ranges are the same set `internal/netpool` gives a guest, kept
+  in step by a parity test. https only, no proxy (not even the environment's),
+  every redirect hop re-checked against the allowlist.
+- **Bounded by the operator**: `-source-max-bytes` on the download,
+  `-source-max-expanded-bytes` on what is written, `-source-max-file-bytes` on one
+  file inside it, `-source-max-files` on the member count (which also bounds what
+  the member names may total), `-source-timeout` on anything a third party controls,
+  and `-source-temp-dir` for where a seed is staged — point it at a real disk where
+  `/tmp` is a tmpfs. Every cap defaults to a conservative number rather than to
+  unlimited, so a flag nobody wired up refuses a hostile archive instead of
+  admitting one.
+- **A git clone is bounded by those byte caps too**, which needs saying because git
+  has no option for it: no `--max-bytes`, and `--depth 1` says nothing about how
+  large the one commit it fetches is. The clone's temporary directory is measured
+  while git is writing it and the clone is killed at `-source-max-bytes` +
+  `-source-max-expanded-bytes` — the packfile bounded like a compressed body, the
+  tree it expands to like an expanded archive. During, not after: "the caps were
+  satisfied" is worth nothing once the disk is full.
+- **Concurrent fetches are bounded node-wide** at 8, answered past that with the
+  same `capacity_error` 429 a full node gives. `-tenant-max-sandboxes` is not that
+  bound — it defaults to unlimited, and a fetch happens before the node's own
+  admission has been asked whether there is room for a VM.
+- **Seeding is all-or-nothing.** Fetch, expand and write in that order; a failure
+  at any stage destroys the VM and fails the create, so no half-seeded sandbox is
+  ever returned, listed or billed. The error names the stage — `fetch`, `expand`
+  or `write` — because the three are fixed by different people. Refusals decided
+  before a byte leaves the host are one `source_not_permitted` (400) with one
+  message, since a caller able to tell "no such host" from "that is a private
+  address" would have a port scanner with the host's routing table; an origin that
+  was reached and misbehaved is `source_fetch_failed` (502).
+- **The fetch happens before the VM boots**, so a caller is never billed for
+  somebody else's slow web server: metering is cumulative from boot, and a seed
+  fetched after it would land in the sandbox's wall clock as idle time. The writes
+  that follow do count as activity, which is what stops the idle reclaim taking
+  the VM away mid-seed.
+- **A source too big for the sandbox is a request error, not a mystery `ENOSPC`
+  from inside the guest.** The writable layer is a tmpfs stacked over the
+  read-only image, so both `disk_mib` and `mem_mib` bound it and the smaller wins;
+  a tree that will not fit is refused before the VM boots, with the numbers and
+  the fields that would fix it.
+- **A private repository never hands its credential to the guest.** The clone is
+  host-side and only the working tree is copied in — `.git` is not written at all.
+  `credential_ref` names a credential the operator configured with
+  `-source-credential name@https://host/prefix/=/path/to/file`; the secret never
+  enters the request,
+  the URL, or argv (`/proc/<pid>/cmdline` is world-readable, so it reaches git
+  through an askpass helper reading the environment). git is run with a
+  built-from-nothing environment, https only, redirects refused, submodules not
+  recursed, and pinned to the addresses this daemon vetted, so git never resolves
+  the name itself. A host with no `git` on `PATH` — or one older than 2.31, which
+  ignores the `http.curloptResolve` those pins are made of and would silently do its
+  own DNS instead — serves tarballs only and says so at startup.
+- **A credential is bound to a URL prefix, and that binding is the point of the
+  flag.** The map is shared by every caller, so a credential resolved by name alone
+  would be a confused deputy twice over: it spends the operator's token on any
+  repository a caller names, since the authenticated working tree lands in a sandbox
+  the caller reads, and it hands the token *itself* to whatever host answers, since
+  git offers its credential to anything that challenges for one and an allowlist
+  entry can be a suffix. A `credential_ref` outside its prefix is refused in the same
+  words as one that does not exist, so the names and the repositories behind them
+  cannot be enumerated either. Matching is host-then-path at a component boundary,
+  so `.../acme` does not cover `.../acmecorp`.
+- **Seeding does not spend `ttl_seconds`.** The TTL is time to run things in, so the
+  clock is restarted once the tree is in the guest; a slow fetch can no longer hand
+  back a sandbox whose `expires_at` elapsed during the create. A `ttl_seconds`
+  shorter than the seed is refused naming that field rather than surfacing as a 500,
+  and a sandbox the TTL claimed mid-seed can no longer be published as running.
+- **An archive whose members contradict each other is refused**, not written: a
+  file and a directory of one name, or a member inside a path another member holds
+  as a file. Each is fine on its own and they cannot both be written, so validating
+  members one at a time left the destination to answer the second write with
+  `ENOTDIR` — a 500 for an archive the caller controls entirely.
+- **Member names are bounded**, at `PATH_MAX` each and 256 bytes per member across
+  the archive. A name is not content, so nothing counted it: a tar can carry a
+  megabyte of it per member, the validated manifest retains every one, and the
+  archive that asks for it compresses to almost nothing. Refusals quote an elided
+  name for the same reason.
+- **Symlinks, hard links, devices and anything not a regular file are refused**
+  rather than skipped, in an archive and in a checkout alike: the guest file
+  endpoints cannot express them, and a project silently missing a link is a bug
+  someone debugs for an hour. Member paths are validated, never joined to a host
+  path — the download is buffered into one unlinked temp file, so host-side path
+  traversal is absent rather than mitigated.
+- **All three SDKs build a source**: `TarballSource`/`GitSource`,
+  `tarballSource`/`gitSource`, `tarball_source`/`git_source`, alongside the
+  generated `source` field. They set the type, and leave out what the caller did not
+  choose — a `strip_components` of 0 and an empty `ref` are the server's own
+  defaults, and sending them would be a caller appearing to have decided something.
+  Each also names the two failures worth branching on:
+  `IsSourceNotPermitted`/`isSourceNotPermitted`/`is_source_not_permitted`, which no
+  retry fixes because an operator has to act, and `IsSourceFetchFailed` and friends,
+  which one might. No new error *type*, so no SDK's existing switch changed.
+- **`microvm exec go go test ./... -source git=https://host/acme/widgets`** in the
+  CLI, with `-source-ref`, `-source-strip` and `-source-credential`. The type is
+  written out rather than inferred from the URL: the same path can name a repository
+  and a tarball, and inferring the wrong one seeds the wrong thing and reports
+  success. A modifier belonging to the other type is passed through to be refused by
+  name, not dropped — someone who wrote `-source-ref` with a tarball meant something
+  by it — and a modifier with no `-source`, or a `-source` on `microvm submit`, which
+  has no sandbox to seed, is an error rather than a flag that vanishes. A refused
+  source prints the two flags an operator would have to set, since the API's message
+  deliberately does not say which reason applied.
+
 ### Retention (daemon)
 
 - **Stopped sandboxes are reaped**: `-sandbox-retention` is how long one stays

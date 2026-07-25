@@ -274,7 +274,11 @@ func (c *Client) Signal(ctx context.Context, execID, signal string) error {
 func (c *Client) WriteFile(ctx context.Context, path string, content io.Reader, mode string) error {
 	url := fmt.Sprintf("%s/v1/files?path=%s", c.baseURL, queryEscape(path))
 	if mode != "" {
-		url += "&mode=" + mode
+		// Escaped like the path. Every producer today emits octal digits and nothing
+		// else, so this changes no request that is made -- it is here so that the
+		// safety of this URL is a property of how it is built rather than of who
+		// happens to call it.
+		url += "&mode=" + queryEscape(mode)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, content)

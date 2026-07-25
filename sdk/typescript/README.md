@@ -62,6 +62,49 @@ await client.tasks.create({
 });
 ```
 
+## Seeding a sandbox with a project
+
+`source` on create has the sandbox arrive with the project already in it, instead
+of one upload per file:
+
+```ts
+import { gitSource, tarballSource } from "@pablofdezr/microvm";
+
+const sb = await client.sandboxes.create({
+  image: "node",
+  source: gitSource("https://github.com/acme/widgets", "main"),
+});
+
+// A release tarball wraps everything in one directory, hence the 1:
+tarballSource("https://host/acme/widgets/v1.2.3.tar.gz", 1);
+```
+
+The **daemon** fetches and expands it, then writes the tree in over the same
+endpoints an upload uses. So it works with `network: false`, and a private
+repository's token never enters the VM — spread in a `credential_ref` naming a
+credential the operator configured with `-source-credential`; the name travels and
+the secret does not:
+
+```ts
+source: { ...gitSource(url, "main"), credential_ref: "github-ci" }
+```
+
+It is refused until an operator has enabled fetching *and* allowlisted the host,
+because the daemon fetches from outside the firewall it installs for guests:
+
+```ts
+if (e.isSourceNotPermitted) {
+  // Not enabled, not allowlisted, not https, or it resolves somewhere the daemon
+  // may not go. One error for all of them, on purpose. No retry helps.
+}
+if (e.isSourceFetchFailed) {
+  // The origin was reached and misbehaved. Worth retrying.
+}
+```
+
+Seeding is all-or-nothing: a failure destroys the VM and fails the create, so there
+is never a half-seeded sandbox to clean up.
+
 ## Streaming output
 
 ```ts

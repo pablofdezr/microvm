@@ -290,6 +290,42 @@ func (e SandboxListObject) Valid() bool {
 	}
 }
 
+// Defines values for SandboxSourceType.
+const (
+	SandboxSourceTypeGit     SandboxSourceType = "git"
+	SandboxSourceTypeTarball SandboxSourceType = "tarball"
+)
+
+// Valid indicates whether the value is a known member of the SandboxSourceType enum.
+func (e SandboxSourceType) Valid() bool {
+	switch e {
+	case SandboxSourceTypeGit:
+		return true
+	case SandboxSourceTypeTarball:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SandboxSourceParamsType.
+const (
+	SandboxSourceParamsTypeGit     SandboxSourceParamsType = "git"
+	SandboxSourceParamsTypeTarball SandboxSourceParamsType = "tarball"
+)
+
+// Valid indicates whether the value is a known member of the SandboxSourceParamsType enum.
+func (e SandboxSourceParamsType) Valid() bool {
+	switch e {
+	case SandboxSourceParamsTypeGit:
+		return true
+	case SandboxSourceParamsTypeTarball:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for SandboxState.
 const (
 	SandboxStateRunning SandboxState = "running"
@@ -747,7 +783,13 @@ type Sandbox struct {
 	// Network Whether filtered egress is on.
 	Network *bool         `json:"network,omitempty"`
 	Object  SandboxObject `json:"object"`
-	State   SandboxState  `json:"state"`
+
+	// Source What this sandbox was seeded from, when it was seeded at all. Absent
+	// otherwise -- a sandbox with no `source` has no empty source object.
+	//
+	// Never the URL as it was sent. See `url_redacted`.
+	Source *SandboxSource `json:"source,omitempty"`
+	State  SandboxState   `json:"state"`
 
 	// Stats What a sandbox has consumed. Cumulative since boot, so a biller must
 	// diff two samples: booting alone costs a couple of CPU-seconds, and
@@ -810,6 +852,15 @@ type SandboxCreateParams struct {
 	// abuse complaint.
 	NetworkBps *int `json:"network_bps,omitempty"`
 
+	// Source A project to seed the sandbox with, fetched by the daemon before this
+	// create returns. Without it, getting a project in is one request per
+	// file, or a clone inside the guest -- which needs `network: true`, is
+	// impossible for a network-isolated sandbox, and puts your credential
+	// inside a VM that is untrusted by design.
+	//
+	// Off unless the operator enabled it. See `SandboxSourceParams`.
+	Source *SandboxSourceParams `json:"source,omitempty"`
+
 	// Storage Options for this sandbox's storage mount. The namespace is never set
 	// here — it comes from your API key. Only the read/write posture is
 	// yours to choose, and only to tighten.
@@ -837,6 +888,10 @@ type SandboxCreateParams struct {
 	// TtlSeconds Maximum lifetime. The sandbox is killed when it elapses. Capped by
 	// the host's own maximum, and extensible later within that cap with
 	// `POST /sandboxes/{sandbox}/extend`.
+	//
+	// It is time to run things in, so seeding a `source` does not consume it:
+	// the clock starts once the project is in the guest. A `ttl_seconds`
+	// shorter than the seed takes is refused naming this field.
 	TtlSeconds *int `json:"ttl_seconds,omitempty"`
 	Vcpus      *int `json:"vcpus,omitempty"`
 }
@@ -869,6 +924,155 @@ type SandboxList struct {
 
 // SandboxListObject defines model for SandboxList.Object.
 type SandboxListObject string
+
+// SandboxSource Where a sandbox was seeded from. Reported so that a sandbox found later can
+// be traced back to the code in it, which is otherwise unknowable from
+// outside the guest.
+type SandboxSource struct {
+	// Commit The commit that was actually checked out, resolved. A branch names a
+	// moving target and a tag can be moved under you; this is the only field
+	// here that says the same thing tomorrow. Absent for a tarball.
+	Commit *string `json:"commit,omitempty"`
+
+	// CredentialRef The operator credential that was used, by name. Safe to return because
+	// it was never the secret -- it is the name of one.
+	CredentialRef *string `json:"credential_ref,omitempty"`
+
+	// Ref The git ref that was asked for. Absent for a tarball.
+	Ref  *string           `json:"ref,omitempty"`
+	Type SandboxSourceType `json:"type"`
+
+	// UrlRedacted The scheme, host and path of what was fetched. Userinfo, query and
+	// fragment are cut off, and the field says so in its name so that nobody
+	// passes it to a fetcher expecting it to work.
+	//
+	// Cut down because a URL is routinely a credential: a presigned object
+	// URL carries its signature in the query, and `https://user:token@host/`
+	// carries a token in plain sight. Tags taught this -- everything the API
+	// returns is readable by the tenant and by an admin key, so nothing the
+	// API returns may be a secret. A URL is the first field where that rule
+	// is not obvious, which is exactly why it is applied here.
+	UrlRedacted string `json:"url_redacted"`
+}
+
+// SandboxSourceType defines model for SandboxSource.Type.
+type SandboxSourceType string
+
+// SandboxSourceParams Where to get the project this sandbox starts with.
+//
+// The daemon fetches it, expands it host-side, and writes the result into the
+// guest's working directory over the same endpoints a file upload uses. It is
+// done before the create returns and it counts as activity, so a slow seed
+// cannot be reclaimed as idle halfway through.
+//
+// **Off unless the operator turned it on.** Fetching needs `-source-fetch`,
+// and every host that may be fetched from must be named with
+// `-source-allow-host`; either one missing refuses every `source` with
+// `source_not_permitted`. An empty allowlist fetches nothing, so enabling the
+// flag alone changes nothing. The gate is the point rather than paperwork:
+// the daemon sits outside the firewall it installs for guests, so a URL it
+// will fetch on request is a URL an operator has to have agreed to.
+//
+// Bounded by the operator too, with `-source-max-bytes` on what is
+// downloaded, `-source-max-expanded-bytes` on what is written, and
+// `-source-max-files` on how many members an archive may hold. Past any of
+// them is `source_fetch_failed`.
+//
+// There is deliberately no destination field. The project lands in the
+// guest's working directory -- where a relative path in a file upload lands --
+// and a caller-chosen root would only be a way to write over the image's own
+// `/usr` and `/etc` before anything in the sandbox runs.
+type SandboxSourceParams struct {
+	// CredentialRef The **name** of a credential the operator configured with
+	// `-source-credential`, for a private repository. Git only.
+	//
+	// Not the credential. A secret in a request body is a secret in an access
+	// log, in a proxy, and in whatever retried the request -- the same
+	// reasoning that made the storage namespace derive from your key instead
+	// of arriving in the body. A name the operator did not configure is
+	// `source_not_permitted`, like an unreachable URL, and for the same
+	// reason: the difference is the operator's business, not the caller's.
+	//
+	// The secret it names never enters the URL and never enters the guest. The
+	// clone happens on the host and only the working tree is copied in, so
+	// nothing in the sandbox can read the token that fetched it -- which is
+	// the whole reason this is not a clone inside the guest.
+	CredentialRef *string `json:"credential_ref,omitempty"`
+
+	// Depth How much history to fetch, in commits. Git only.
+	//
+	// Defaults to 1, because the sandbox needs a working tree and the commits
+	// behind it are bytes nothing in there will read. Raise it only when
+	// something you intend to run walks the history. The `.git` directory is
+	// not written into the guest either way.
+	Depth *int `json:"depth,omitempty"`
+
+	// Ref Branch, tag or full commit SHA to check out. Git only. Defaults to the
+	// remote's default branch.
+	//
+	// Prefer a SHA. It is the only one of the three that resolves to the same
+	// code twice, and the sandbox reports back the commit it actually got.
+	Ref *string `json:"ref,omitempty"`
+
+	// StripComponents Leading path elements to drop from every member, like `tar
+	// --strip-components`. Tarball only.
+	//
+	// `1` is the usual value: a release tarball wraps everything in a single
+	// directory named after the version, and without this the project arrives
+	// one level deeper than every path inside it expects.
+	//
+	// A member with fewer elements than this is skipped rather than refused --
+	// a `LICENSE` sitting beside the wrapper directory is normal. An archive
+	// where every member is skipped is `source_fetch_failed`, because a
+	// sandbox seeded with nothing is not what was asked for and an empty
+	// working directory is the hardest kind of failure to debug later.
+	StripComponents *int `json:"strip_components,omitempty"`
+
+	// Type Which fetcher to use.
+	//
+	// The remaining fields are per-type: `strip_components` belongs to a
+	// tarball, and `ref`, `depth` and `credential_ref` to a git clone. One
+	// sent with the wrong type is an `invalid_request_error` naming the field,
+	// not a field quietly dropped -- a caller who set `ref` on a tarball meant
+	// something by it, and seeding the default branch instead would be the
+	// wrong project delivered silently.
+	Type SandboxSourceParamsType `json:"type"`
+
+	// Url What to fetch.
+	//
+	// `https` only. An `http` seed is a project any network attacker on the
+	// path gets to rewrite before it runs, and `file://`, `ftp://`,
+	// `gopher://` and git's own `ext::` -- which is a command, not a
+	// transport -- are refused by the same check. They name things on the
+	// host, and the host is the one place this URL must never reach.
+	//
+	// The host must be on the operator's `-source-allow-host` list, and so
+	// must every redirect hop: an allowlist checked once is an allowlist a
+	// 302 walks around. Where the name resolves is re-checked at connect
+	// time on every hop, against the private, loopback, link-local and
+	// IPv4-mapped ranges the guest firewall already blocks -- so a name that
+	// resolves to `169.254.169.254`, or rebinds to it between the check and
+	// the connect, does not get a socket.
+	//
+	// Every one of those refusals is the same `source_not_permitted` with the
+	// same message. Distinguishing them would turn this field into a port
+	// scanner that reads the host's routing table.
+	//
+	// No credential in here. `credential_ref` is where one goes, and this
+	// value comes back on the sandbox with its userinfo and query removed
+	// precisely because callers put them here anyway.
+	Url string `json:"url"`
+}
+
+// SandboxSourceParamsType Which fetcher to use.
+//
+// The remaining fields are per-type: `strip_components` belongs to a
+// tarball, and `ref`, `depth` and `credential_ref` to a git clone. One
+// sent with the wrong type is an `invalid_request_error` naming the field,
+// not a field quietly dropped -- a caller who set `ref` on a tarball meant
+// something by it, and seeding the default branch instead would be the
+// wrong project delivered silently.
+type SandboxSourceParamsType string
 
 // SandboxState defines model for SandboxState.
 type SandboxState string
@@ -1137,6 +1341,9 @@ type NotFound = ErrorEnvelope
 
 // QueueUnreachable The body of every non-2xx reply.
 type QueueUnreachable = ErrorEnvelope
+
+// SourceUnavailable The body of every non-2xx reply.
+type SourceUnavailable = ErrorEnvelope
 
 // Unauthorized The body of every non-2xx reply.
 type Unauthorized = ErrorEnvelope

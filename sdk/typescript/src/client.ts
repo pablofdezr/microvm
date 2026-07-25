@@ -29,6 +29,8 @@ export type Sandbox = Schemas["Sandbox"];
 export type SandboxList = Schemas["SandboxList"];
 export type SandboxState = Schemas["SandboxState"];
 export type SandboxCreateParams = Schemas["SandboxCreateParams"];
+export type SandboxSource = Schemas["SandboxSource"];
+export type SandboxSourceParams = Schemas["SandboxSourceParams"];
 export type Execution = Schemas["Execution"];
 export type ExecutionList = Schemas["ExecutionList"];
 export type ExecutionStatus = Schemas["ExecutionStatus"];
@@ -161,6 +163,37 @@ export class APIError extends Error {
    */
   get isForbidden(): boolean {
     return this.status === 403;
+  }
+
+  /**
+   * A create whose `source` was refused before anything was fetched.
+   *
+   * One error covers every reason — seeding is not enabled on the node, the host
+   * is not on the operator's allowlist, the scheme is not https, the
+   * `credential_ref` names nothing, or the URL resolves somewhere the daemon may
+   * not go. They are not told apart on purpose: the daemon fetches from outside
+   * the firewall it installs for guests, so a caller able to distinguish "no such
+   * host" from "that is a private address" would have a port scanner with the
+   * host's routing table.
+   *
+   * Not worth retrying. An operator has to act.
+   */
+  get isSourceNotPermitted(): boolean {
+    return this.code === "source_not_permitted";
+  }
+
+  /**
+   * A `source` that was reached and did not survive: the origin answered badly,
+   * it timed out, the body was past the operator's cap, or the archive holds a
+   * member that cannot be written into a guest.
+   *
+   * Worth retrying, unlike a refusal — the URL is not necessarily wrong and the
+   * origin may answer in a minute. No sandbox exists either way: seeding is
+   * all-or-nothing, so a failed seed destroys the VM before the reply, and
+   * nothing half-seeded is returned, listed or billed.
+   */
+  get isSourceFetchFailed(): boolean {
+    return this.code === "source_fetch_failed";
   }
 }
 
@@ -421,6 +454,56 @@ function encodeTagFilter(tags?: Record<string, string>): string[] | undefined {
   if (!tags) return undefined;
   const keys = Object.keys(tags).sort();
   return keys.length === 0 ? undefined : keys.map((k) => `${k}:${tags[k]}`);
+}
+
+/**
+ * The `source` of a create that seeds the sandbox from a tar or tar.gz archive.
+ *
+ * `stripComponents` is almost always 1: a release tarball wraps everything in one
+ * directory named after the version, and without dropping it the project arrives a
+ * level deeper than every path inside it expects. Zero is left out of the request
+ * rather than sent, since it is the server's own default.
+ *
+ * The daemon fetches and expands the archive on the host and writes the tree in
+ * over the endpoints an upload uses, so nothing in the guest touches the network
+ * and a sandbox created with `network: false` is seeded just the same. It is
+ * refused until an operator enables fetching and allowlists the host — see
+ * `APIError.isSourceNotPermitted`.
+ */
+export function tarballSource(
+  url: string,
+  stripComponents = 0,
+): SandboxSourceParams {
+  const src: SandboxSourceParams = { type: "tarball", url };
+  if (stripComponents > 0) src.strip_components = stripComponents;
+  return src;
+}
+
+/**
+ * The `source` of a create that seeds the sandbox from a git clone. An omitted
+ * `ref` takes the remote's default branch.
+ *
+ * Prefer a commit SHA: it is the only one of branch, tag and SHA that resolves to
+ * the same code twice, and the sandbox reports back the commit it actually got in
+ * `source.commit`.
+ *
+ * For a private repository spread in a `credential_ref` naming a credential the
+ * operator configured. The name travels and the secret never does — the clone
+ * happens on the host and only the working tree is copied in, `.git` and
+ * credential both left behind, which is the whole reason this is not a clone
+ * inside the guest.
+ *
+ * ```ts
+ * await client.sandboxes.create({
+ *   image: "node",
+ *   source: { ...gitSource(url, "main"), credential_ref: "github-ci" },
+ * });
+ * ```
+ */
+export function gitSource(url: string, ref?: string): SandboxSourceParams {
+  const src: SandboxSourceParams = { type: "git", url };
+  if (ref) src.ref = ref;
+  return src;
 }
 
 class SandboxResource {
