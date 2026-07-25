@@ -138,6 +138,16 @@ func New(cfg Config, log *slog.Logger) (*Runtime, error) {
 		log.Warn("could not reclaim orphaned taps", "err", err)
 	}
 
+	// Snapshots from a previous run are unreachable by definition: the only handle
+	// to one is a SnapshotRef, and those live in this process's memory. Left alone
+	// they accumulate one full copy of a guest's RAM per shape per run until the
+	// disk -- shared with the log store and the object cache -- fills.
+	if n, freed, err := sweepOrphanedSnapshots(cfg.SnapshotDir); err != nil {
+		log.Warn("could not reclaim snapshots from a previous run", "dir", cfg.SnapshotDir, "err", err)
+	} else if n > 0 {
+		log.Info("reclaimed snapshots left by a previous run", "count", n, "bytes", freed)
+	}
+
 	r := &Runtime{
 		cfg:      cfg,
 		log:      log,
@@ -147,9 +157,35 @@ func New(cfg Config, log *slog.Logger) (*Runtime, error) {
 		firewall: firewall,
 		insts:    make(map[string]*instance),
 	}
+	// Said at startup rather than per boot: an operator reads this once, and a
+	// host that ran an earlier build has the ownership an earlier chown left.
+	r.warnSharedArtefactWritable(r.sharedArtefacts()...)
+
 	log.Info("firecracker runtime ready",
 		"slice", cfg.Slice, "pool", cfg.PoolCIDR, "chroot_base", cfg.ChrootBase)
 	return r, nil
+}
+
+// sharedArtefacts lists the files every sandbox on this host reads: the guest
+// kernel, and each image with whatever verity sidecar it ships.
+func (r *Runtime) sharedArtefacts() []string {
+	out := []string{r.cfg.KernelPath}
+
+	entries, err := os.ReadDir(r.cfg.ImageDir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		image := filepath.Join(r.cfg.ImageDir, e.Name())
+		out = append(out, image)
+		if vp, err := verity.Load(image); err == nil && vp != nil {
+			out = append(out, vp.HashPath)
+		}
+	}
+	return out
 }
 
 func (c *Config) validate() error {
@@ -262,11 +298,11 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 		jailID:  jailID,
 		runtime: r,
 		log:     r.log.With("sandbox", spec.ID, "jail", jailID),
-		started: time.Now(),
 		// The cgroup sits at <slice>/<jail-id>: the jailer names it after the
 		// --id it was given, which the probe on the real host confirmed.
 		group: r.slice.Child(jailID),
 	}
+	inst.startedNano.Store(time.Now().UnixNano())
 
 	if err := r.setup(ctx, inst, spec); err != nil {
 		// Roll back whatever got as far as existing, or the failure leaks a TAP
@@ -313,6 +349,9 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 	if err != nil {
 		return err
 	}
+	// Recorded so a snapshot of this VM can name the image it was captured
+	// against; a snapshot references its block devices rather than containing them.
+	inst.rootfs = rootfs
 
 	if spec.Network {
 		lease, err := r.pool.Allocate()
@@ -335,12 +374,21 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		return fmt.Errorf("create jail root: %w", err)
 	}
 
-	if err := r.stageFile(r.cfg.KernelPath, filepath.Join(jailRoot, "vmlinux")); err != nil {
+	// Collected as they are staged and kept out of the chown below: each is a
+	// hardlink to a master the whole host shares.
+	var shared []string
+
+	kernelPath := filepath.Join(jailRoot, "vmlinux")
+	if err := r.stageFile(r.cfg.KernelPath, kernelPath); err != nil {
 		return fmt.Errorf("stage kernel: %w", err)
 	}
-	if err := r.stageFile(rootfs, filepath.Join(jailRoot, "rootfs.ext4")); err != nil {
+	shared = append(shared, kernelPath)
+
+	rootfsPath := filepath.Join(jailRoot, "rootfs.ext4")
+	if err := r.stageFile(rootfs, rootfsPath); err != nil {
 		return fmt.Errorf("stage rootfs: %w", err)
 	}
+	shared = append(shared, rootfsPath)
 
 	// Verified boot, when the image ships a verity sidecar next to its .ext4.
 	// Load returns nil for an image without one, which boots normally from the
@@ -350,9 +398,14 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		return fmt.Errorf("verity for image %q: %w", spec.Image, err)
 	}
 	if vp != nil {
-		if err := r.stageFile(vp.HashPath, filepath.Join(jailRoot, verity.HashName)); err != nil {
+		hashPath := filepath.Join(jailRoot, verity.HashName)
+		if err := r.stageFile(vp.HashPath, hashPath); err != nil {
 			return fmt.Errorf("stage verity hash tree: %w", err)
 		}
+		// The hash tree above all: it is what makes a tampered rootfs fail closed,
+		// so a VMM able to rewrite it could authorise the very image verity exists
+		// to reject.
+		shared = append(shared, hashPath)
 	}
 
 	cfgJSON, err := r.vmConfig(spec, inst.lease, vp)
@@ -365,7 +418,7 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 	}
 
 	// The jailed VMM must be able to read what we staged and write its socket.
-	if err := chownTree(jailRoot, r.cfg.UID, r.cfg.GID); err != nil {
+	if err := chownTree(jailRoot, r.cfg.UID, r.cfg.GID, shared...); err != nil {
 		return fmt.Errorf("chown jail: %w", err)
 	}
 
@@ -707,13 +760,62 @@ func (r *Runtime) Close() error {
 	return r.firewall.Remove()
 }
 
-func chownTree(root string, uid, gid int) error {
+// chownTree hands the jail to the VMM, except for keep: paths that are
+// hardlinks to a file the whole host shares.
+//
+// A hardlink is the same inode, so chowning one in a jail chowns the host's
+// master. Left unskipped, booting any sandbox moves the shared rootfs and the
+// guest kernel to the VMM's uid at mode 0644 -- and the VMM is the process the
+// jailer exists to contain. An escape would then land in a chroot holding a
+// writable handle on the userland and the kernel every future sandbox on the
+// host boots, which is a worse position than the one the jail is meant to leave
+// it in. The masters are world-readable, so skipping them costs nothing: read is
+// all a read-only drive needs.
+func chownTree(root string, uid, gid int, keep ...string) error {
+	skip := make(map[string]bool, len(keep))
+	for _, p := range keep {
+		skip[p] = true
+	}
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+		if skip[path] {
+			return nil
+		}
 		return os.Chown(path, uid, gid)
 	})
+}
+
+// warnSharedArtefactWritable reports a file every sandbox reads that the VMM uid
+// could write.
+//
+// Every host that ran an earlier build has these already: the chown above used
+// to walk them. Nothing here repairs them, because a daemon that silently
+// re-owns an operator's files is how the problem started -- it names them and
+// the fix instead.
+func (r *Runtime) warnSharedArtefactWritable(paths ...string) {
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			continue
+		}
+		mode := fi.Mode().Perm()
+		writable := (int(st.Uid) == r.cfg.UID && mode&0o200 != 0) ||
+			(int(st.Gid) == r.cfg.GID && mode&0o020 != 0) ||
+			mode&0o002 != 0
+		if !writable {
+			continue
+		}
+		r.log.Warn("a file every sandbox on this host reads is writable by the VMM uid",
+			"path", p, "uid", st.Uid, "gid", st.Gid, "mode", fmt.Sprintf("%04o", mode),
+			"why", "a VMM that escapes its guest could rewrite the userland or kernel every later sandbox boots",
+			"fix", fmt.Sprintf("chown 0:0 %s && chmod 0444 %s", p, p))
+	}
 }
 
 func copyFile(src, dst string) error {

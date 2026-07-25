@@ -159,6 +159,25 @@ type Instance interface {
 	Stop(ctx context.Context) error
 }
 
+// MeterAdopter is an optional Instance capability: restarting the wall-clock
+// meter at the moment a task takes the sandbox over.
+//
+// It exists because a pre-booted sandbox exists before anybody owns it. Stats
+// derives Wall from when the VM was minted and Idle from Wall minus CPU burned,
+// so a VM that sat in the warm pool for ten minutes reported ten minutes of wall
+// and ten minutes of idle against the first tenant to be handed it -- next to a
+// created_at stamped at checkout, so the billable numbers were larger than the
+// sandbox's whole apparent life. Pool residency is the host's cost, not a
+// tenant's.
+//
+// It is optional rather than part of Instance so a backend with no pool, and every
+// test fake, is not made to implement it. Callers type-assert.
+type MeterAdopter interface {
+	// AdoptMeter restarts the wall-clock and idle meters from now. It is called
+	// once, as the sandbox leaves the pool and before any caller can see it.
+	AdoptMeter()
+}
+
 // GuestClient is what the layers above can ask of the code inside a sandbox.
 //
 // It is an interface rather than the concrete vsock client for two reasons, and
@@ -210,9 +229,24 @@ type SnapshotRef struct {
 	VCPUs  int
 	MemMiB int
 
-	// Digest is a content hash of the snapshot. It is bound into the per-restore
-	// entropy token (see internal/vmgenid) so a token minted for one snapshot
-	// cannot be replayed against another.
+	// Rootfs is the image file the snapshot was captured against, and RootfsID
+	// identifies that exact file. A snapshot does not contain its block devices,
+	// only references to them, so a restore stages whatever stands at that path
+	// today -- and a guest resumed with the page cache and inode state of one
+	// filesystem over a different one is silent corruption behind a health probe
+	// that passes. The pair is what lets a restore refuse an image that has been
+	// rebuilt underneath its template.
+	Rootfs   string
+	RootfsID string
+
+	// Digest identifies the snapshot. It is bound into the per-restore entropy
+	// token (see internal/vmgenid) so a token minted for one snapshot is not
+	// reusable against another.
+	//
+	// It is NOT an integrity check and nothing re-verifies it: no restore
+	// re-hashes the files it stages. Tamper-resistance for the snapshot comes from
+	// the files themselves being read-only and root-owned, so the unprivileged VMM
+	// that maps them cannot write them.
 	Digest string
 }
 
@@ -236,4 +270,14 @@ type Snapshotter interface {
 	// Restore boots a fresh VM from ref under spec's identity, reseeds its
 	// entropy, and returns it ready to use.
 	Restore(ctx context.Context, spec Spec, ref SnapshotRef) (Instance, error)
+
+	// Discard deletes a snapshot's files. It is idempotent.
+	//
+	// Someone has to: a snapshot is a full copy of a guest's RAM, so a daemon that
+	// captures one template per shape per run and never reclaims them fills the
+	// disk it shares with the log store and the object cache -- and leaves a
+	// complete guest memory image at rest for as long as the box lives. There is no
+	// owner but the caller that asked for the capture, because a SnapshotRef is the
+	// only handle that exists.
+	Discard(ctx context.Context, ref SnapshotRef) error
 }

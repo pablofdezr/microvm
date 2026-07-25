@@ -319,9 +319,50 @@ host page cache, on a Pi 5):
   code, so handing one out keeps the one-sandbox-per-task rule — no snapshot
   collision to fix up.
 - **Firecracker snapshots** (`-snapshot-dir`), so the warm pool fills by restoring
-  a template in tens of milliseconds instead of cold-booting. A snapshot is a
-  copy of RAM, so every restore reseeds the guest's entropy (see
-  [internal/vmgenid](internal/vmgenid)) — restored VMs never share a CSPRNG.
+  a template instead of cold-booting: a restored guest answers in **~12 ms** on a
+  Pi 5 (4–83 ms over 36 restores, on a host busy with other tenants' work).
+
+  A snapshot is a copy of RAM, so every restore rotates the guest's CSPRNG before
+  the VM is reachable — and *rotates* is the operative word. Writing fresh bytes
+  into the guest's `/dev/urandom` is not a reseed on any kernel since 5.18: it
+  mixes into the input pool and does not re-derive the key `getrandom(2)` answers
+  from, which a snapshot restores identically into every restore along with the
+  jiffies deadline that would have rotated it. So the guest agent mixes the token
+  in *and* forces the re-derivation, and a restore that cannot is destroyed rather
+  than handed over. See [internal/vmgenid](internal/vmgenid) and
+  [internal/agent/reseed.go](internal/agent/reseed.go).
+
+  On an arm64 host with a **GICv2** (a Pi 5's GIC-400, and anything that is not a
+  GICv3) Firecracker does not save the guest's per-vCPU interrupt-controller
+  state, so a restored guest comes back with its virtual timer disabled and never
+  runs anything that waits on time again — it looks exactly like a guest that
+  cannot reconnect over vsock. Only the guest can write those registers, so the
+  agent carries them across the snapshot itself: the host arms it before pausing,
+  each vCPU reapplies its own state in the first instruction it runs on resume,
+  and the host stands the carry down when the guest answers — checking, as it does,
+  that *every* vCPU was repaired and not just the one that answered the health
+  probe. Guests that need none of this say so and nothing happens. The mechanism,
+  the measurements and why there is no host-side lever are in
+  [internal/agent/gic_linux.go](internal/agent/gic_linux.go).
+
+  **What snapshots are not.** They are a warm-pool optimisation, and only that:
+
+  - No networking. A snapshot carries the guest's MAC and IP in its memory image,
+    so every restore of one template would claim the same address. Networked
+    shapes cold-boot instead.
+  - No restoring a tenant's sandbox. Templates come from VMs that have run no code.
+  - No surviving a daemon restart. Templates are captured per run, discarded at
+    shutdown, and swept at startup — so `-snapshot-dir` is scratch space, not
+    storage, and it wants one directory per daemon.
+  - Requires guest images rebuilt from this repo (the agent's snapshot routes), and
+    a restored guest keeps the template's clock, so its `/proc/uptime` is the
+    snapshot's rather than wall-clock.
+
+  Sandbox **persistence, resume-after-stop, fork, named sandboxes, get-or-create
+  and sessions do not exist.** They are no longer blocked on anything — restore
+  works — but nothing has been written for them, and each needs more than a working
+  restore: durable snapshot metadata, guest-side network reconfiguration, and an
+  API identity that outlives a VM.
 
 One gotcha worth recording: a Dockerfile's `ENV` is container-runtime metadata,
 not a file. `docker export` discards it and the guest kernel hands PID 1 an

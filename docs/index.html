@@ -633,7 +633,7 @@ microvm logs sb_01JZ8... exe_01JZ8...   <span class="c"># an execution's recorde
         </div>
         <div class="item">
           <h3>Fast cold starts <span class="new">NEW</span></h3>
-          <p>Warm build caches baked into the images, plus a pool of pre-booted VMs that skips the boot entirely.</p>
+          <p>Warm build caches baked into the images, plus a pool of pre-booted VMs that skips the boot entirely — optionally filled by restoring a Firecracker snapshot, which a guest answers in tens of milliseconds. Restores are a pool optimisation: each one is a fresh VM with its own rotated CSPRNG, not a saved sandbox you can come back to.</p>
         </div>
         <div class="item">
           <h3>Auth &amp; quotas</h3>

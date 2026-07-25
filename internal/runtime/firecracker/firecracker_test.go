@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -67,5 +68,57 @@ func TestRootfsPathRejectsPaths(t *testing.T) {
 		if got, err := r.rootfsPath(image); err == nil {
 			t.Errorf("rootfsPath(%q) = %q, want an error", image, got)
 		}
+	}
+}
+
+// A staged image is a hardlink to the host's master, so chowning it in the jail
+// chowns the file every sandbox on the host boots from -- to the uid of the
+// process the jailer exists to contain.
+func TestChownTreeLeavesSharedMastersAlone(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("chown needs root")
+	}
+
+	dir := t.TempDir()
+	master := filepath.Join(dir, "python.ext4")
+	if err := os.WriteFile(master, []byte("rootfs"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	jail := filepath.Join(dir, "jail")
+	if err := os.MkdirAll(jail, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(jail, "rootfs.ext4")
+	if err := os.Link(master, staged); err != nil {
+		t.Fatal(err)
+	}
+	ownJail := filepath.Join(jail, "vm.json")
+	if err := os.WriteFile(ownJail, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const uid, gid = 65534, 65534 // nobody
+	if err := chownTree(jail, uid, gid, staged); err != nil {
+		t.Fatal(err)
+	}
+
+	ownerOf := func(path string) (int, int) {
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := fi.Sys().(*syscall.Stat_t)
+		return int(st.Uid), int(st.Gid)
+	}
+
+	if u, _ := ownerOf(master); u != 0 {
+		t.Errorf("the host's master image is now owned by uid %d; a VMM escape could rewrite it", u)
+	}
+	if u, _ := ownerOf(staged); u != 0 {
+		t.Errorf("the staged hardlink is uid %d, so the master is too (same inode)", u)
+	}
+	if u, _ := ownerOf(ownJail); u != uid {
+		t.Errorf("vm.json is uid %d, want %d: the VMM must still own what it reads and writes", u, uid)
 	}
 }

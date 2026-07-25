@@ -104,6 +104,23 @@ one. Either:
 > For **verified boot** (§5) a kernel needs `CONFIG_DM_VERITY=y` and
 > `CONFIG_DM_INIT=y`; the `kernel/` builder enables both.
 
+> For **snapshots** (`-snapshot-dir`) on an **arm64 host with a GICv2** — a
+> Raspberry Pi 5's GIC-400, and anything that is not a GICv3 — the guest kernel
+> needs `CONFIG_DEVMEM=y` (`/dev/mem`), which is on by default and is what the
+> guest agent uses to put its own interrupt-controller state back after a restore.
+> Firecracker does not save that state on GICv2, and without it a restored guest
+> comes back with no working timer and answers nothing; the agent refuses to arm a
+> snapshot it cannot carry, so the warm pool cold-boots instead of producing
+> unrestorable snapshots. x86 hosts and arm64 hosts with a GICv3 need none of
+> this. See [`internal/agent/gic_linux.go`](internal/agent/gic_linux.go).
+>
+> Snapshots also need the guest kernel's `RNDRESEEDCRNG` ioctl on `/dev/urandom`
+> (`CONFIG_*` — it is unconditional in the random driver, so any mainline kernel
+> has it). It is how a restored guest's CSPRNG is actually rotated; a guest that
+> cannot rotate it has its restore refused rather than being handed out sharing
+> its keys with every other restore of the same template. See
+> [`internal/agent/reseed.go`](internal/agent/reseed.go).
+
 The `vmlinux` architecture must match the host. Place it where the daemon expects
 it (default `/var/lib/microvm/vmlinux`, overridable with `-kernel`):
 
@@ -191,6 +208,27 @@ mkdir -p /var/lib/microvm/images /srv/jailer
 ls -l /dev/kvm            # must exist
 lsmod | grep -E 'kvm|tun' # kvm + tun present
 ```
+
+### If you enable snapshots (`-snapshot-dir`)
+
+```bash
+# Scratch space, not storage. One directory per daemon: a snapshot's only handle
+# is in the daemon's memory, so anything left here by a previous run is orphaned
+# and is swept at startup -- two daemons sharing one would sweep each other's
+# live templates.
+mkdir -p /var/lib/microvm/snapshots
+chmod 700 /var/lib/microvm/snapshots
+```
+
+Budget one **full copy of the guest's RAM per warm-pool shape**, so
+`-warm python:2:512:2,node:2:512:2 -snapshot-dir …` wants ~1 GiB free on top of
+the images. Templates are discarded when the daemon shuts down and swept if it
+was killed, so the steady state is one per shape — but put it on a filesystem
+where filling it does not take the log store and the image directory with it.
+
+Snapshots need guest images built from this repo at or after the agent's snapshot
+routes exist. An older image is not restored unsafely: the arm call warns and the
+reseed call refuses, so the warm pool cold-boots that shape instead.
 
 ---
 

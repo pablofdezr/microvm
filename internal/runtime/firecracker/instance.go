@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"time"
 
@@ -30,7 +31,16 @@ type instance struct {
 	jailID  string
 	runtime *Runtime
 	log     *slog.Logger
-	started time.Time
+
+	// startedNano is when the wall-clock meter began, in Unix nanoseconds. It is
+	// atomic because AdoptMeter moves it while Stats may be sampling, and because
+	// pool residency must not be charged to the tenant who is handed the VM.
+	startedNano atomic.Int64
+
+	// rootfs is the host path to the image this VM booted from. Kept because a
+	// snapshot references its block devices by path rather than containing them, so
+	// a template has to record which file it was captured against.
+	rootfs string
 
 	cmd     *exec.Cmd
 	logFile *os.File
@@ -40,6 +50,12 @@ type instance struct {
 	// may wait on the process: two waiters race for the exit status and the
 	// loser gets ECHILD, the same trap that made PID 1's reaper steal exec exit
 	// codes inside the guest.
+	//
+	// It means "the process we started returned", which is NOT "the VM is gone".
+	// --new-pid-ns makes the jailer fork, because the init of a new PID namespace
+	// must be a child, so this closes ~30ms in on a perfectly healthy VM. Reading
+	// it as death broke every snapshot restore once. The VMM's liveness signal is
+	// the cgroup below: it holds the process the jailer left behind.
 	exited chan struct{}
 
 	client  *guestclient.Client
@@ -70,6 +86,19 @@ func (i *instance) ID() string { return i.id }
 
 func (i *instance) Client() runtime.GuestClient { return i.client }
 
+// startedAt is when this sandbox's meters began.
+func (i *instance) startedAt() time.Time { return time.Unix(0, i.startedNano.Load()) }
+
+// AdoptMeter restarts the wall-clock meter, implementing runtime.MeterAdopter.
+//
+// The warm pool calls it as a VM is handed out. Without it a VM that waited ten
+// minutes in the pool reported ten minutes of Wall and ten of Idle against its
+// first tenant -- a bill for the host's own readiness, and one that contradicted
+// the sandbox's created_at. The CPU meter is the cgroup's and needs no adjustment:
+// a pristine pooled VM has burned effectively none, and what it burned coming up
+// is the host's too but is not worth clearing the kernel's counter over.
+func (i *instance) AdoptMeter() { i.startedNano.Store(time.Now().UnixNano()) }
+
 // HostListener returns this sandbox's private inbound socket.
 //
 // It is nil if the listener could not be opened, which is not fatal: a sandbox
@@ -96,7 +125,7 @@ func (i *instance) Stats() (runtime.Stats, error) {
 		return runtime.Stats{}, fmt.Errorf("read cgroup stats for %s: %w", i.id, err)
 	}
 
-	wall := time.Since(i.started)
+	wall := time.Since(i.startedAt())
 	idle := wall - s.ActiveCPU
 	// With more than one vCPU, active CPU can legitimately exceed wall-clock:
 	// two cores busy for a second is two seconds of CPU. Idle is meaningless
@@ -269,9 +298,7 @@ func (i *instance) waitReady(ctx context.Context) error {
 }
 
 // waitReadyWithin is waitReady with an explicit deadline. The restore path uses
-// a longer one: a guest resumed from a snapshot re-accepts on vsock noticeably
-// slower than one that cold-booted, so a cold-boot-sized timeout would give up
-// on a VM that is still coming back.
+// a shorter one, for the reasons measured at restoreReadyTimeout.
 func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -294,7 +321,16 @@ func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) e
 			return err
 
 		case <-ctx.Done():
-			return fmt.Errorf("sandbox did not answer within %v: %w", timeout, ctx.Err())
+			// WaitReady is watching the same context, so it is about to return --
+			// with the last dial failure attached, which is the only part of this
+			// worth reading. Racing it to the return statement threw that away and
+			// reported a bare deadline instead, so give it a moment to answer.
+			select {
+			case err := <-ready:
+				return err
+			case <-time.After(readyDrainGrace):
+				return fmt.Errorf("sandbox did not answer within %v: %w", timeout, ctx.Err())
+			}
 
 		case <-ticker.C:
 			populated, err := i.group.Populated()
@@ -315,6 +351,11 @@ func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) e
 
 // livenessInterval is how often the VM is checked for having died during boot.
 const livenessInterval = 100 * time.Millisecond
+
+// readyDrainGrace is how long the deadline path waits for the readiness poller's
+// own error before falling back to reporting the bare timeout. It only ever
+// covers one in-flight dial that has already been cancelled.
+const readyDrainGrace = 250 * time.Millisecond
 
 // ConsoleLog returns the guest's serial output, which is the only record of a
 // VM that failed before its agent came up.

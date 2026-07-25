@@ -60,6 +60,10 @@ type Runtime struct {
 	// assert a VM was restored rather than cold-booted, without any KVM.
 	snapshots []runtime.SnapshotRef
 	restored  int
+	discarded int
+	// RestoreErr, when set, makes every Restore fail. It is how a test reaches the
+	// pool's fall-back-to-cold-boot path without a host that cannot restore.
+	RestoreErr error
 }
 
 // Output is a scripted command's result.
@@ -162,6 +166,9 @@ func (r *Runtime) Snapshot(ctx context.Context, inst runtime.Instance) (runtime.
 // Restore implements runtime.Snapshotter: it returns a fresh instance under
 // spec's identity, as if loaded from ref.
 func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.SnapshotRef) (runtime.Instance, error) {
+	if err := r.restoreErr(); err != nil {
+		return nil, err
+	}
 	inst := &Instance{
 		id:       spec.ID,
 		rt:       r,
@@ -175,6 +182,44 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 	r.restored++
 	r.mu.Unlock()
 	return inst, nil
+}
+
+// Discard implements runtime.Snapshotter: it forgets a recorded snapshot, so a
+// test can assert that the layer above reclaims the templates it captured rather
+// than leaving a full copy of a guest's RAM on disk per shape per run.
+func (r *Runtime) Discard(ctx context.Context, ref runtime.SnapshotRef) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, have := range r.snapshots {
+		if have.Dir == ref.Dir {
+			r.snapshots = append(r.snapshots[:i], r.snapshots[i+1:]...)
+			r.discarded++
+			return nil
+		}
+	}
+	return fmt.Errorf("runtimetest: no such snapshot: %s", ref.Dir)
+}
+
+// Discarded reports how many snapshots were reclaimed.
+func (r *Runtime) Discarded() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.discarded
+}
+
+// restoreErr reads the configured failure under the lock, so a test may flip it
+// while the pool's refill goroutine is running.
+func (r *Runtime) restoreErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.RestoreErr
+}
+
+// SetRestoreErr makes Restore fail, or succeed again with nil.
+func (r *Runtime) SetRestoreErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.RestoreErr = err
 }
 
 // Restored reports how many instances were restored from a snapshot.
@@ -208,6 +253,8 @@ type Instance struct {
 	modes   map[string]string
 	stopped chan struct{}
 	isDown  bool
+	// metersAdopted counts AdoptMeter calls.
+	metersAdopted int
 
 	// signals records what was sent to which exec, so a test can assert that
 	// cancelling actually signalled rather than merely returning 200.
@@ -239,6 +286,22 @@ func (i *Instance) HostListener() net.Listener { return i.listener }
 
 // Guest returns the same listener as the caller-facing type, for dialling in.
 func (i *Instance) Guest() *Listener { return i.listener }
+
+// AdoptMeter implements runtime.MeterAdopter: it records that the pool restarted
+// this sandbox's meters as it handed it out, which is the only way a test can see
+// that pool residency is not being billed to the tenant.
+func (i *Instance) AdoptMeter() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.metersAdopted++
+}
+
+// MetersAdopted reports how many times AdoptMeter was called.
+func (i *Instance) MetersAdopted() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.metersAdopted
+}
 
 func (i *Instance) Stats() (runtime.Stats, error) {
 	// Outside the lock, like the real one: reading meters takes no instance lock,
@@ -444,8 +507,9 @@ func (r *Runtime) Instance(id string) (*Instance, bool) {
 // drifts from them, this file stops building rather than the tests quietly
 // testing something the production code no longer does.
 var (
-	_ runtime.Runtime     = (*Runtime)(nil)
-	_ runtime.Instance    = (*Instance)(nil)
-	_ runtime.GuestClient = (*client)(nil)
-	_ runtime.Snapshotter = (*Runtime)(nil)
+	_ runtime.Runtime      = (*Runtime)(nil)
+	_ runtime.Instance     = (*Instance)(nil)
+	_ runtime.GuestClient  = (*client)(nil)
+	_ runtime.Snapshotter  = (*Runtime)(nil)
+	_ runtime.MeterAdopter = (*Instance)(nil)
 )

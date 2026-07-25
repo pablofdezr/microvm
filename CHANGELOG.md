@@ -22,16 +22,43 @@ project aims for [Semantic Versioning](https://semver.org).
   - *Warm pool of pristine pre-booted VMs* (`-warm image:vcpus:mem:count`). Each
     pooled VM is a distinct, never-used microVM, so serving one preserves the
     one-sandbox-per-task invariant; the pool refills in the background.
-  - *Firecracker snapshots* (`-snapshot-dir`, **experimental**). VMs boot with the
-    control API socket so they can be paused and snapshotted; the warm pool then
-    tries to fill by restoring from a template snapshot. Every restore reseeds the
-    guest's entropy (a snapshot is a copy of RAM, so restored VMs would otherwise
-    share a CSPRNG — see `internal/vmgenid`). Validated end-to-end on a Pi 5:
-    snapshot *create* and the VMM *restore/resume* work, but the restored guest
-    agent does not re-establish its vsock session (the hard, still-open part of
-    snapshot restore, shared with the prior art), so the pool falls back to a cold
-    boot for now. Off by default and safe: the fallback keeps the warm pool
-    working via cold boots.
+  - *Firecracker snapshots* (`-snapshot-dir`). VMs boot with the control API
+    socket so they can be paused and snapshotted; the warm pool fills by restoring
+    from a per-shape template snapshot. Every restore rotates the guest's CSPRNG
+    before the VM is reachable, and a restore that cannot is destroyed rather than
+    handed out (a snapshot is a copy of RAM, so restored VMs would otherwise share
+    keys — see `internal/vmgenid` and `internal/agent/reseed.go`). Validated
+    end-to-end on a Pi 5 (arm64, GIC-400, Firecracker v1.16.1): **a restored guest
+    answers in ~12 ms** (36 two-vCPU restores, 4–83 ms, on a host simultaneously
+    running other tenants' work at load average 7–13), a warm pool configured with
+    `-snapshot-dir` fills entirely from restores with no cold boots, and sandbox
+    creation from it takes 41–140 ms.
+
+    What restore is, precisely: a fresh VMM in a fresh jail, resumed from a
+    template captured from a pristine VM the pool cold-booted itself, with its own
+    vsock socket, its own host listener and its own CSPRNG. What it is **not**,
+    and none of this is planned-and-nearly-there:
+
+    - **No networking.** A snapshot carries the guest's MAC and IP in its memory
+      image and names its host TAP in its device state, so every restore of one
+      template would claim the same address. `Restore` refuses a networked spec
+      and the warm pool never snapshots a networked shape; those shapes cold-boot.
+      Giving a restore its own address needs the guest to reconfigure itself on
+      resume, which is a feature nobody has written.
+    - **No restoring a tenant's sandbox.** Templates are captured from VMs that
+      have run no code. Nothing here can snapshot a sandbox that has.
+    - **No surviving a restart.** A snapshot's only handle is an in-memory ref, so
+      templates are captured per daemon run, reclaimed at shutdown, and swept at
+      startup. Snapshots are a warm-pool optimisation, not storage.
+    - A restored guest keeps the template's clock, so its `/proc/uptime` is the
+      snapshot's rather than wall-clock.
+
+    Six things people reasonably expect this to unlock — sandbox persistence,
+    resume-after-stop, fork, named sandboxes, get-or-create, and sessions — are
+    **not built**. They are not blocked on anything any more, which is a change
+    from before; they are simply unwritten, and each of them needs work this
+    change does not contain (durable snapshot metadata, guest-side network
+    reconfiguration, and an identity in the API that outlives a VM).
 - **Verified boot (dm-verity)**: images built with `MICROVM_VERITY=1` ship a
   hash tree and a root-hash sidecar next to the `.ext4`, and the daemon boots
   them as a dm-verity device — the guest kernel verifies every block of the
@@ -65,6 +92,137 @@ project aims for [Semantic Versioning](https://semver.org).
   Go SDK (`example_test.go`).
 - **CI guard**: `api/check-generated.sh` fails the build when the generated SDK
   types drift from `api/openapi.yaml`.
+
+### Fixed
+
+- **Security: a restored VM's CSPRNG was not actually being rotated.** The reseed
+  wrote 16 unique bytes into the guest's `/dev/urandom` and reported success. On
+  Linux ≥ 5.18 — every guest kernel this ships — that write reaches
+  `mix_pool_bytes()` and stops: it credits no entropy and it does not re-derive
+  `base_crng.key`, which is the key `getrandom(2)` answers from. A snapshot
+  restores that key, its generation counter, its 60-second jiffies deadline *and*
+  the jiffies identically into every restore, so **two sandboxes restored from one
+  template produced byte-identical `secrets.token_hex`, TLS private keys and
+  session tokens** for the same first minute of guest execution — longer than most
+  sandboxes live. This is exactly the break `internal/vmgenid` documents, and it
+  was open on the one platform the snapshot path was validated on: Firecracker's
+  VMGenID device, which does force a reseed, is x86_64/ACPI-only, and arm64 uses a
+  device tree. Reseeding is now a dedicated guest route (`POST
+  /v1/snapshot/reseed`) that mixes the token in *and* forces the re-derivation
+  (`ioctl(RNDRESEEDCRNG)` — the agent is PID 1 root, so `CAP_SYS_ADMIN` was never
+  the obstacle the old comment claimed), and it fails if the forcing fails. A
+  restore that cannot rotate is destroyed and the shape falls back to cold boots.
+  Requires a rebuilt guest image: an image without the route is refused rather
+  than restored unsafely.
+- **Security: a template's memory image was writable by every VMM that restored
+  from it.** Firecracker writes a snapshot as the unprivileged uid every jailed VMM
+  on the host shares, and a restore hardlinked `mem` and `state` into the restoring
+  sandbox's own chroot and then chowned the tree — handing each sandbox's VMM
+  ownership, and so write access, of the shared template inode. A VMM that escaped
+  its guest (the event the jailer and that uid exist for) could open `/mem` `O_RDWR`
+  inside its own jail and choose the guest RAM — kernel text included — that every
+  later restore of that shape boots with, and nothing would notice: no restore
+  re-hashes what it stages, so the snapshot digest was never an integrity check
+  anywhere. Snapshot files are now root-owned and mode `0444` from the moment they
+  are collected, and re-sealed after the jail chown. Firecracker only reads them
+  (the memory file is mapped private, which is why one template can serve many
+  restores), so read-only costs it nothing.
+- **A partially repaired restored guest was reported as ready.** Readiness is one
+  HTTP reply, answered on whichever vCPU the guest scheduled it on; the
+  interrupt-controller state a GICv2 snapshot loses is banked *per* vCPU. Arming
+  leaves a pinned spinner per vCPU plus at least one unpinned runtime thread on the
+  same vCPUs, so at least one spinner is off-CPU when the host pauses — and its
+  vCPU came back with no timer and no reachable SGIs, so the sandbox passed its
+  health check and wedged on its first cross-CPU call. Worse, the stand-down set
+  the stop flag before waiting, so a spinner scheduled late read "stop" and exited
+  without ever looking at its registers, turning that race from transient into
+  permanent. Each spinner now checks and repairs its own vCPU before it honours a
+  stop, the disarm reports how many vCPUs were accounted for, and a restore whose
+  stand-down does not add up destroys the VM instead of shipping it.
+- **A failed stand-down no longer drops the carry on the floor.** `disarm` cleared
+  its session handle *before* waiting on it, so a wait that timed out left a retry
+  being told "nothing to stand down" while spinners were still running, and a later
+  arm recording the *armed* `GOMAXPROCS` and GC settings as the ones to restore
+  afterwards. The session is now only forgotten once the wait has succeeded.
+- **One slow restore no longer disables snapshots for a shape for the daemon's
+  life.** A snapshot failure latched the shape to cold boots and nothing ever
+  cleared it, so a single restore that faulted its memory image in from a cold page
+  cache permanently disabled the fast path. Failures now cool down (30 s, doubling,
+  capped at 10 minutes) and only become permanent after five consecutive ones,
+  which is a host that cannot do this rather than one bad restore. A failure also
+  discards the shape's template, since a stale template is a candidate cause.
+- **Restore no longer leaks host resources on failure.** Eight bare error returns
+  after the jail existed left behind, between them, the jail tree, its hardlinks to
+  the shared template, and — once the inbound listener was open — a bound host
+  socket in a directory whose VM never existed. It now rolls back through
+  `inst.Stop`, exactly as the cold-boot path does.
+- **Restore is bounded.** The wait for Firecracker's control socket polled the
+  caller's context and ignored the VMM's own exit, and the reseed was issued on a
+  client that deliberately sets no timeout. From the warm pool the caller's context
+  has no deadline, so a jailer that died on exec — or a guest that answered health
+  and then wedged — blocked the single refill goroutine for the daemon's life, with
+  no log line and no fallback to cold boots for *any* shape. There is now one
+  deadline over the whole restore plus a bound on every step, and the socket wait
+  ends when the process does.
+- **Snapshots are reclaimed.** Every capture created a directory under
+  `-snapshot-dir` that nothing ever deleted: one full copy of a guest's RAM per
+  shape per daemon run, orphaned on restart, until the disk it shares with the log
+  store and the object cache filled. Templates are now discarded when the pool
+  closes and when a shape's snapshot path fails, and any left by a previous run are
+  swept at startup. (This does mean one `-snapshot-dir` per daemon.)
+- **A restore no longer resumes onto an image that has been rebuilt underneath
+  it.** A snapshot references its block devices rather than containing them, so a
+  restore staged whatever stood at the image path *today* — and an operator
+  rebuilding an image in place, the documented way to update one, left every later
+  restore resuming a guest whose page cache and inode state described a different
+  filesystem: EIO and silent corruption behind a health probe that passes. A
+  template now records which file it was captured from and refuses a mismatch.
+- **Pool residency is no longer billed to the tenant.** A pre-booted VM's meters
+  started when the VM was minted, so a sandbox served from the pool after ten
+  minutes reported ten minutes of billable wall and ten of idle against its first
+  tenant — next to a `created_at` stamped at checkout, making `stats.wall` larger
+  than the sandbox's whole apparent life. The meters restart as the VM leaves the
+  pool.
+- **Capture no longer hashes the guest's entire memory image.** The snapshot digest
+  is consumed by exactly one thing (binding a restore token whose uniqueness comes
+  from `crypto/rand` anyway), is never verified and never leaves the host, yet it
+  was read over the whole `mem` file on the warm pool's single refill goroutine
+  ignoring cancellation — four and a half minutes for an 8 GiB guest at the 30 MB/s
+  floor `internal/fcapi` cites. It now covers the state file, respects its context,
+  and says in its own doc comment that it is an identifier and not an integrity
+  check.
+- **Snapshot restore on arm64 GICv2 hosts** (a Raspberry Pi 5 and anything else
+  with a GIC-400 rather than a GICv3). A restored guest used to answer nothing at
+  all, and the warm pool fell back to a cold boot after paying 90 seconds per
+  shape. It was never a vsock problem: Firecracker's GICv2 snapshot path does not
+  save the guest's *banked*, per-vCPU interrupt-controller state — the guest came
+  back with the ARM virtual timer PPI (INTID 27) disabled and pending forever on
+  every vCPU, and with the whole GIC CPU interface switched off on secondary vCPUs
+  (`GICC_CTLR=0`, `PMR=0`). An arm64 microVM has no other clockevent device, so
+  the guest ran userspace at full speed with a correct clock while nothing that
+  waited on time ever completed again: the guest kernel accepted the host's vsock
+  connection in under a millisecond and the agent never got as far as writing a
+  reply. Only the guest can write those registers, so it now carries them across
+  the snapshot itself — the host arms the guest immediately before pausing it
+  (`POST /v1/snapshot/arm`), each vCPU holds its state and reapplies it in the
+  first instruction it executes on resume, and the host stands the carry down as
+  soon as the restored guest answers (`POST /v1/snapshot/disarm`). On a host that
+  restores the state correctly (x86, or arm64 with a GICv3) the guest reports that
+  it has nothing to carry and nothing happens. Requires a rebuilt guest image;
+  `internal/agent/gic_linux.go` documents the defect and the measurements.
+- **Snapshot capture no longer times out on a slow disk.** `internal/fcapi` put a
+  single 30-second timeout on every Firecracker API call, but a snapshot write is
+  the guest's whole memory going to disk — from inside a cgroup capped near the
+  guest's memory size, so its page cache is reclaimed as it goes. A 512 MiB guest
+  measured over 30s on a busy SD card, which surfaced as "snapshot path failed"
+  and permanently disabled snapshots for that shape; a larger guest could never
+  have captured at all. Control calls keep a 30-second bound; the snapshot write
+  gets its own.
+- **A failed restore now says why.** The readiness error carries the guest console
+  (as the cold-boot path already did) instead of being thrown away by the jail
+  teardown, `waitReadyWithin` no longer discards the readiness poller's own error
+  in a race with its deadline, and a restore that cannot open its host-side vsock
+  listener logs it instead of silently having no storage.
 
 ### Scheduling (daemon)
 

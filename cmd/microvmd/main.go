@@ -132,7 +132,7 @@ func main() {
 	flag.StringVar(&cfg.warm, "warm", "",
 		"comma-separated warm-pool shapes to pre-boot, image:vcpus:mem:count (e.g. python-arm64.ext4:2:512:2); each shape keeps that many pristine VMs ready to skip the cold boot")
 	flag.StringVar(&cfg.snapshotDir, "snapshot-dir", "",
-		"EXPERIMENTAL: enable Firecracker snapshots (VMs boot with the API socket) and store them here; the warm pool tries to fill by restoring a template snapshot, falling back to cold boot (the restored guest's vsock reconnect is not yet solved)")
+		"enable Firecracker snapshots (VMs boot with the API socket) and store them here; the warm pool fills by restoring a per-shape template snapshot (a restored guest answers in tens of milliseconds) and falls back to cold boot if any of it fails. Scratch space, not storage: templates are captured per run, discarded at shutdown and swept at startup, so use one directory per daemon and budget one copy of a guest's RAM per warm shape. Networked shapes are never snapshotted. Needs guest images built from this repo at or after the snapshot agent routes, and a guest kernel with /dev/mem on arm64 GICv2 hosts -- see DEPLOY.md")
 	flag.IntVar(&cfg.memMiB, "mem", 0,
 		"schedulable memory in MiB for queued tasks; tasks are packed so their memory never exceeds this. 0 means unbounded. Memory is the dimension that must not oversubscribe, so set it whenever tasks vary in size")
 	flag.StringVar(&cfg.redisAddr, "redis", "",
@@ -257,6 +257,18 @@ func run(cfg config, log *slog.Logger) error {
 		// starve it.
 		log.Warn("no ceiling set: sandboxes may consume the whole host",
 			"hint", "set -ceiling-cores and -ceiling-mem-mb if this box runs anything else")
+	}
+
+	// Made here rather than on first use. A missing directory otherwise surfaces
+	// as a warm-pool warning thirty seconds in ("snapshot: make dir: no such file
+	// or directory"), by which time the pool has cold-booted the shape and the
+	// operator has a daemon that looks healthy and quietly does not snapshot.
+	// 0700 root-owned: a snapshot is a guest's whole memory, and the VMM reads its
+	// copy through the jail rather than from here.
+	if cfg.snapshotDir != "" {
+		if err := os.MkdirAll(cfg.snapshotDir, 0o700); err != nil {
+			return fmt.Errorf("snapshot dir %s: %w", cfg.snapshotDir, err)
+		}
 	}
 
 	rt, err := fcruntime.New(fcruntime.Config{

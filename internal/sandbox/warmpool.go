@@ -71,7 +71,7 @@ type warmPool struct {
 	mu        sync.Mutex
 	ready     map[warmKey][]runtime.Instance
 	templates map[warmKey]runtime.SnapshotRef // shape -> its template snapshot
-	coldOnly  map[warmKey]bool                // shapes whose snapshot path failed
+	snapFails map[warmKey]*snapFailure        // shapes whose snapshot path failed
 
 	kick   chan struct{}
 	ctx    context.Context
@@ -90,7 +90,7 @@ func newWarmPool(rt runtime.Runtime, log *slog.Logger, specs []WarmSpec, useSnap
 		specs:     make(map[warmKey]runtime.Spec),
 		ready:     make(map[warmKey][]runtime.Instance),
 		templates: make(map[warmKey]runtime.SnapshotRef),
-		coldOnly:  make(map[warmKey]bool),
+		snapFails: make(map[warmKey]*snapFailure),
 		kick:      make(chan struct{}, 1),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -157,8 +157,20 @@ func (p *warmPool) refillOne() bool {
 	if !want {
 		return false
 	}
-	if p.snap != nil && !p.isColdOnly(k) {
-		return p.refillViaSnapshot(k, spec)
+	// A networked shape is never a snapshot shape: a snapshot carries the guest's
+	// MAC and IP in its memory image, so every restore of one template would claim
+	// the same address. The runtime refuses it; not asking is how the pool avoids
+	// one guaranteed failure and cooldown per networked shape.
+	if p.snap != nil && !k.network && !p.isColdOnly(k) {
+		if p.refillViaSnapshot(k, spec) {
+			return true
+		}
+		// No VM came of it. If the shape has just fallen back to cold boots, do
+		// that now: leaving it short until the next poll would spend three seconds
+		// with an empty pool on the way to the boot we already know we want.
+		if !p.isColdOnly(k) {
+			return false
+		}
 	}
 	return p.refillViaColdBoot(k, spec)
 }
@@ -222,6 +234,7 @@ func (p *warmPool) refillViaSnapshot(k warmKey, spec runtime.Spec) bool {
 		return p.snapshotFailed(k, "restore", err)
 	}
 	p.mu.Lock()
+	delete(p.snapFails, k) // a working restore clears the shape's record
 	p.ready[k] = append(p.ready[k], inst)
 	n := len(p.ready[k])
 	p.mu.Unlock()
@@ -229,24 +242,94 @@ func (p *warmPool) refillViaSnapshot(k warmKey, spec runtime.Spec) bool {
 	return true
 }
 
-// snapshotFailed marks a shape cold-only so the pool stops trying snapshots for
-// it and cold-boots instead: a snapshot problem degrades to slower, never to no
-// warm VMs.
+// snapFailure is a shape's record of the snapshot path failing.
+//
+// It records a count and a retry time rather than a flag, because "this host
+// cannot do snapshots" and "this one restore was slow" are different facts and the
+// flag could not tell them apart. It latched on the first failure and nothing
+// cleared it, so a single slow restore -- a memory image whose page cache had been
+// reclaimed, on an SD card -- disabled restores for that shape for the daemon's
+// whole life, silently, on a code path whose entire purpose is to be faster than
+// the alternative.
+type snapFailure struct {
+	n     int
+	until time.Time
+}
+
+const (
+	// snapRetryBase is the first cooldown after a failure, doubling each time.
+	snapRetryBase = 30 * time.Second
+	// snapRetryMax caps it: a shape that keeps failing should keep being retried,
+	// just rarely.
+	snapRetryMax = 10 * time.Minute
+	// snapGiveUpAfter is how many consecutive failures make it permanent. By this
+	// point it is not one slow restore, it is a host that cannot do this -- no KVM
+	// snapshot support, a guest image without the agent routes -- and retrying
+	// costs a cold boot and a full memory dump every time.
+	snapGiveUpAfter = 5
+)
+
+// snapshotFailed records a snapshot-path failure for a shape and falls it back to
+// cold boots: a snapshot problem degrades to slower warm VMs, never to none.
+//
+// It also throws the shape's template away. The template is a candidate cause --
+// captured against an image that has since been rebuilt, captured from a guest
+// that did not carry its interrupt-controller state -- and one that would
+// otherwise be retried unchanged forever while occupying a full copy of a guest's
+// RAM on disk.
 func (p *warmPool) snapshotFailed(k warmKey, stage string, err error) bool {
 	if p.ctx.Err() != nil {
 		return false
 	}
-	p.log.Warn("warm pool snapshot path failed; cold-booting this shape instead", "stage", stage, "err", err)
+
 	p.mu.Lock()
-	p.coldOnly[k] = true
+	f := p.snapFails[k]
+	if f == nil {
+		f = &snapFailure{}
+		p.snapFails[k] = f
+	}
+	f.n++
+	cooldown := snapRetryBase << min(f.n-1, 8)
+	if cooldown > snapRetryMax {
+		cooldown = snapRetryMax
+	}
+	f.until = time.Now().Add(cooldown)
+	stale, hadTemplate := p.templates[k]
+	delete(p.templates, k)
+	// Copied out under the lock: everything below runs outside it, and reaching
+	// back into f there would be reading a value another goroutine may be changing.
+	failures := f.n
+	permanent := failures >= snapGiveUpAfter
 	p.mu.Unlock()
+
+	if permanent {
+		p.log.Warn("warm pool snapshot path failed too often; cold-booting this shape from now on",
+			"stage", stage, "failures", failures, "err", err)
+	} else {
+		p.log.Warn("warm pool snapshot path failed; cold-booting this shape and retrying snapshots later",
+			"stage", stage, "failures", failures, "retry_in", cooldown, "err", err)
+	}
+
+	if hadTemplate {
+		if derr := p.snap.Discard(p.ctx, stale); derr != nil {
+			p.log.Warn("could not reclaim the failed shape's template snapshot", "err", derr)
+		}
+	}
 	return false
 }
 
+// isColdOnly reports whether a shape should skip the snapshot path right now.
 func (p *warmPool) isColdOnly(k warmKey) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.coldOnly[k]
+	f := p.snapFails[k]
+	if f == nil {
+		return false
+	}
+	if f.n >= snapGiveUpAfter {
+		return true
+	}
+	return time.Now().Before(f.until)
 }
 
 func (p *warmPool) backoff() {
@@ -254,6 +337,13 @@ func (p *warmPool) backoff() {
 	case <-p.ctx.Done():
 	case <-time.After(3 * time.Second):
 	}
+}
+
+// readyCount is how many VMs of a shape are waiting to be handed out.
+func (p *warmPool) readyCount(k warmKey) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.ready[k])
 }
 
 func (p *warmPool) pickDeficit() (warmKey, runtime.Spec, bool) {
@@ -284,6 +374,15 @@ func (p *warmPool) checkout(k warmKey) runtime.Instance {
 	p.ready[k] = insts[:len(insts)-1]
 	p.mu.Unlock()
 
+	// The meters start now, not when the VM was minted. This is the moment the
+	// sandbox stops being the host's readiness and becomes somebody's work, and it
+	// is the one place both fill paths pass through -- without it a VM that waited
+	// ten minutes in the pool billed its first tenant ten minutes of wall and ten
+	// of idle, next to a created_at stamped here.
+	if a, ok := inst.(runtime.MeterAdopter); ok {
+		a.AdoptMeter()
+	}
+
 	p.hits.Add(1)
 	select {
 	case p.kick <- struct{}{}:
@@ -308,10 +407,27 @@ func (p *warmPool) close(ctx context.Context) {
 			leftover = append(leftover, insts...)
 			p.ready[k] = nil
 		}
+		var templates []runtime.SnapshotRef
+		for k, ref := range p.templates {
+			templates = append(templates, ref)
+			delete(p.templates, k)
+		}
 		p.mu.Unlock()
 
 		for _, inst := range leftover {
 			_ = inst.Stop(ctx)
+		}
+
+		// The templates go too. Each is a full copy of a guest's RAM -- half a
+		// gigabyte for the smallest shape this pool is worth using on -- and the only
+		// handle to one is the ref just deleted above, so leaving them behind leaves
+		// files nothing will ever open again, plus a complete guest memory image at
+		// rest for as long as the box lives. The startup sweep is the backstop for a
+		// daemon that is killed rather than closed; this is the ordinary path.
+		for _, ref := range templates {
+			if err := p.snap.Discard(ctx, ref); err != nil {
+				p.log.Warn("could not reclaim a template snapshot on shutdown", "dir", ref.Dir, "err", err)
+			}
 		}
 	})
 }

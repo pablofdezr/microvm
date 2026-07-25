@@ -39,6 +39,15 @@ type Agent struct {
 	execs   *registry
 	started time.Time
 	log     *slog.Logger
+
+	// gic carries the guest's interrupt-controller state across a host-driven
+	// snapshot. It costs nothing until the host arms it.
+	gic *gicCarrier
+
+	// reseed rotates this guest's CSPRNG from a host-supplied token, and is a
+	// field so a test can supply one that does not ioctl the kernel running the
+	// test. See reseed.go for why the rotation is not a file write.
+	reseed func(token []byte) error
 }
 
 // New returns an Agent that runs commands under workdir.
@@ -48,6 +57,8 @@ func New(workdir string, log *slog.Logger) *Agent {
 		execs:   newRegistry(),
 		started: time.Now(),
 		log:     log,
+		gic:     newGICCarrier(log),
+		reseed:  reseedCSPRNG,
 	}
 }
 
@@ -61,7 +72,42 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/files", a.handlePutFile)
 	mux.HandleFunc("GET /v1/files", a.handleGetFile)
 	mux.HandleFunc("POST /v1/mkdir", a.handleMkdir)
+	mux.HandleFunc("POST /v1/snapshot/arm", a.handleSnapshotArm)
+	mux.HandleFunc("POST /v1/snapshot/disarm", a.handleSnapshotDisarm)
+	mux.HandleFunc("POST /v1/snapshot/reseed", a.handleSnapshotReseed)
 	return mux
+}
+
+// handleSnapshotArm prepares the guest to be snapshotted. The host calls it
+// immediately before pausing the VM.
+func (a *Agent) handleSnapshotArm(w http.ResponseWriter, r *http.Request) {
+	resp, err := a.gic.arm(r.Context())
+	if err != nil {
+		// The host treats this as a snapshot that must not be taken: a guest that
+		// cannot carry its interrupt controller cannot be restored on a host that
+		// needs it to, and the failure would otherwise surface much later as a
+		// restored VM that never answers.
+		a.log.Error("could not arm for a snapshot", "err", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSnapshotDisarm releases the guest after a restore. It is safe to call on
+// a guest that was never armed.
+//
+// It answers with what the carry did rather than a bare acknowledgement, because
+// the host's readiness probe cannot see it: one HTTP reply proves one working
+// vCPU, and the state a snapshot loses is per-vCPU. The response says how many
+// vCPUs were accounted for, and the host discards a guest that does not add up.
+func (a *Agent) handleSnapshotDisarm(w http.ResponseWriter, r *http.Request) {
+	resp, err := a.gic.disarm(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {

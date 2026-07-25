@@ -3,12 +3,15 @@ package fcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // capturedReq records what the stub Firecracker received.
@@ -114,5 +117,48 @@ func TestErrorStatusIsReported(t *testing.T) {
 func TestDialFailsWhenNoSocket(t *testing.T) {
 	if err := New("/nonexistent/fc.sock").Pause(context.Background()); err == nil {
 		t.Fatal("expected an error dialing a missing socket")
+	}
+}
+
+// A snapshot write outlives the control timeout, because it takes as long as the
+// guest's memory takes to reach the disk. A single client-wide timeout could not
+// express that, and the 30s one this replaced turned a slow capture into a
+// permanent "snapshots do not work on this host".
+func TestSnapshotWriteOutlivesControl(t *testing.T) {
+	if snapshotWriteTimeout <= controlTimeout {
+		t.Fatalf("snapshotWriteTimeout %v must exceed controlTimeout %v", snapshotWriteTimeout, controlTimeout)
+	}
+
+	// A short socket path: the sun.sun_path limit is ~104 bytes and a test name
+	// is part of t.TempDir().
+	dir, err := os.MkdirTemp("", "fcapi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "fc.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A VMM that answers only after longer than a control call is allowed to run.
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(controlTimeout + time.Second):
+			w.WriteHeader(http.StatusNoContent)
+		case <-r.Context().Done():
+		}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+
+	// The caller's deadline is what fires, not a client-wide cap -- which is also
+	// how the test proves the point in 150ms instead of 30s.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	if err := New(sock).CreateSnapshot(ctx, "state", "mem"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the caller's deadline", err)
 	}
 }

@@ -111,6 +111,64 @@ type HealthResponse struct {
 	UptimeMS int64 `json:"uptime_ms"`
 }
 
+// SnapshotArmResponse is the agent's answer to POST /v1/snapshot/arm, the call
+// the host makes just before it pauses a VM to snapshot it.
+//
+// Arming asks the guest to hold on to the interrupt-controller state that a
+// Firecracker snapshot does not save on a GICv2 host, and to put it back the
+// moment the VM resumes; see internal/agent/gic_linux.go for what is lost and
+// why only the guest can restore it. A guest that needs none of this says so
+// here rather than failing, because most hosts do not.
+type SnapshotArmResponse struct {
+	// Armed is true when the guest is now holding its state and will reapply it
+	// on resume. False is not an error: see Detail.
+	Armed bool `json:"armed"`
+
+	// CPUs is how many vCPUs are armed, one thread each. Every vCPU has its own
+	// banked copy of the state, so a carry that covered only some of them would
+	// restore into a guest with a working timer on some CPUs and not others.
+	CPUs int `json:"cpus,omitempty"`
+
+	// Detail explains an Armed:false answer -- a guest with a GICv3, or no
+	// device tree at all, has nothing to carry.
+	Detail string `json:"detail,omitempty"`
+}
+
+// SnapshotDisarmResponse is the agent's answer to POST /v1/snapshot/disarm, the
+// call the host makes once a restored guest has answered.
+//
+// It reports rather than merely acknowledging, because the host cannot otherwise
+// tell a fully repaired guest from a half repaired one. The readiness probe is a
+// single HTTP request answered on whichever vCPU the guest's scheduler picked, so
+// it is satisfied by one working vCPU; the state a snapshot loses is *per* vCPU.
+// Checked is therefore the fact the host needs: a stand-down that does not
+// account for every vCPU is a guest that may have a dead one, and the host must
+// throw it away rather than hand it to a tenant.
+type SnapshotDisarmResponse struct {
+	// Armed reports whether there was a carry to stand down at all. False is the
+	// normal answer on a platform that needed none.
+	Armed bool `json:"armed"`
+
+	// CPUs is how many vCPUs the carry covered.
+	CPUs int `json:"cpus,omitempty"`
+
+	// Checked is how many of those vCPUs compared their live interrupt-controller
+	// state against what was carried before standing down. Fewer than CPUs means
+	// a vCPU was never reached, which is exactly the guest the host must discard.
+	Checked int `json:"checked,omitempty"`
+
+	// Reapplied is how many vCPUs found their state missing and put it back. It
+	// is the difference between a host that needs the carry (every vCPU) and one
+	// that never did (none), and it is only knowable from inside the guest.
+	Reapplied int `json:"reapplied,omitempty"`
+}
+
+// ReseedTokenBytes is the exact size of a restore entropy token, matching the
+// 128-bit hardware VMGenID the mechanism mirrors. The agent requires exactly
+// this: a short token is a caller that has misunderstood what it is sending, and
+// a reseed is not a place to be lenient.
+const ReseedTokenBytes = 16
+
 // ErrorResponse is the agent's body for non-2xx replies.
 type ErrorResponse struct {
 	Error string `json:"error"`

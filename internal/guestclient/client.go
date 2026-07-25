@@ -315,6 +315,120 @@ func (c *Client) ReadFile(ctx context.Context, path string) (io.ReadCloser, erro
 	return resp.Body, nil
 }
 
+// ErrSnapshotArmUnsupported means the guest image predates the snapshot arm
+// route.
+//
+// It is a sentinel because the host has to tell it from a real failure. An image
+// built before this existed can still be snapshotted and restored on a host that
+// does not need the carry (x86, or an arm64 host with a GICv3), so the host warns
+// and continues rather than refusing to snapshot it.
+var ErrSnapshotArmUnsupported = errors.New("the guest agent has no snapshot arm route; the image predates it")
+
+// ArmSnapshot asks the guest to hold the interrupt-controller state a Firecracker
+// snapshot loses and to reapply it on resume. The host calls it immediately
+// before pausing the VM, and the guest spins one thread per vCPU until
+// DisarmSnapshot -- so the two calls belong together, as close as the snapshot
+// allows.
+func (c *Client) ArmSnapshot(ctx context.Context) (protocol.SnapshotArmResponse, error) {
+	var out protocol.SnapshotArmResponse
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/snapshot/arm", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return out, ErrSnapshotArmUnsupported
+	}
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return out, err
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("decode snapshot arm: %w", err)
+	}
+	return out, nil
+}
+
+// DisarmSnapshot releases a restored guest's vCPUs and reports what the carry
+// did. Calling it on a guest that was never armed is success, so the restore path
+// can call it unconditionally.
+//
+// The report is not decoration. The host's only other view of a restored guest is
+// one HTTP reply from the readiness probe, which is answered on whichever vCPU the
+// guest scheduled it on and therefore proves exactly one vCPU works -- while the
+// state a GICv2 snapshot loses is banked per vCPU. Checked against CPUs is how the
+// host learns that every vCPU was in fact accounted for, and a guest where it was
+// not has to be destroyed rather than handed to a tenant.
+func (c *Client) DisarmSnapshot(ctx context.Context) (protocol.SnapshotDisarmResponse, error) {
+	var out protocol.SnapshotDisarmResponse
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/snapshot/disarm", nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return out, ErrSnapshotArmUnsupported
+	}
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return out, err
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("decode snapshot disarm: %w", err)
+	}
+	return out, nil
+}
+
+// ReseedEntropy rotates a restored guest's CSPRNG from a host-minted token.
+//
+// It is a route of its own rather than a write to /dev/urandom through WriteFile,
+// and the difference is the entire security property. A write mixes bytes into the
+// kernel's input pool and changes nothing about what getrandom(2) returns; the key
+// those bytes come from is re-derived on a jiffies deadline that a snapshot
+// restores identically into every restore. The agent's route writes *and* forces
+// the re-derivation, and it fails if the forcing fails -- so a host that gets a
+// success here knows this guest's random numbers are its own. See
+// internal/agent/reseed.go.
+//
+// There is deliberately no tolerance for a guest image that lacks the route: an
+// image that cannot rotate its CSPRNG cannot be restored safely, so the restore
+// fails and the warm pool cold-boots that shape instead.
+func (c *Client) ReseedEntropy(ctx context.Context, token []byte) error {
+	if len(token) != protocol.ReseedTokenBytes {
+		return fmt.Errorf("reseed token is %d bytes, want %d", len(token), protocol.ReseedTokenBytes)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v1/snapshot/reseed", bytes.NewReader(token))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return fmt.Errorf("the guest agent has no CSPRNG reseed route, so this restore would "+
+			"share its random numbers with every other restore of the same snapshot: %w",
+			ErrSnapshotArmUnsupported)
+	}
+	return checkStatus(resp, http.StatusNoContent)
+}
+
 // ErrNotDirectory means something that is not a directory already stands where
 // Mkdir was asked to create one.
 //
