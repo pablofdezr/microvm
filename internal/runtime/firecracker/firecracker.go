@@ -282,10 +282,36 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.Spec) (runtime.Instan
 	return inst, nil
 }
 
+// rootfsPath resolves an image name to the file that actually holds it.
+//
+// The catalog the API serves is the image directory with ".ext4" trimmed off,
+// so a caller asks for "python" while the file on disk is "python.ext4". Both
+// spellings resolve here: the warm-pool flag names the file directly, a caller
+// names the image, and neither should have to know about the other.
+//
+// The name comes from an API caller, so it must be a name and not a path --
+// otherwise "../../etc/shadow" would stage a host file into the jail as a
+// rootfs. filepath.Join would happily clean the traversal away.
+func (r *Runtime) rootfsPath(image string) (string, error) {
+	if image == "" || image != filepath.Base(image) || image[0] == '.' {
+		return "", fmt.Errorf("rootfs for image %q: not an image name", image)
+	}
+
+	for _, candidate := range []string{
+		filepath.Join(r.cfg.ImageDir, image),
+		filepath.Join(r.cfg.ImageDir, image+".ext4"),
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("rootfs for image %q: %w", image, os.ErrNotExist)
+}
+
 func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) error {
-	rootfs := filepath.Join(r.cfg.ImageDir, spec.Image)
-	if _, err := os.Stat(rootfs); err != nil {
-		return fmt.Errorf("rootfs for image %q: %w", spec.Image, err)
+	rootfs, err := r.rootfsPath(spec.Image)
+	if err != nil {
+		return err
 	}
 
 	if spec.Network {

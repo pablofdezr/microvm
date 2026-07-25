@@ -144,7 +144,11 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 	if err := r.stageFile(r.cfg.KernelPath, filepath.Join(jailRoot, "vmlinux")); err != nil {
 		return nil, fmt.Errorf("restore: stage kernel: %w", err)
 	}
-	if err := r.stageFile(filepath.Join(r.cfg.ImageDir, spec.Image), filepath.Join(jailRoot, "rootfs.ext4")); err != nil {
+	rootfs, err := r.rootfsPath(spec.Image)
+	if err != nil {
+		return nil, fmt.Errorf("restore: %w", err)
+	}
+	if err := r.stageFile(rootfs, filepath.Join(jailRoot, "rootfs.ext4")); err != nil {
 		return nil, fmt.Errorf("restore: stage rootfs: %w", err)
 	}
 	for _, name := range []string{snapStateFile, snapMemFile} {
