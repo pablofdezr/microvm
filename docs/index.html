@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-lang="ts">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -202,7 +202,16 @@
   pre .c { color: var(--faint); }
   pre .f { color: var(--text); }
   .code-pane { display: none; }
-  .code-pane.active { display: block; }
+  :root[data-lang="ts"] .code-pane[data-pane="ts"],
+  :root[data-lang="py"] .code-pane[data-pane="py"],
+  :root[data-lang="go"] .code-pane[data-pane="go"],
+  .code-pane[data-pane="sh"] { display: block; }
+  .code-title { padding-left: 4px; font-size: 0.82rem; color: var(--muted); }
+
+  /* ---- Examples ---- */
+  .head-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .head-row .tabs { margin-bottom: 2px; }
+  .stack { display: grid; gap: 14px; }
 
   /* ---- Features ---- */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 32px; row-gap: 0; }
@@ -260,6 +269,7 @@
     <a class="brand" href="#top" aria-label="microvm home">microvm</a>
     <nav class="nav-links">
       <a class="hide-sm" href="#quickstart">Quick start</a>
+      <a class="hide-sm" href="#examples">Examples</a>
       <a class="hide-sm" href="#features">Features</a>
       <a href="https://github.com/pablofdezr/microvm">GitHub</a>
       <button class="icon-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
@@ -315,7 +325,7 @@
           </button>
         </div>
 
-        <div class="code-pane active" data-pane="ts"><pre><code><span class="k">import</span> { Client } <span class="k">from</span> <span class="s">"@pablofdezr/microvm"</span>;
+        <div class="code-pane" data-pane="ts"><pre><code><span class="k">import</span> { Client } <span class="k">from</span> <span class="s">"@pablofdezr/microvm"</span>;
 
 <span class="k">const</span> client = <span class="k">new</span> <span class="f">Client</span>(<span class="s">"http://127.0.0.1:8080"</span>, { token });
 
@@ -350,6 +360,249 @@ sb, err := client.Sandboxes.<span class="f">Create</span>(ctx, microvm.SandboxCr
 exe, _ := client.<span class="f">Run</span>(ctx, sb.Id, <span class="s">"python3"</span>, <span class="s">"-c"</span>, <span class="s">"print('hi')"</span>)
 fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
       </div>
+    </div>
+  </section>
+
+  <!-- Examples -->
+  <section class="block" id="examples">
+    <div class="wrap">
+      <div class="section-head head-row">
+        <div>
+          <p class="label">Examples</p>
+          <h2>Files, streams, queues and full nodes</h2>
+          <p class="lead">Everything below is the same client. Pick a language once — it applies to every snippet on the page.</p>
+        </div>
+        <div class="tabs" role="tablist" aria-label="Language">
+          <button class="tab" role="tab" aria-selected="true" data-lang="ts">TypeScript</button>
+          <button class="tab" role="tab" aria-selected="false" data-lang="py">Python</button>
+          <button class="tab" role="tab" aria-selected="false" data-lang="go">Go</button>
+        </div>
+      </div>
+
+      <div class="stack">
+
+        <!-- Files -->
+        <article class="code-card">
+          <div class="code-head">
+            <span class="code-title">Write a file in, read the result out</span>
+            <button class="copy" aria-label="Copy code" title="Copy">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="code-pane" data-pane="ts"><pre><code><span class="k">const</span> source = <span class="s">`
+import json
+json.dump({"ok": True}, open("out.json", "w"))
+`</span>;
+
+<span class="k">const</span> sb = <span class="k">await</span> client.sandboxes.<span class="f">create</span>({ image: <span class="s">"python"</span> });
+<span class="k">await</span> client.files.<span class="f">write</span>(sb.id, <span class="s">"main.py"</span>, source);
+<span class="k">await</span> client.<span class="f">run</span>(sb.id, <span class="s">"python3"</span>, [<span class="s">"main.py"</span>]);
+
+<span class="k">const</span> out = <span class="k">await</span> client.files.<span class="f">readText</span>(sb.id, <span class="s">"out.json"</span>);
+console.<span class="f">log</span>(<span class="f">JSON</span>.<span class="f">parse</span>(out).ok);</code></pre></div>
+          <div class="code-pane" data-pane="py"><pre><code>source = <span class="s">"""
+import json
+json.dump({"ok": True}, open("out.json", "w"))
+"""</span>
+
+sb = client.sandboxes.<span class="f">create</span>(<span class="s">"python"</span>)
+client.files.<span class="f">write</span>(sb[<span class="s">"id"</span>], <span class="s">"main.py"</span>, source)
+client.<span class="f">run</span>(sb[<span class="s">"id"</span>], <span class="s">"python3"</span>, <span class="s">"main.py"</span>)
+
+out = client.files.<span class="f">read</span>(sb[<span class="s">"id"</span>], <span class="s">"out.json"</span>)
+<span class="f">print</span>(json.<span class="f">loads</span>(out)[<span class="s">"ok"</span>])</code></pre></div>
+          <div class="code-pane" data-pane="go"><pre><code><span class="k">const</span> source = <span class="s">`
+import json
+json.dump({"ok": True}, open("out.json", "w"))
+`</span>
+
+sb, _ := client.Sandboxes.<span class="f">Create</span>(ctx, microvm.SandboxCreateParams{Image: <span class="s">"python"</span>})
+<span class="k">defer</span> client.Sandboxes.<span class="f">Delete</span>(ctx, sb.Id)
+
+client.Files.<span class="f">Write</span>(ctx, sb.Id, <span class="s">"main.py"</span>, []<span class="k">byte</span>(source))
+client.<span class="f">Run</span>(ctx, sb.Id, <span class="s">"python3"</span>, <span class="s">"main.py"</span>)
+
+out, _ := client.Files.<span class="f">Retrieve</span>(ctx, sb.Id, <span class="s">"out.json"</span>)
+fmt.<span class="f">Println</span>(<span class="k">string</span>(out))</code></pre></div>
+        </article>
+
+        <!-- Streaming -->
+        <article class="code-card">
+          <div class="code-head">
+            <span class="code-title">Follow the output as it is produced</span>
+            <button class="copy" aria-label="Copy code" title="Copy">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="code-pane" data-pane="ts"><pre><code><span class="k">import</span> { frameText } <span class="k">from</span> <span class="s">"@pablofdezr/microvm"</span>;
+
+<span class="c">// Starting a command and watching it are two calls: a dropped</span>
+<span class="c">// connection no longer kills the job.</span>
+<span class="k">const</span> exe = <span class="k">await</span> client.executions.<span class="f">create</span>(sb.id, {
+  cmd: <span class="s">"python3"</span>,
+  args: [<span class="s">"train.py"</span>],
+  timeout_seconds: 600,
+});
+
+<span class="c">// The stream replays from the start, then follows — reconnecting loses nothing.</span>
+<span class="k">for await</span> (<span class="k">const</span> frame <span class="k">of</span> client.executions.<span class="f">stream</span>(sb.id, exe.id)) {
+  <span class="k">if</span> (frame.type === <span class="s">"stdout"</span>) process.stdout.<span class="f">write</span>(<span class="f">frameText</span>(frame));
+}</code></pre></div>
+          <div class="code-pane" data-pane="py"><pre><code><span class="c"># Starting a command and watching it are two calls: a dropped</span>
+<span class="c"># connection no longer kills the job.</span>
+exe = client.executions.<span class="f">create</span>(
+    sb[<span class="s">"id"</span>], <span class="s">"python3"</span>, [<span class="s">"train.py"</span>], timeout_seconds=600
+)
+
+<span class="c"># The stream replays from the start, then follows — reconnecting loses nothing.</span>
+<span class="k">for</span> frame <span class="k">in</span> client.executions.<span class="f">stream</span>(sb[<span class="s">"id"</span>], exe[<span class="s">"id"</span>]):
+    <span class="k">if</span> frame[<span class="s">"type"</span>] == <span class="s">"stdout"</span>:
+        sys.stdout.buffer.<span class="f">write</span>(frame[<span class="s">"data"</span>])</code></pre></div>
+          <div class="code-pane" data-pane="go"><pre><code><span class="c">// Starting a command and watching it are two calls: a dropped</span>
+<span class="c">// connection no longer kills the job.</span>
+exe, _ := client.Executions.<span class="f">Create</span>(ctx, sb.Id, microvm.ExecutionCreateParams{
+    Cmd:            <span class="s">"python3"</span>,
+    Args:           &amp;[]<span class="k">string</span>{<span class="s">"train.py"</span>},
+    TimeoutSeconds: microvm.<span class="f">Ptr</span>(600),
+})
+
+<span class="c">// The stream replays from the start, then follows — reconnecting loses nothing.</span>
+<span class="k">for</span> frame, err := <span class="k">range</span> client.Executions.<span class="f">Stream</span>(ctx, sb.Id, exe.Id) {
+    <span class="k">if</span> err != <span class="k">nil</span> {
+        log.<span class="f">Fatal</span>(err)
+    }
+    os.Stdout.<span class="f">Write</span>(frame.<span class="f">Bytes</span>())
+}</code></pre></div>
+        </article>
+
+        <!-- Tasks -->
+        <article class="code-card">
+          <div class="code-head">
+            <span class="code-title">Queue a task and wait for the result</span>
+            <button class="copy" aria-label="Copy code" title="Copy">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="code-pane" data-pane="ts"><pre><code><span class="c">// No sandbox to hold: the task waits for a slot anywhere in the fleet.</span>
+<span class="k">const</span> task = <span class="k">await</span> client.tasks.<span class="f">create</span>({
+  image: <span class="s">"node"</span>,
+  cmd: <span class="s">"node"</span>,
+  args: [<span class="s">"job.js"</span>],
+  files: { <span class="s">"job.js"</span>: source },
+  vcpus: 2,
+  mem_mib: 1024,
+  priority: 7, <span class="c">// 0–10, higher runs first; equal is FIFO</span>
+});
+
+<span class="k">const</span> done = <span class="k">await</span> client.tasks.<span class="f">wait</span>(task.id);
+console.<span class="f">log</span>(done.status, done.exit_code, done.stdout);</code></pre></div>
+          <div class="code-pane" data-pane="py"><pre><code><span class="c"># No sandbox to hold: the task waits for a slot anywhere in the fleet.</span>
+task = client.tasks.<span class="f">create</span>(
+    <span class="s">"node"</span>, <span class="s">"node"</span>,
+    args=[<span class="s">"job.js"</span>],
+    files={<span class="s">"job.js"</span>: source},
+    vcpus=2,
+    mem_mib=1024,
+    priority=7,  <span class="c"># 0-10, higher runs first; equal is FIFO</span>
+)
+
+done = client.tasks.<span class="f">wait</span>(task[<span class="s">"id"</span>])
+<span class="f">print</span>(done[<span class="s">"status"</span>], done[<span class="s">"exit_code"</span>], done[<span class="s">"stdout"</span>])</code></pre></div>
+          <div class="code-pane" data-pane="go"><pre><code><span class="c">// No sandbox to hold: the task waits for a slot anywhere in the fleet.</span>
+<span class="c">// Optional fields are pointers, so microvm.Ptr sets them inline.</span>
+task, _ := client.Tasks.<span class="f">Create</span>(ctx, microvm.TaskCreateParams{
+    Image:    <span class="s">"node"</span>,
+    Cmd:      <span class="s">"node"</span>,
+    Args:     &amp;[]<span class="k">string</span>{<span class="s">"job.js"</span>},
+    Vcpus:    microvm.<span class="f">Ptr</span>(2),
+    MemMib:   microvm.<span class="f">Ptr</span>(1024),
+    Priority: microvm.<span class="f">Ptr</span>(7), <span class="c">// 0-10, higher runs first; equal is FIFO</span>
+})
+
+done, _ := client.Tasks.<span class="f">Wait</span>(ctx, task.Id)
+fmt.<span class="f">Print</span>(done.Stdout)</code></pre></div>
+        </article>
+
+        <!-- Limits + capacity -->
+        <article class="code-card">
+          <div class="code-head">
+            <span class="code-title">Cap the sandbox, and handle a full node</span>
+            <button class="copy" aria-label="Copy code" title="Copy">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="code-pane" data-pane="ts"><pre><code><span class="k">import</span> { APIError } <span class="k">from</span> <span class="s">"@pablofdezr/microvm"</span>;
+
+<span class="k">try</span> {
+  <span class="k">const</span> sb = <span class="k">await</span> client.sandboxes.<span class="f">create</span>({
+    image: <span class="s">"go"</span>,
+    vcpus: 2,
+    mem_mib: 1024,
+    cpu_cores: 0.5,   <span class="c">// a hard ceiling, enforced</span>
+    network: <span class="k">true</span>,    <span class="c">// filtered egress — no RFC1918, no metadata</span>
+    ttl_seconds: 300, <span class="c">// killed when it elapses</span>
+  });
+} <span class="k">catch</span> (e) {
+  <span class="c">// The node is full. Hand the work to the queue instead of failing.</span>
+  <span class="k">if</span> (e <span class="k">instanceof</span> APIError &amp;&amp; e.isCapacity) {
+    <span class="k">await</span> client.tasks.<span class="f">create</span>({ image: <span class="s">"go"</span>, cmd: <span class="s">"go"</span>, args: [<span class="s">"run"</span>, <span class="s">"main.go"</span>] });
+  } <span class="k">else throw</span> e;
+}</code></pre></div>
+          <div class="code-pane" data-pane="py"><pre><code><span class="k">from</span> microvm <span class="k">import</span> APIError
+
+<span class="k">try</span>:
+    sb = client.sandboxes.<span class="f">create</span>(
+        <span class="s">"go"</span>,
+        vcpus=2,
+        mem_mib=1024,
+        cpu_cores=0.5,    <span class="c"># a hard ceiling, enforced</span>
+        network=<span class="k">True</span>,     <span class="c"># filtered egress - no RFC1918, no metadata</span>
+        ttl_seconds=300,  <span class="c"># killed when it elapses</span>
+    )
+<span class="k">except</span> APIError <span class="k">as</span> e:
+    <span class="k">if</span> <span class="k">not</span> e.is_capacity:
+        <span class="k">raise</span>
+    <span class="c"># The node is full. Hand the work to the queue instead of failing.</span>
+    client.tasks.<span class="f">create</span>(<span class="s">"go"</span>, <span class="s">"go"</span>, args=[<span class="s">"run"</span>, <span class="s">"main.go"</span>])</code></pre></div>
+          <div class="code-pane" data-pane="go"><pre><code>sb, err := client.Sandboxes.<span class="f">Create</span>(ctx, microvm.SandboxCreateParams{
+    Image:      <span class="s">"go"</span>,
+    Vcpus:      microvm.<span class="f">Ptr</span>(2),
+    MemMib:     microvm.<span class="f">Ptr</span>(1024),
+    CpuCores:   microvm.<span class="f">Ptr</span>(0.5),  <span class="c">// a hard ceiling, enforced</span>
+    Network:    microvm.<span class="f">Ptr</span>(<span class="k">true</span>), <span class="c">// filtered egress — no RFC1918, no metadata</span>
+    TtlSeconds: microvm.<span class="f">Ptr</span>(300),  <span class="c">// killed when it elapses</span>
+})
+
+<span class="c">// The node is full. Hand the work to the queue instead of failing.</span>
+<span class="k">if</span> microvm.<span class="f">IsCapacity</span>(err) {
+    _, err = client.Tasks.<span class="f">Create</span>(ctx, microvm.TaskCreateParams{
+        Image: <span class="s">"go"</span>, Cmd: <span class="s">"go"</span>, Args: &amp;[]<span class="k">string</span>{<span class="s">"run"</span>, <span class="s">"main.go"</span>},
+    })
+}</code></pre></div>
+        </article>
+
+        <!-- CLI -->
+        <article class="code-card">
+          <div class="code-head">
+            <span class="code-title">Or skip the SDK entirely</span>
+            <button class="copy" aria-label="Copy code" title="Copy">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M6 15H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="code-pane" data-pane="sh"><pre><code>microvm run python main.py              <span class="c"># upload, run, print the output</span>
+microvm run node app.ts -network        <span class="c"># with filtered internet</span>
+microvm run python job.py -env KEY=v -timeout 30s
+
+microvm submit python job.py            <span class="c"># queue it instead; prints a task ID</span>
+microvm result tsk_01JZ8...             <span class="c"># wait for it and print the output</span>
+
+microvm ps                              <span class="c"># sandboxes on this node</span>
+microvm queue                           <span class="c"># depth and this node's slots</span>
+microvm logs sb_01JZ8... exe_01JZ8...   <span class="c"># an execution's recorded output</span></code></pre></div>
+        </article>
+
+      </div>
+      <p class="table-note">The exit code is the program's own, so <code>microvm run python test.py &amp;&amp; deploy</code> composes. Ctrl-C aborts the process inside the guest, not just the CLI.</p>
     </div>
   </section>
 
@@ -485,21 +738,20 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
     try { localStorage.setItem("theme", next); } catch (e) {}
   });
 
-  var instCode = document.getElementById("inst-cmd");
-
-  // Language tabs
-  document.querySelectorAll("[data-lang]").forEach(function (tab) {
+  // Language tabs — one choice, every snippet on the page follows it.
+  var tabs = document.querySelectorAll(".tab[data-lang]");
+  tabs.forEach(function (tab) {
     tab.addEventListener("click", function () {
-      document.querySelectorAll("[data-lang]").forEach(function (t) { t.setAttribute("aria-selected", "false"); });
-      tab.setAttribute("aria-selected", "true");
-      document.querySelectorAll(".code-pane").forEach(function (p) { p.classList.remove("active"); });
-      document.querySelector('.code-pane[data-pane="' + tab.dataset.lang + '"]').classList.add("active");
+      var lang = tab.dataset.lang;
+      root.setAttribute("data-lang", lang);
+      tabs.forEach(function (t) {
+        t.setAttribute("aria-selected", String(t.dataset.lang === lang));
+      });
     });
   });
 
-  // Copy buttons
-  function wireCopy(btnId, getText) {
-    var btn = document.getElementById(btnId);
+  // Copy buttons — each one copies whatever its own card is showing.
+  function wireCopy(btn, getText) {
     btn.addEventListener("click", function () {
       navigator.clipboard.writeText(getText()).then(function () {
         var svg = btn.innerHTML;
@@ -508,8 +760,22 @@ fmt.<span class="f">Print</span>(exe.Stdout)</code></pre></div>
       });
     });
   }
-  wireCopy("inst-copy", function () { return instCode.textContent.replace(/^\$\s*/, ""); });
-  wireCopy("code-copy", function () { return document.querySelector(".code-pane.active pre").textContent; });
+
+  var instCode = document.getElementById("inst-cmd");
+  wireCopy(document.getElementById("inst-copy"), function () {
+    return instCode.textContent.replace(/^\$\s*/, "");
+  });
+
+  document.querySelectorAll(".code-card").forEach(function (card) {
+    var btn = card.querySelector(".copy");
+    if (!btn) return;
+    wireCopy(btn, function () {
+      var pane =
+        card.querySelector('.code-pane[data-pane="' + root.getAttribute("data-lang") + '"]') ||
+        card.querySelector(".code-pane");
+      return pane.querySelector("pre").textContent;
+    });
+  });
 </script>
 
 </body>
