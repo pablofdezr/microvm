@@ -200,6 +200,10 @@ type GuestClient interface {
 	// Signal delivers a signal to a running exec's process group.
 	Signal(ctx context.Context, execID, signal string) error
 
+	// Resize changes a running tty exec's window. It is a no-op-shaped error
+	// (guestclient.ErrNotTTY) against an exec with no pseudo-terminal.
+	Resize(ctx context.Context, execID string, rows, cols uint16) error
+
 	// WriteFile uploads content into the guest.
 	WriteFile(ctx context.Context, path string, content io.Reader, mode string) error
 

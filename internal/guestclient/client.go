@@ -270,6 +270,41 @@ func (c *Client) Signal(ctx context.Context, execID, signal string) error {
 	return checkStatus(resp, http.StatusNoContent)
 }
 
+// ErrNotTTY means a resize was aimed at an exec that has no pseudo-terminal.
+//
+// A sentinel because the layers above answer it differently from a transport
+// failure: resizing a plain exec is the caller's own confusion, not a broken VM,
+// and it is owed a 409 rather than a 500.
+var ErrNotTTY = errors.New("exec has no tty to resize")
+
+// Resize changes a running tty exec's window size, which makes the guest kernel
+// raise SIGWINCH in the process so a full-screen program repaints. It returns
+// ErrNotTTY against an exec that was not started with a tty.
+func (c *Client) Resize(ctx context.Context, execID string, rows, cols uint16) error {
+	body, err := json.Marshal(protocol.ResizeRequest{Rows: rows, Cols: cols})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/v1/exec/%s/resize", c.baseURL, execID), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("resize %s: %w", execID, ErrNotTTY)
+	}
+	return checkStatus(resp, http.StatusNoContent)
+}
+
 // WriteFile uploads content to path inside the guest.
 func (c *Client) WriteFile(ctx context.Context, path string, content io.Reader, mode string) error {
 	url := fmt.Sprintf("%s/v1/files?path=%s", c.baseURL, queryEscape(path))
@@ -425,6 +460,40 @@ func (c *Client) ReseedEntropy(ctx context.Context, token []byte) error {
 		return fmt.Errorf("the guest agent has no CSPRNG reseed route, so this restore would "+
 			"share its random numbers with every other restore of the same snapshot: %w",
 			ErrSnapshotArmUnsupported)
+	}
+	return checkStatus(resp, http.StatusNoContent)
+}
+
+// ConfigureNet re-addresses the guest's network interface after a restore, so a
+// restored VM takes a fresh address instead of the one its memory image carried.
+//
+// It is a concrete-client method rather than a runtime.GuestClient one, like
+// ArmSnapshot and ReseedEntropy: only the restore path calls it, and the layers
+// above the runtime have no business reaching into a guest's network. It travels
+// over vsock, which does not depend on the guest's address being right, so it can
+// move the guest from the template's address to its own.
+func (c *Client) ConfigureNet(ctx context.Context, req protocol.NetConfigRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/v1/net/configure", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return fmt.Errorf("the guest agent has no network configure route, so a networked restore "+
+			"cannot take its own address: %w", ErrSnapshotArmUnsupported)
 	}
 	return checkStatus(resp, http.StatusNoContent)
 }

@@ -69,13 +69,36 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/exec", a.handleExec)
 	mux.HandleFunc("POST /v1/exec/{id}/signal", a.handleSignal)
 	mux.HandleFunc("POST /v1/exec/{id}/stdin", a.handleStdin)
+	mux.HandleFunc("POST /v1/exec/{id}/resize", a.handleResize)
 	mux.HandleFunc("PUT /v1/files", a.handlePutFile)
 	mux.HandleFunc("GET /v1/files", a.handleGetFile)
 	mux.HandleFunc("POST /v1/mkdir", a.handleMkdir)
+	mux.HandleFunc("POST /v1/net/configure", a.handleNetConfigure)
 	mux.HandleFunc("POST /v1/snapshot/arm", a.handleSnapshotArm)
 	mux.HandleFunc("POST /v1/snapshot/disarm", a.handleSnapshotDisarm)
 	mux.HandleFunc("POST /v1/snapshot/reseed", a.handleSnapshotReseed)
 	return mux
+}
+
+// handleNetConfigure re-addresses the guest's network interface after a snapshot
+// restore, so a restored VM takes a fresh address rather than the one baked into
+// its memory image. The host calls it once the restored VM is answering.
+func (a *Agent) handleNetConfigure(w http.ResponseWriter, r *http.Request) {
+	var req protocol.NetConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+	if err := reconfigureNetwork(a.log, req); err != nil {
+		// The host treats this as a restore that must be thrown away: a guest that
+		// could not take its new address is on the wrong network, and handing it to
+		// a tenant would leak the template's address into the netpool slot the
+		// restore was issued.
+		a.log.Error("could not reconfigure network after restore", "err", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleSnapshotArm prepares the guest to be snapshotted. The host calls it
@@ -210,10 +233,39 @@ func (a *Agent) handleStdin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("close") == "true" {
-		if err := p.stdin.Close(); err != nil {
+		if err := p.closeStdin(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("close stdin: %w", err))
 			return
 		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleResize changes a running tty exec's window size. A plain exec has no
+// terminal to resize and is answered with a conflict rather than silently
+// ignored, since a caller resizing one has misunderstood what they started.
+func (a *Agent) handleResize(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var req protocol.ResizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
+		return
+	}
+
+	p, ok := a.execs.get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, errNotFound)
+		return
+	}
+
+	if err := p.resize(req.Rows, req.Cols); err != nil {
+		if errors.Is(err, errNotTTY) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -387,9 +439,24 @@ func decodeExecRequest(r *http.Request) (protocol.ExecRequest, error) {
 		return req, errors.New("cmd is required")
 	}
 	if req.TTY {
-		// Accepting the field and ignoring it would silently give the caller
-		// merged streams and no job control. Reject until it is implemented.
-		return req, errors.New("tty is not supported yet")
+		// A pty with a 0x0 window is read by some programs as "no size known" and
+		// by full-screen ones as unusable, so a tty exec that named no size gets a
+		// conventional 80x24 rather than the kernel's zero default. A caller that
+		// knows better sets rows and cols, or resizes once it does.
+		if req.Rows == 0 {
+			req.Rows = defaultTTYRows
+		}
+		if req.Cols == 0 {
+			req.Cols = defaultTTYCols
+		}
 	}
 	return req, nil
 }
+
+// Default pseudo-terminal geometry, applied to a tty exec that named none. 80x24
+// is the historical terminal size and what most programs assume when asked to
+// guess.
+const (
+	defaultTTYRows uint16 = 24
+	defaultTTYCols uint16 = 80
+)

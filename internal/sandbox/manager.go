@@ -41,6 +41,13 @@ type State string
 const (
 	StateRunning State = "running"
 	StateStopped State = "stopped"
+	// StateSuspended is a sandbox whose VM has been snapshotted to disk and torn
+	// down, but which is not gone: Resume boots a fresh VM from the snapshot under
+	// the same id. It holds no CPU or memory, only the snapshot, and it keeps its
+	// tenant slot and name so a resume is guaranteed one and cannot be raced for the
+	// other. It is kept until resumed or deleted -- unlike a stopped sandbox, it is
+	// never swept, because the snapshot is the whole point of keeping it.
+	StateSuspended State = "suspended"
 )
 
 // StopReason says why a sandbox is no longer running.
@@ -59,6 +66,10 @@ const (
 	ReasonIdle StopReason = "idle"
 	// ReasonFailed means the VM died on its own -- a crash, or the OOM killer.
 	ReasonFailed StopReason = "failed"
+	// ReasonSuspended means the sandbox was snapshotted and its VM torn down, to be
+	// resumed later. It is the reason a suspended sandbox reports for having no
+	// running VM, distinct from the three ways a stopped one is gone for good.
+	ReasonSuspended StopReason = "suspended"
 )
 
 // Spec describes a sandbox to create.
@@ -120,6 +131,20 @@ type Spec struct {
 	// sandbox is, so the caps are the whole reason a caller cannot make this
 	// map big.
 	Tags map[string]string
+
+	// Name is a caller-chosen handle, unique among a tenant's running sandboxes,
+	// or empty for an anonymous one. It is what get-or-create resolves: a caller
+	// that names a sandbox can ask for "the one called build" and be handed the
+	// existing VM rather than a second one, which is how a stable identity
+	// outlives any single request without the caller having to store an ID.
+	//
+	// Scoped to Tenant, never global: two tenants may both have a "build" and
+	// neither can name the other's, exactly as MaxConcurrent is counted per
+	// tenant. It frees the moment the sandbox stops, so the next create under the
+	// same name boots a fresh VM rather than colliding. Pass it through
+	// ValidateName first; like Tags it is caller-controlled memory the manager
+	// holds for the sandbox's whole life.
+	Name string
 }
 
 // Tag limits.
@@ -163,6 +188,43 @@ func ValidateTags(tags map[string]string) error {
 	return nil
 }
 
+// MaxNameBytes bounds a sandbox name. A name is held for the sandbox's whole
+// life and is a map key a caller picks, so it is capped like a tag: it is
+// caller-controlled memory the manager keeps, and the cap is what stops a create
+// parking a large one in the daemon's heap.
+const MaxNameBytes = 64
+
+// ValidateName checks a caller's sandbox name.
+//
+// A name is a lookup key, not free text: get-or-create compares it byte for
+// byte, and it turns up in log lines and error messages. So it is held to a
+// slug's alphabet -- letters, digits, and the three separators -- rather than
+// left to carry spaces, colons or control characters that would make one name
+// ambiguous with another or unreadable in a log. The returned error reads as the
+// reason it was refused, so a caller-facing layer can quote it verbatim.
+func ValidateName(name string) error {
+	if name == "" {
+		return errors.New("a name cannot be empty")
+	}
+	if len(name) > MaxNameBytes {
+		// Bytes, not characters, for the same reason as a tag key: the cap is
+		// spending bytes, and a name in a multi-byte script runs out sooner than
+		// its length suggests.
+		return fmt.Errorf("the name %q is %d bytes, and a name may be at most %d",
+			elide(name), len(name), MaxNameBytes)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '-' || r == '.':
+		default:
+			return fmt.Errorf("the name %q contains %q; a name may use only letters, digits, and _-.",
+				elide(name), r)
+		}
+	}
+	return nil
+}
+
 // elide shortens a caller's string for an error message. Quoting the key back is
 // how a caller knows which tag was refused, and a key that broke the length
 // limit is by definition too long to repeat. It cuts on a rune boundary, so the
@@ -189,6 +251,7 @@ func elide(s string) string {
 // silently could not.
 type Info struct {
 	ID        string
+	Name      string
 	State     State
 	Reason    StopReason
 	CreatedAt time.Time
@@ -303,6 +366,12 @@ type Sandbox struct {
 	// their run cost would otherwise get nothing.
 	finalStats runtime.Stats
 
+	// snapshotRef is the disk snapshot a suspended sandbox can be resumed from, or
+	// nil when the sandbox is not suspended. Guarded by mu: Suspend sets it and
+	// Resume and stop read it, all under the lock. It is discarded when the sandbox
+	// is stopped or resumed, so a snapshot never outlives the sandbox that owns it.
+	snapshotRef *runtime.SnapshotRef
+
 	stopOnce sync.Once
 }
 
@@ -349,6 +418,27 @@ type Manager struct {
 	// so most of what it read would not count. An entry is deleted at zero, which
 	// is what stops this growing with every tenant that ever called.
 	live map[string]int
+
+	// named indexes running sandboxes by their caller-chosen name, per tenant, so
+	// get-or-create resolves a name without walking the map and a plain named
+	// create can refuse a collision. An entry is added when a create publishes and
+	// removed when the sandbox stops, so the name frees the instant its VM does.
+	named map[nameKey]*Sandbox
+
+	// naming holds the names of creates that are still booting: reserved before the
+	// VM exists so a second create for the same name loses the race here, under the
+	// lock, rather than by both booting a VM and one then failing to publish. The
+	// create clears its own entry -- promoting it into named on success, dropping it
+	// on failure -- so nothing here outlives the create that put it in.
+	naming map[nameKey]struct{}
+}
+
+// nameKey scopes a name to a tenant. A struct rather than a joined string so
+// there is no separator two callers could straddle: a tenant of "a" and a name
+// of "b:c" must never collide with a tenant of "a:b" and a name of "c".
+type nameKey struct {
+	tenant string
+	name   string
 }
 
 // Option configures a Manager.
@@ -418,6 +508,8 @@ func NewManager(rt runtime.Runtime, logs *logstore.Store, log *slog.Logger, opts
 		log:       log,
 		sandboxes: make(map[string]*Sandbox),
 		live:      make(map[string]int),
+		named:     make(map[nameKey]*Sandbox),
+		naming:    make(map[nameKey]struct{}),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -484,6 +576,19 @@ func (e *ConcurrencyLimitError) Error() string {
 	return fmt.Sprintf("this tenant has %d sandboxes running and may have %d at once", e.Live, e.Max)
 }
 
+// NameConflictError is a named create refused because the name is already taken
+// by a running sandbox of the same tenant.
+//
+// Typed so the caller-facing layer can answer it as the 409 it is rather than as
+// a generic failure, and so a caller can tell it from every other reason a create
+// is refused: a name collision is fixed by picking another name or by asking for
+// get-or-create, not by retrying or by deleting a sandbox.
+type NameConflictError struct{ Name string }
+
+func (e *NameConflictError) Error() string {
+	return fmt.Sprintf("a running sandbox named %q already exists", e.Name)
+}
+
 // reserve takes one of the tenant's concurrency slots, or reports the cap.
 //
 // The count is incremented whether or not there is a limit, because the cheap
@@ -531,15 +636,141 @@ func (m *Manager) release(tenant string) {
 	delete(m.live, tenant)
 }
 
+// reserveName resolves a create's name against the sandboxes already using it,
+// and holds a booting reservation when the name is free.
+//
+// It returns the existing sandbox when one is running under this name and the
+// caller asked for get-or-create -- that is the whole feature, a name that hands
+// back the VM it already refers to -- and a *NameConflictError when the name is
+// taken and the caller did not. A free name is recorded in naming and the caller
+// must clear it: publishName on success, abandonName on failure.
+//
+// An in-flight create for the same name is a conflict even for get-or-create.
+// The in-flight one has published no sandbox to hand back yet, and blocking until
+// it does would tie this request's fate to another's -- a create that fails would
+// take a get-or-create waiting behind it down with it.
+func (m *Manager) reserveName(tenant, name string, getOrCreate bool) (existing *Sandbox, err error) {
+	if name == "" {
+		return nil, nil // anonymous; nothing to reserve
+	}
+	key := nameKey{tenant, name}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if sb, ok := m.named[key]; ok {
+		if getOrCreate {
+			return sb, nil
+		}
+		return nil, &NameConflictError{Name: name}
+	}
+	if _, booting := m.naming[key]; booting {
+		return nil, &NameConflictError{Name: name}
+	}
+	m.naming[key] = struct{}{}
+	return nil, nil
+}
+
+// publishName promotes a booting reservation to the running index once its
+// sandbox is live and listed. The name is what a later get-or-create finds.
+func (m *Manager) publishName(tenant, name string, sb *Sandbox) {
+	if name == "" {
+		return
+	}
+	key := nameKey{tenant, name}
+	m.mu.Lock()
+	delete(m.naming, key)
+	m.named[key] = sb
+	m.mu.Unlock()
+}
+
+// abandonName drops a booting reservation whose create failed before it
+// published. It touches only naming, so it is safe to defer unconditionally: a
+// create that did publish clears its naming entry there and this becomes a no-op.
+func (m *Manager) abandonName(tenant, name string) {
+	if name == "" {
+		return
+	}
+	key := nameKey{tenant, name}
+	m.mu.Lock()
+	delete(m.naming, key)
+	m.mu.Unlock()
+}
+
+// releaseName frees a published name when its sandbox stops.
+//
+// Only when the index still points at that sandbox: a name reused after a stop
+// binds a new sandbox, and the old holder's teardown must not delete the new
+// binding. Stop runs once, so this cannot race with itself.
+func (m *Manager) releaseName(tenant, name string, sb *Sandbox) {
+	if name == "" {
+		return
+	}
+	key := nameKey{tenant, name}
+	m.mu.Lock()
+	if m.named[key] == sb {
+		delete(m.named, key)
+	}
+	m.mu.Unlock()
+}
+
 // Create starts a sandbox and begins enforcing its lifetime.
+//
+// A named create is refused with *NameConflictError when the tenant already has a
+// running sandbox of that name. GetOrCreate is the variant that hands the
+// existing one back instead of refusing.
 func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
+	sb, _, err := m.create(ctx, spec, false)
+	return sb, err
+}
+
+// GetOrCreate returns the tenant's running sandbox of spec.Name when one exists,
+// and otherwise creates it. The bool is true when a VM was booted and false when
+// an existing sandbox was handed back -- which is how the API answers 201 for one
+// and 200 for the other.
+//
+// An existing sandbox is returned exactly as it stands: the rest of spec is the
+// shape a create would have used, and it is ignored when there is nothing to
+// create. That is the point of the call -- "the sandbox called build, or a new
+// one" -- and it is why the shape is not diffed against the existing VM.
+func (m *Manager) GetOrCreate(ctx context.Context, spec Spec) (*Sandbox, bool, error) {
+	return m.create(ctx, spec, true)
+}
+
+// create boots a sandbox and begins enforcing its lifetime, or, when getOrCreate
+// is set and the name is taken by a running sandbox, hands that one back. The
+// bool reports whether a VM was booted.
+func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*Sandbox, bool, error) {
 	spec.applyDefaults()
+
+	// The name is resolved before anything is spent on this create: a
+	// get-or-create hit returns the existing VM without booting a second one or
+	// charging a slot, and a plain collision is refused here rather than after a
+	// boot. A free name is held in naming until this create publishes or gives up.
+	existing, err := m.reserveName(spec.Tenant, spec.Name, getOrCreate)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return existing, false, nil
+	}
+	// Unwind the reservation on every failure path below. Set true at the publish
+	// point, where the name moves from naming into named; until then a return here
+	// must free it, or the name is wedged for the daemon's life.
+	namePublished := false
+	if spec.Name != "" {
+		defer func() {
+			if !namePublished {
+				m.abandonName(spec.Tenant, spec.Name)
+			}
+		}()
+	}
 
 	// Reserved before the VM boots, not counted after it has. Two creates that
 	// both read a count and then raised it would both pass, so the cap would hold
 	// everywhere except under the concurrency that makes it matter.
 	if err := m.reserve(spec.Tenant, spec.MaxConcurrent); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// The source is fetched here, before a VM exists, and the slot above is
@@ -550,7 +781,7 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 	seed, err := m.prepareSeed(ctx, spec)
 	if err != nil {
 		m.release(spec.Tenant)
-		return nil, err
+		return nil, false, err
 	}
 	if seed != nil {
 		defer seed.Close()
@@ -581,7 +812,7 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 			// would let a node that is failing to boot VMs slowly lock a tenant out
 			// of the cap it never spent.
 			m.release(spec.Tenant)
-			return nil, err
+			return nil, false, err
 		}
 	}
 
@@ -638,7 +869,7 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 			_ = sb.Stop(stopCtx, ReasonFailed)
 			cancel()
 			sb.log.Error("sandbox destroyed because seeding failed", "err", err)
-			return nil, err
+			return nil, false, err
 		}
 		sb.source = ptrTo(seed.Result())
 	}
@@ -647,8 +878,16 @@ func (m *Manager) Create(ctx context.Context, spec Spec) (*Sandbox, error) {
 	m.sandboxes[spec.ID] = sb
 	m.mu.Unlock()
 
-	sb.log.Info("sandbox created", "ttl", spec.TTL, "idle_timeout", spec.IdleTimeout)
-	return sb, nil
+	// After the sandbox is listed, so the name a get-or-create resolves always
+	// points at a sandbox already reachable by every other route. namePublished
+	// stands the deferred cleanup down: the name is named's now, not naming's.
+	if spec.Name != "" {
+		m.publishName(spec.Tenant, spec.Name, sb)
+		namePublished = true
+	}
+
+	sb.log.Info("sandbox created", "ttl", spec.TTL, "idle_timeout", spec.IdleTimeout, "name", spec.Name)
+	return sb, true, nil
 }
 
 // ptrTo keeps one copy of a seed's result on the sandbox. A value rather than the
@@ -803,6 +1042,22 @@ func (m *Manager) Get(id string) (*Sandbox, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	sb, ok := m.sandboxes[id]
+	return sb, ok
+}
+
+// GetByName returns a tenant's running sandbox of the given name.
+//
+// Only running ones are indexed, so a stopped sandbox is never found here even
+// while it is still listed under its ID: a name is a live handle, and resolving
+// it to a dead VM would hand a caller something they cannot run on. The tenant is
+// part of the key, so one tenant cannot resolve another's name.
+func (m *Manager) GetByName(tenant, name string) (*Sandbox, bool) {
+	if name == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sb, ok := m.named[nameKey{tenant, name}]
 	return sb, ok
 }
 
@@ -1204,12 +1459,19 @@ func mergeEnv(sandboxEnv, execEnv map[string]string) map[string]string {
 	return out
 }
 
-// beginExec registers an exec in flight, refusing if the sandbox is gone.
+// beginExec registers an exec in flight, refusing if the sandbox is gone or on
+// its way out.
+//
+// stopping is checked as well as the state, because it is claimed a beat before
+// the state changes: the supervisor sets it when the TTL is up, and Suspend sets
+// it before it snapshots. An exec admitted in that window would run against a VM
+// being frozen or killed underneath it, which is exactly the race the claim
+// exists to close.
 func (s *Sandbox) beginExec() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.state != StateRunning {
+	if s.state != StateRunning || s.stopping {
 		return fmt.Errorf("sandbox %s is %s (%s)", s.id, s.state, s.reason)
 	}
 	s.running++
@@ -1290,6 +1552,16 @@ func (s *Sandbox) Signal(ctx context.Context, execID, signal string) error {
 	return s.inst.Client().Signal(ctx, execID, signal)
 }
 
+// Resize changes a running tty exec's window. It reports guestclient.ErrNotTTY
+// when the exec was not started with a tty, which the caller-facing layer answers
+// as a conflict rather than a failure.
+func (s *Sandbox) Resize(ctx context.Context, execID string, rows, cols uint16) error {
+	if err := s.requireRunning(); err != nil {
+		return err
+	}
+	return s.inst.Client().Resize(ctx, execID, rows, cols)
+}
+
 // requireRunning rejects work aimed at a sandbox that is gone, with a reason
 // rather than whatever obscure transport error the dead VM would produce.
 func (s *Sandbox) requireRunning() error {
@@ -1321,6 +1593,7 @@ func (s *Sandbox) Info() Info {
 
 	info := Info{
 		ID:        s.id,
+		Name:      s.spec.Name,
 		State:     state,
 		Reason:    reason,
 		CreatedAt: s.createdAt,
@@ -1380,12 +1653,23 @@ func (s *Sandbox) stop(ctx context.Context, reason StopReason) error {
 	// manager's lock and nothing else in this package holds the two together.
 	s.mgr.release(s.spec.Tenant)
 
+	// The name frees with the slot and for the same reason: a stopped sandbox is
+	// still listed, but a caller must be able to re-create "build" the instant the
+	// old one dies. releaseName no-ops when the name has already been rebound, so a
+	// stop that lost the race to a re-create cannot delete the winner's binding.
+	s.mgr.releaseName(s.spec.Tenant, s.spec.Name, s)
+
 	// Any exec still streaming is about to have its VM pulled out from under
 	// it. Mark those records now so a caller polling for a result is told the
 	// sandbox vanished rather than waiting for an exit that will never come.
 	s.mgr.logs.SandboxGone(s.id)
 
 	s.cancelSupervisor()
+
+	// A suspended sandbox carries a disk snapshot; stopping it for good reclaims
+	// that snapshot, which is otherwise a full copy of a guest's RAM left at rest
+	// with nothing able to open it again.
+	s.discardSnapshot(ctx)
 
 	err := s.inst.Stop(ctx)
 
@@ -1420,6 +1704,11 @@ func (s *Sandbox) Reason() StopReason {
 // hands the sandbox over: a sandbox ID is not a capability, and a sandbox with no
 // tenant belongs to no caller.
 func (s *Sandbox) Tenant() string { return s.spec.Tenant }
+
+// Name is the caller-chosen handle the sandbox was created with, or empty for an
+// anonymous one. Fixed at creation and never from a request afterwards, so no
+// lock, like Tenant.
+func (s *Sandbox) Name() string { return s.spec.Name }
 
 // Tags returns the sandbox's labels, or nil when it has none.
 //

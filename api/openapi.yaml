@@ -126,6 +126,13 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/SandboxCreateParams' }
       responses:
+        '200':
+          description: |
+            An existing sandbox, returned by `get_or_create` because one of your
+            running sandboxes already has this `name`. Nothing was booted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
         '201':
           description: The sandbox is running and ready.
           content:
@@ -288,6 +295,63 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/CapacityExhausted' }
 
+  /sandboxes/{sandbox}/suspend:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: suspendSandbox
+      summary: Suspend a sandbox
+      description: |
+        Snapshot the sandbox's VM to disk and tear the VM down, leaving the
+        sandbox resumable under the same id with `POST
+        /sandboxes/{sandbox}/resume`. It is the durable half of resume-after-stop:
+        a suspended sandbox costs no CPU or memory, only the snapshot on disk.
+
+        Its slot and name are kept, not released, so a later resume is guaranteed
+        both and cannot be refused for either. It is not swept like a stopped
+        sandbox — it is kept until you resume or delete it.
+
+        An execution in flight is a `409`: freezing the VM would capture the
+        process mid-run. Finish or cancel it, then suspend. A node not configured
+        for snapshots answers `409` too.
+      tags: [Sandboxes]
+      responses:
+        '200':
+          description: The sandbox, now `suspended`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
+  /sandboxes/{sandbox}/resume:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+    post:
+      operationId: resumeSandbox
+      summary: Resume a suspended sandbox
+      description: |
+        Boot a fresh VM from a suspended sandbox's snapshot and return it running
+        under the same id. The clock restarts: a resumed VM is a new VM with a
+        fresh TTL window.
+
+        Only a `suspended` sandbox can be resumed; a running or stopped one is a
+        `409`. Because the suspend kept the slot and name, this neither reserves
+        nor can be refused for either.
+      tags: [Sandboxes]
+      responses:
+        '200':
+          description: The sandbox, now `running` again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
   /sandboxes/{sandbox}/executions:
     parameters:
       - $ref: '#/components/parameters/SandboxId'
@@ -420,6 +484,34 @@ paths:
               schema: { $ref: '#/components/schemas/Execution' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/CapacityExhausted' }
+
+  /sandboxes/{sandbox}/executions/{execution}/resize:
+    parameters:
+      - $ref: '#/components/parameters/SandboxId'
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      operationId: resizeExecution
+      summary: Resize a TTY execution's window
+      description: |
+        Tell a `tty` execution its terminal changed size. The guest raises
+        SIGWINCH, so a full-screen program repaints to the new dimensions —
+        wire it to your own terminal's resize event to keep the two in step.
+
+        Only for executions started with `tty: true`; a plain execution has no
+        terminal to resize and is answered with a 409.
+      tags: [Executions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecutionResizeParams' }
+      responses:
+        '204': { description: The window was resized. }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/CapacityExhausted' }
 
   /sandboxes/{sandbox}/files:
@@ -959,18 +1051,27 @@ components:
 
     SandboxState:
       type: string
-      enum: [running, stopped]
+      description: |
+        - `running` — has a live VM.
+        - `stopped` — gone for good; kept only briefly for its final metering.
+        - `suspended` — snapshotted to disk and torn down, resumable under the
+          same id with `POST /sandboxes/{sandbox}/resume`. Costs no CPU or memory,
+          only the snapshot, and keeps its slot and name so a resume cannot be
+          refused for either.
+      enum: [running, stopped, suspended]
 
     SandboxStopReason:
       type: string
       description: |
-        Why a sandbox stopped. `stopped` means you asked; the rest happened to
-        it, and only `failed` means something went wrong.
+        Why a sandbox has no running VM. `stopped` means you asked; `suspended`
+        means it was snapshotted for later; the rest happened to it, and only
+        `failed` means something went wrong.
       enum:
-        - stopped   # deleted by the caller
-        - expired   # its TTL elapsed
-        - idle      # nothing ran for its idle timeout
-        - failed    # the VM died
+        - stopped     # deleted by the caller
+        - expired     # its TTL elapsed
+        - idle        # nothing ran for its idle timeout
+        - failed      # the VM died
+        - suspended   # snapshotted and torn down, resumable
 
     Sandbox:
       type: object
@@ -979,6 +1080,16 @@ components:
         id: { type: string, example: "sb_01JZ8QK3M4N5P6R7S8T9V0W1X2" }
         object: { type: string, enum: [sandbox] }
         image: { type: string, example: "python" }
+        name:
+          type: string
+          description: |
+            The handle this sandbox was created with, if any. It is unique among
+            your running sandboxes and is what `get_or_create` resolves, so you
+            can address "the sandbox called build" without storing its id.
+
+            It frees the moment the sandbox stops: create the next `build` and it
+            is a fresh VM. Absent when the sandbox was created without one.
+          example: "build"
         state: { $ref: '#/components/schemas/SandboxState' }
         stop_reason:
           allOf: [{ $ref: '#/components/schemas/SandboxStopReason' }]
@@ -1170,6 +1281,33 @@ components:
           type: string
           description: The language image.
           example: "python"
+        name:
+          type: string
+          maxLength: 64
+          description: |
+            A stable handle for this sandbox, unique among your running
+            sandboxes. Letters, digits and `_-.`, at most 64 bytes.
+
+            On its own it just labels the sandbox and makes a duplicate name a
+            409. With `get_or_create` it becomes a lookup: the same name returns
+            the sandbox you already have rather than booting a second one, so a
+            stable identity outlives any single request without you storing an id.
+
+            Scoped to your API key, so two tenants may both have a `build` and
+            neither can name the other's. It frees when the sandbox stops.
+          example: "build"
+        get_or_create:
+          type: boolean
+          default: false
+          description: |
+            When `name` already belongs to one of your running sandboxes, return
+            that sandbox instead of creating one — a 200 with the existing
+            sandbox rather than a 201 with a new one. Without it, a duplicate
+            `name` is refused with a 409.
+
+            The existing sandbox is returned as it is: the other fields here are
+            the shape a create *would* have used and are ignored when there is
+            nothing to create. Requires `name`.
         vcpus: { type: integer, minimum: 1, default: 1 }
         mem_mib: { type: integer, minimum: 128, default: 256 }
         cpu_cores:
@@ -1565,6 +1703,50 @@ components:
           type: integer
           default: 300
           description: Kills the process group when exceeded.
+        tty:
+          type: boolean
+          default: false
+          description: |
+            Run the command against a pseudo-terminal instead of pipes. The
+            process sees an interactive terminal, so line editing, colour and
+            programs that refuse to run without one all work.
+
+            stdout and stderr are merged — a terminal has one output stream — so
+            everything arrives on `stdout`. Resize the window with the resize
+            route, and stream input through the stdin route as keystrokes.
+        rows:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: |
+            Initial terminal height in rows, for a `tty` execution. Defaults to
+            24 when omitted; ignored without `tty`.
+          example: 24
+        cols:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: |
+            Initial terminal width in columns, for a `tty` execution. Defaults to
+            80 when omitted; ignored without `tty`.
+          example: 80
+
+    ExecutionResizeParams:
+      type: object
+      required: [rows, cols]
+      properties:
+        rows:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The new terminal height, in rows.
+          example: 40
+        cols:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The new terminal width, in columns.
+          example: 120
 
     ExecutionCancelParams:
       type: object

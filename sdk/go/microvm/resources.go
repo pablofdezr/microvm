@@ -25,6 +25,24 @@ func (s *SandboxService) Create(ctx context.Context, params SandboxCreateParams,
 	return &out, err
 }
 
+// GetOrCreate returns your running sandbox of the given name if one exists, and
+// otherwise creates it from params.
+//
+// It is how a stable identity outlives a single process: name a sandbox once,
+// then reach "the one called build" again from anywhere without storing its id.
+// name is filled in for you and get_or_create is set; the rest of params is the
+// shape used only when there is nothing to reuse, and ignored when a sandbox of
+// that name is already running. Two callers racing this with the same name get
+// the same sandbox, not two.
+func (s *SandboxService) GetOrCreate(ctx context.Context, name string, params SandboxCreateParams, opts ...RequestOption) (*Sandbox, error) {
+	params.Name = &name
+	getOrCreate := true
+	params.GetOrCreate = &getOrCreate
+	var out Sandbox
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes", params, &out, opts...)
+	return &out, err
+}
+
 // TarballSource builds the Source of a create that seeds the sandbox from a tar
 // or tar.gz archive.
 //
@@ -95,6 +113,29 @@ func (s *SandboxService) Extend(ctx context.Context, sandboxID string, ttlSecond
 	var out Sandbox
 	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/extend",
 		SandboxExtendParams{TtlSeconds: ttlSeconds}, &out, append(opts, replayable)...)
+	return &out, err
+}
+
+// Suspend snapshots the sandbox's VM to disk and tears the VM down, leaving it
+// resumable under the same id with Resume.
+//
+// A suspended sandbox costs no CPU or memory, only the snapshot, and keeps its
+// slot and name so a later Resume is guaranteed both. It is kept until you resume
+// or delete it, unlike a stopped sandbox. An execution in flight is refused with a
+// conflict (see IsConflict); finish or cancel it first. It needs a node configured
+// for snapshots.
+func (s *SandboxService) Suspend(ctx context.Context, sandboxID string, opts ...RequestOption) (*Sandbox, error) {
+	var out Sandbox
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/suspend", nil, &out, opts...)
+	return &out, err
+}
+
+// Resume boots a fresh VM from a suspended sandbox's snapshot and returns it
+// running under the same id, with a fresh TTL window. Only a suspended sandbox can
+// be resumed; a running or stopped one is a conflict.
+func (s *SandboxService) Resume(ctx context.Context, sandboxID string, opts ...RequestOption) (*Sandbox, error) {
+	var out Sandbox
+	err := s.c.do(ctx, http.MethodPost, "/sandboxes/"+sandboxID+"/resume", nil, &out, opts...)
 	return &out, err
 }
 
@@ -249,6 +290,19 @@ func (s *ExecutionService) Cancel(ctx context.Context, sandboxID, executionID st
 	err := s.c.do(ctx, http.MethodPost,
 		"/sandboxes/"+sandboxID+"/executions/"+executionID+"/cancel", params, &out)
 	return &out, err
+}
+
+// Resize changes a running tty execution's terminal size, so a full-screen
+// program inside repaints to the new dimensions. Wire it to your own terminal's
+// resize event to keep the two in step.
+//
+// Only for an execution started with Tty set: a plain one has no terminal and is
+// refused with a conflict (see IsConflict). A resize is a set, not an increment,
+// so retrying it lands on the same window and is safe.
+func (s *ExecutionService) Resize(ctx context.Context, sandboxID, executionID string, rows, cols int, opts ...RequestOption) error {
+	return s.c.do(ctx, http.MethodPost,
+		"/sandboxes/"+sandboxID+"/executions/"+executionID+"/resize",
+		ExecutionResizeParams{Rows: rows, Cols: cols}, nil, append(opts, replayable)...)
 }
 
 // FileService is the /v1/sandboxes/{sandbox}/files resource.

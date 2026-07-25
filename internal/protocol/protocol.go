@@ -61,12 +61,30 @@ type ExecRequest struct {
 	// For interactive input use the streaming stdin endpoint instead.
 	Stdin []byte `json:"stdin,omitempty"`
 
-	// TTY allocates a pty and merges stderr into stdout.
+	// TTY allocates a pty and runs the process against it. stderr is merged into
+	// stdout -- a terminal has one output stream -- and the process sees an
+	// interactive terminal, so line editing, colour and programs that refuse to
+	// run without one all work. Output arrives as stdout frames.
 	TTY bool `json:"tty,omitempty"`
+
+	// Rows and Cols are the initial window size of the pty, used only when TTY is
+	// set. Zero leaves the kernel default (usually 0x0, which some programs read
+	// as "no size known"); the host fills in a sensible default. Resize later with
+	// the resize route.
+	Rows uint16 `json:"rows,omitempty"`
+	Cols uint16 `json:"cols,omitempty"`
 
 	// Timeout kills the process group when exceeded. Zero means no limit; the
 	// host is expected to always set one.
 	Timeout time.Duration `json:"timeout,omitempty"`
+}
+
+// ResizeRequest tells the agent a TTY exec's window changed size. A terminal
+// program is told through SIGWINCH, which the kernel raises when the pty's size
+// is set, so a full-screen program repaints to the new dimensions.
+type ResizeRequest struct {
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
 }
 
 // Frame is one NDJSON record in an exec's output stream.
@@ -99,6 +117,30 @@ type Frame struct {
 type SignalRequest struct {
 	// Signal is a name such as "SIGTERM" or "SIGKILL".
 	Signal string `json:"signal"`
+}
+
+// NetConfigRequest reconfigures the guest's network interface after a snapshot
+// restore.
+//
+// A snapshot carries the guest's IP in its memory image, so every VM restored
+// from one template would come back claiming the template's address. The host
+// gives each restore its own netpool slot -- a fresh host TAP and /30 -- and then
+// tells the guest, through this, to take the matching address. It travels over
+// vsock, which is independent of the guest's IP, so it works before the network
+// is right rather than depending on the very thing it is fixing.
+type NetConfigRequest struct {
+	// Iface is the interface to reconfigure, e.g. "eth0".
+	Iface string `json:"iface"`
+	// IP is the new address in CIDR form, e.g. "10.0.0.2/30". Empty leaves the
+	// interface unaddressed (loopback-only).
+	IP string `json:"ip,omitempty"`
+	// Gateway is the default route, or empty for none.
+	Gateway string `json:"gateway,omitempty"`
+	// MTU sets the interface MTU when non-zero.
+	MTU int `json:"mtu,omitempty"`
+	// DNS is a comma-separated list of nameservers written to resolv.conf, or
+	// empty to leave it unchanged.
+	DNS string `json:"dns,omitempty"`
 }
 
 // HealthResponse is returned by the agent's readiness endpoint. The host polls

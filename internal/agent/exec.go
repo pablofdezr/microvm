@@ -18,19 +18,38 @@ import (
 // JSON overhead; larger ones add latency to interactive output.
 const chunkSize = 32 * 1024
 
-var errNotFound = errors.New("exec not found")
+var (
+	errNotFound = errors.New("exec not found")
+	// errNotTTY is a resize aimed at an exec that has no pty, and errTTYUnsupported
+	// a tty exec on a platform with no ptys at all. They are kept apart because they
+	// mean different things: the first is the caller resizing the wrong exec, the
+	// second is the guest image being run somewhere it cannot serve a terminal.
+	// errTTYUnsupported is used only in the non-Linux build (see pty_other.go); it
+	// lives here so both builds share one definition.
+	errNotTTY         = errors.New("exec has no tty to resize")
+	errTTYUnsupported = errors.New("tty is not supported on this platform")
+)
 
-// process is a command running inside the guest, tracked so that later signal
-// and stdin calls can find it.
+// process is a command running inside the guest, tracked so that later signal,
+// stdin and resize calls can find it.
 type process struct {
 	id  string
 	cmd *exec.Cmd
 
 	// pgid is the process group of the command. Signals go to the whole group
-	// so that a shell's children die with it.
+	// so that a shell's children die with it. Both the plain and the tty path put
+	// the child in its own group whose id equals its pid -- Setpgid for one,
+	// Setsid for the other -- so -pgid reaches every descendant either way.
 	pgid int
 
-	stdin io.WriteCloser
+	// stdin is where the caller's input goes: the command's stdin pipe for a plain
+	// exec, the pty master for a tty one. An io.Writer, not a WriteCloser, because
+	// the two ends are closed differently -- see closeStdin.
+	stdin io.Writer
+
+	// pty is the pseudo-terminal a tty exec runs against, or nil for a plain one.
+	// It owns the master and slave and is what resize acts on.
+	pty *ptyPair
 
 	// done is closed once the process has been reaped.
 	done chan struct{}
@@ -38,6 +57,30 @@ type process struct {
 	// timedOut records that the agent, not the caller, killed the process.
 	mu       sync.Mutex
 	timedOut bool
+}
+
+// closeStdin ends the caller's input to the process.
+//
+// For a plain exec it closes the stdin pipe, so a program reading to EOF proceeds.
+// A pty has no half-close -- closing the master hangs the session up and takes the
+// output with it -- so for a tty exec this is a no-op, and the caller ends input
+// in band (Ctrl-D) or by cancelling the exec.
+func (p *process) closeStdin() error {
+	if p.pty != nil {
+		return nil
+	}
+	if c, ok := p.stdin.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// resize changes a tty exec's window, or reports errNotTTY for a plain one.
+func (p *process) resize(rows, cols uint16) error {
+	if p.pty == nil {
+		return errNotTTY
+	}
+	return p.pty.resize(rows, cols)
 }
 
 func (p *process) markTimedOut() {
@@ -99,6 +142,10 @@ func (r *registry) remove(id string) {
 //
 // ctx cancellation (the host hanging up the HTTP request) kills the process
 // group: an aborted stream must not leave orphans burning CPU in the guest.
+//
+// A tty request runs the command against a pseudo-terminal instead of pipes; the
+// two paths diverge only in how the process is wired up and rejoin at drive,
+// which owns the frame loop, the watchdog and the terminal frame.
 func (a *Agent) run(ctx context.Context, req protocol.ExecRequest, emit func(protocol.Frame) error) error {
 	cmd := exec.Command(req.Cmd, req.Args...)
 	cmd.Dir = a.workdir
@@ -107,6 +154,15 @@ func (a *Agent) run(ctx context.Context, req protocol.ExecRequest, emit func(pro
 	}
 	cmd.Env = buildEnv(req.Env)
 
+	if req.TTY {
+		return a.runTTY(ctx, cmd, req, emit)
+	}
+	return a.runPlain(ctx, cmd, req, emit)
+}
+
+// runPlain wires the command to pipes, keeping stdout and stderr as separate
+// streams, and drives it to completion.
+func (a *Agent) runPlain(ctx context.Context, cmd *exec.Cmd, req protocol.ExecRequest, emit func(protocol.Frame) error) error {
 	// Setpgid puts the child in a new process group whose ID equals its PID, so
 	// that killing -PID reaches every descendant it spawns.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -139,21 +195,6 @@ func (a *Agent) run(ctx context.Context, req protocol.ExecRequest, emit func(pro
 	defer a.execs.remove(req.ID)
 	defer close(p.done)
 
-	if err := emit(protocol.Frame{Type: protocol.FrameStarted, PID: cmd.Process.Pid}); err != nil {
-		_ = p.signal(syscall.SIGKILL)
-		_ = cmd.Wait()
-		return err
-	}
-
-	if len(req.Stdin) > 0 {
-		// Write in the background: a large payload can block until the process
-		// drains it, and the process may never read at all.
-		go func() {
-			_, _ = stdin.Write(req.Stdin)
-			_ = stdin.Close()
-		}()
-	}
-
 	// frames carries output from both pipe readers to the single emitting
 	// goroutine below, since emit is not safe for concurrent use.
 	frames := make(chan protocol.Frame, 16)
@@ -166,6 +207,84 @@ func (a *Agent) run(ctx context.Context, req protocol.ExecRequest, emit func(pro
 		close(frames)
 	}()
 
+	return a.drive(ctx, req, p, frames, emit)
+}
+
+// runTTY allocates a pseudo-terminal, runs the command against it as its
+// controlling terminal, and drives it to completion. stderr is merged into
+// stdout because a terminal has one output stream, so every frame is a stdout
+// frame.
+func (a *Agent) runTTY(ctx context.Context, cmd *exec.Cmd, req protocol.ExecRequest, emit func(protocol.Frame) error) error {
+	pty, err := openPTY(req.Rows, req.Cols)
+	if err != nil {
+		return fmt.Errorf("allocate tty: %w", err)
+	}
+
+	// The slave is the process's stdin, stdout and stderr. Setsid makes the child a
+	// session leader -- with a process group whose ID is its PID, so -PID still
+	// reaches the whole group -- and Setctty makes the slave (fd 0) its controlling
+	// terminal, which is what lets it receive SIGWINCH and job-control signals.
+	cmd.Stdin = pty.slaveFile()
+	cmd.Stdout = pty.slaveFile()
+	cmd.Stderr = pty.slaveFile()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+
+	if err := cmd.Start(); err != nil {
+		pty.close()
+		return fmt.Errorf("start %s: %w", req.Cmd, err)
+	}
+	// The parent keeps only the master. Dropping the slave is also what makes a
+	// read of the master return EIO once the child exits, which is how the pump
+	// learns the process is gone -- a pty master never reports a clean EOF.
+	pty.closeSlave()
+
+	p := &process{
+		id:    req.ID,
+		cmd:   cmd,
+		pgid:  cmd.Process.Pid, // equals the pgid thanks to Setsid
+		stdin: pty.masterFile(),
+		pty:   pty,
+		done:  make(chan struct{}),
+	}
+	a.execs.add(p)
+	defer a.execs.remove(req.ID)
+	defer close(p.done)
+	defer pty.close()
+
+	frames := make(chan protocol.Frame, 16)
+	var pumps sync.WaitGroup
+	pumps.Add(1)
+	// pump treats the master's EIO-on-exit as the end of the stream, the same way
+	// it treats a pipe's EOF: any read error ends the pump without an error frame.
+	go pump(&pumps, pty.masterFile(), protocol.FrameStdout, frames)
+	go func() {
+		pumps.Wait()
+		close(frames)
+	}()
+
+	return a.drive(ctx, req, p, frames, emit)
+}
+
+// drive runs a started process to completion: it emits FrameStarted, feeds any
+// initial stdin, streams frames to the caller, enforces the timeout and abort,
+// and emits the terminal frame. It is the half runPlain and runTTY share.
+func (a *Agent) drive(ctx context.Context, req protocol.ExecRequest, p *process, frames <-chan protocol.Frame, emit func(protocol.Frame) error) error {
+	if err := emit(protocol.Frame{Type: protocol.FrameStarted, PID: p.cmd.Process.Pid}); err != nil {
+		_ = p.signal(syscall.SIGKILL)
+		_ = p.cmd.Wait()
+		return err
+	}
+
+	if len(req.Stdin) > 0 {
+		// Write in the background: a large payload can block until the process
+		// drains it, and the process may never read at all. closeStdin is the
+		// EOF a plain exec needs and the no-op a tty one wants.
+		go func() {
+			_, _ = p.stdin.Write(req.Stdin)
+			_ = p.closeStdin()
+		}()
+	}
+
 	// Watchdogs: either the caller aborts or the deadline passes. Both escalate
 	// to the process group rather than the leader alone.
 	watchDone := make(chan struct{})
@@ -175,17 +294,17 @@ func (a *Agent) run(ctx context.Context, req protocol.ExecRequest, emit func(pro
 	var emitErr error
 	for f := range frames {
 		if emitErr != nil {
-			continue // drain so the pumps can finish and the pipes close
+			continue // drain so the pumps can finish and the streams close
 		}
 		if err := emit(f); err != nil {
 			emitErr = err
 			// The host is gone. Kill the process so we stop producing output
-			// nobody will read, then keep draining until the pipes close.
+			// nobody will read, then keep draining until the streams close.
 			_ = p.signal(syscall.SIGKILL)
 		}
 	}
 
-	waitErr := cmd.Wait()
+	waitErr := p.cmd.Wait()
 	if emitErr != nil {
 		return emitErr
 	}

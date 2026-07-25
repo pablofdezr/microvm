@@ -64,6 +64,11 @@ const (
 
 	CodeSandboxNotRunning = "sandbox_not_running"
 	CodeAlreadyExists     = "resource_already_exists"
+	CodeExecutionNotTTY   = "execution_not_tty"
+
+	CodeSnapshotUnsupported = "snapshot_unsupported"
+	CodeSandboxBusy         = "sandbox_busy"
+	CodeNotSuspended        = "sandbox_not_suspended"
 
 	CodeIdempotencyKeyReused = "idempotency_key_reused"
 

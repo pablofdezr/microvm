@@ -84,18 +84,40 @@ func (c *Client) CreateSnapshot(ctx context.Context, statePath, memPath string) 
 	})
 }
 
+// NetOverride remaps one of a snapshot's network interfaces onto a different host
+// TAP at load time.
+//
+// A snapshot names the host TAP each interface was attached to in its device
+// state, so a plain restore comes back on that TAP -- which no longer exists, or
+// worse belongs to whatever sandbox the netpool has since issued it to. An
+// override points the interface at a fresh TAP instead, which is what lets a
+// networked VM be restored onto its own netpool slot. The guest still has to
+// re-address itself over vsock afterwards; this only fixes the host side.
+type NetOverride struct {
+	IfaceID     string `json:"iface_id"`
+	HostDevName string `json:"host_dev_name"`
+}
+
 // LoadSnapshot restores a VM from a snapshot, resuming it in the same call when
 // resume is true. It is issued against a fresh VMM that has never started a
 // microVM -- Firecracker refuses a load once one has.
-func (c *Client) LoadSnapshot(ctx context.Context, statePath, memPath string, resume bool) error {
-	// A load is not a read of the memory file: Firecracker maps it, so this
-	// returns in milliseconds however large the guest is (6ms measured for a
-	// 512 MiB guest). It is a control call.
-	return c.do(ctx, controlTimeout, http.MethodPut, "/snapshot/load", map[string]any{
+//
+// netOverrides remaps the snapshot's network interfaces onto fresh host TAPs; it
+// is nil for a restore with no networking, which is every restore the warm pool
+// does.
+func (c *Client) LoadSnapshot(ctx context.Context, statePath, memPath string, resume bool, netOverrides []NetOverride) error {
+	body := map[string]any{
 		"snapshot_path": statePath,
 		"mem_backend":   map[string]string{"backend_type": "File", "backend_path": memPath},
 		"resume_vm":     resume,
-	})
+	}
+	if len(netOverrides) > 0 {
+		body["network_overrides"] = netOverrides
+	}
+	// A load is not a read of the memory file: Firecracker maps it, so this
+	// returns in milliseconds however large the guest is (6ms measured for a
+	// 512 MiB guest). It is a control call.
+	return c.do(ctx, controlTimeout, http.MethodPut, "/snapshot/load", body)
 }
 
 func (c *Client) do(ctx context.Context, timeout time.Duration, method, path string, body any) error {

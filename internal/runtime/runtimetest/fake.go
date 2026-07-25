@@ -259,6 +259,10 @@ type Instance struct {
 	// signals records what was sent to which exec, so a test can assert that
 	// cancelling actually signalled rather than merely returning 200.
 	signals []SignalRecord
+
+	// resizes records tty window changes, so a test can assert a resize reached
+	// the guest rather than merely returning 204.
+	resizes []ResizeRecord
 }
 
 // SignalsSent returns the signals delivered to this sandbox.
@@ -272,6 +276,19 @@ func (i *Instance) SignalsSent() []SignalRecord {
 type SignalRecord struct {
 	ExecID string
 	Signal string
+}
+
+// ResizesSent returns the tty resizes delivered to this sandbox.
+func (i *Instance) ResizesSent() []ResizeRecord {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]ResizeRecord(nil), i.resizes...)
+}
+
+// ResizeRecord is one delivered window resize.
+type ResizeRecord struct {
+	ExecID     string
+	Rows, Cols uint16
 }
 
 func (i *Instance) ID() string { return i.id }
@@ -413,6 +430,16 @@ func (c *client) Signal(ctx context.Context, execID, signal string) error {
 		return fmt.Errorf("sandbox %s is gone", c.inst.id)
 	}
 	c.inst.signals = append(c.inst.signals, SignalRecord{ExecID: execID, Signal: signal})
+	return nil
+}
+
+func (c *client) Resize(ctx context.Context, execID string, rows, cols uint16) error {
+	c.inst.mu.Lock()
+	defer c.inst.mu.Unlock()
+	if c.inst.isDown {
+		return fmt.Errorf("sandbox %s is gone", c.inst.id)
+	}
+	c.inst.resizes = append(c.inst.resizes, ResizeRecord{ExecID: execID, Rows: rows, Cols: cols})
 	return nil
 }
 

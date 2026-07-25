@@ -144,12 +144,20 @@ func (s *Server) Handler() http.Handler {
 	// No Idempotency-Key: extending never brings a deadline forward, so a retry
 	// of the same call is already a no-op. Same reason as /cancel.
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/extend", read(s.handleExtendSandbox))
+	// Suspend and resume are state transitions guarded on the current state, so a
+	// retry of one either repeats a no-op or is refused by the new state -- no
+	// Idempotency-Key needed, same as extend.
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/suspend", read(s.handleSuspendSandbox))
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/resume", read(s.handleResumeSandbox))
 
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/executions", create(s.handleCreateExecution))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/executions", read(s.handleListExecutions))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/executions/{execution}", read(s.handleRetrieveExecution))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/executions/{execution}/stream", read(s.handleStreamExecution))
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/executions/{execution}/cancel", read(s.handleCancelExecution))
+	// No Idempotency-Key: a resize is a set, not an increment, so replaying one
+	// lands on the same window. Same reason as /cancel and /extend.
+	mux.Handle("POST "+p+"/sandboxes/{sandbox}/executions/{execution}/resize", read(s.handleResizeExecution))
 
 	mux.Handle("POST "+p+"/sandboxes/{sandbox}/files", read(s.handleCreateFile))
 	mux.Handle("GET "+p+"/sandboxes/{sandbox}/files", read(s.handleRetrieveFile))

@@ -328,8 +328,9 @@ func (e SandboxSourceParamsType) Valid() bool {
 
 // Defines values for SandboxState.
 const (
-	SandboxStateRunning SandboxState = "running"
-	SandboxStateStopped SandboxState = "stopped"
+	SandboxStateRunning   SandboxState = "running"
+	SandboxStateStopped   SandboxState = "stopped"
+	SandboxStateSuspended SandboxState = "suspended"
 )
 
 // Valid indicates whether the value is a known member of the SandboxState enum.
@@ -339,6 +340,8 @@ func (e SandboxState) Valid() bool {
 		return true
 	case SandboxStateStopped:
 		return true
+	case SandboxStateSuspended:
+		return true
 	default:
 		return false
 	}
@@ -346,10 +349,11 @@ func (e SandboxState) Valid() bool {
 
 // Defines values for SandboxStopReason.
 const (
-	SandboxStopReasonExpired SandboxStopReason = "expired"
-	SandboxStopReasonFailed  SandboxStopReason = "failed"
-	SandboxStopReasonIdle    SandboxStopReason = "idle"
-	SandboxStopReasonStopped SandboxStopReason = "stopped"
+	SandboxStopReasonExpired   SandboxStopReason = "expired"
+	SandboxStopReasonFailed    SandboxStopReason = "failed"
+	SandboxStopReasonIdle      SandboxStopReason = "idle"
+	SandboxStopReasonStopped   SandboxStopReason = "stopped"
+	SandboxStopReasonSuspended SandboxStopReason = "suspended"
 )
 
 // Valid indicates whether the value is a known member of the SandboxStopReason enum.
@@ -362,6 +366,8 @@ func (e SandboxStopReason) Valid() bool {
 	case SandboxStopReasonIdle:
 		return true
 	case SandboxStopReasonStopped:
+		return true
+	case SandboxStopReasonSuspended:
 		return true
 	default:
 		return false
@@ -571,16 +577,33 @@ type ExecutionCancelParams struct {
 type ExecutionCreateParams struct {
 	Args *[]string `json:"args,omitempty"`
 	Cmd  string    `json:"cmd"`
-	Cwd  *string   `json:"cwd,omitempty"`
+
+	// Cols Initial terminal width in columns, for a `tty` execution. Defaults to
+	// 80 when omitted; ignored without `tty`.
+	Cols *int    `json:"cols,omitempty"`
+	Cwd  *string `json:"cwd,omitempty"`
 
 	// Env Merged over the sandbox's env; these win. Write-only.
 	Env *map[string]string `json:"env,omitempty"`
+
+	// Rows Initial terminal height in rows, for a `tty` execution. Defaults to
+	// 24 when omitted; ignored without `tty`.
+	Rows *int `json:"rows,omitempty"`
 
 	// Stdin Written to the process, then closed.
 	Stdin *[]byte `json:"stdin,omitempty"`
 
 	// TimeoutSeconds Kills the process group when exceeded.
 	TimeoutSeconds *int `json:"timeout_seconds,omitempty"`
+
+	// Tty Run the command against a pseudo-terminal instead of pipes. The
+	// process sees an interactive terminal, so line editing, colour and
+	// programs that refuse to run without one all work.
+	//
+	// stdout and stderr are merged — a terminal has one output stream — so
+	// everything arrives on `stdout`. Resize the window with the resize
+	// route, and stream input through the stdin route as keystrokes.
+	Tty *bool `json:"tty,omitempty"`
 }
 
 // ExecutionList defines model for ExecutionList.
@@ -598,6 +621,15 @@ type ExecutionList struct {
 
 // ExecutionListObject defines model for ExecutionList.Object.
 type ExecutionListObject string
+
+// ExecutionResizeParams defines model for ExecutionResizeParams.
+type ExecutionResizeParams struct {
+	// Cols The new terminal width, in columns.
+	Cols int `json:"cols"`
+
+	// Rows The new terminal height, in rows.
+	Rows int `json:"rows"`
+}
 
 // ExecutionStatus Outcomes that all look like failure but are not, and a caller must tell
 // apart:
@@ -780,6 +812,14 @@ type Sandbox struct {
 	Image   string    `json:"image"`
 	MemMib  *int      `json:"mem_mib,omitempty"`
 
+	// Name The handle this sandbox was created with, if any. It is unique among
+	// your running sandboxes and is what `get_or_create` resolves, so you
+	// can address "the sandbox called build" without storing its id.
+	//
+	// It frees the moment the sandbox stops: create the next `build` and it
+	// is a fresh VM. Absent when the sandbox was created without one.
+	Name *string `json:"name,omitempty"`
+
 	// Network Whether filtered egress is on.
 	Network *bool         `json:"network,omitempty"`
 	Object  SandboxObject `json:"object"`
@@ -789,7 +829,14 @@ type Sandbox struct {
 	//
 	// Never the URL as it was sent. See `url_redacted`.
 	Source *SandboxSource `json:"source,omitempty"`
-	State  SandboxState   `json:"state"`
+
+	// State - `running` — has a live VM.
+	// - `stopped` — gone for good; kept only briefly for its final metering.
+	// - `suspended` — snapshotted to disk and torn down, resumable under the
+	//   same id with `POST /sandboxes/{sandbox}/resume`. Costs no CPU or memory,
+	//   only the snapshot, and keeps its slot and name so a resume cannot be
+	//   refused for either.
+	State SandboxState `json:"state"`
 
 	// Stats What a sandbox has consumed. Cumulative since boot, so a biller must
 	// diff two samples: booting alone costs a couple of CPU-seconds, and
@@ -835,12 +882,34 @@ type SandboxCreateParams struct {
 	// needed them.
 	Env *map[string]string `json:"env,omitempty"`
 
+	// GetOrCreate When `name` already belongs to one of your running sandboxes, return
+	// that sandbox instead of creating one — a 200 with the existing
+	// sandbox rather than a 201 with a new one. Without it, a duplicate
+	// `name` is refused with a 409.
+	//
+	// The existing sandbox is returned as it is: the other fields here are
+	// the shape a create *would* have used and are ignored when there is
+	// nothing to create. Requires `name`.
+	GetOrCreate *bool `json:"get_or_create,omitempty"`
+
 	// IdleSeconds Reclaim after this long with nothing running. Negative disables it.
 	IdleSeconds *int `json:"idle_seconds,omitempty"`
 
 	// Image The language image.
 	Image  string `json:"image"`
 	MemMib *int   `json:"mem_mib,omitempty"`
+
+	// Name A stable handle for this sandbox, unique among your running
+	// sandboxes. Letters, digits and `_-.`, at most 64 bytes.
+	//
+	// On its own it just labels the sandbox and makes a duplicate name a
+	// 409. With `get_or_create` it becomes a lookup: the same name returns
+	// the sandbox you already have rather than booting a second one, so a
+	// stable identity outlives any single request without you storing an id.
+	//
+	// Scoped to your API key, so two tenants may both have a `build` and
+	// neither can name the other's. It frees when the sandbox stops.
+	Name *string `json:"name,omitempty"`
 
 	// Network Filtered egress. The public internet is reachable; every private
 	// range, link-local and the cloud metadata endpoint are not.
@@ -1074,11 +1143,17 @@ type SandboxSourceParams struct {
 // wrong project delivered silently.
 type SandboxSourceParamsType string
 
-// SandboxState defines model for SandboxState.
+// SandboxState - `running` — has a live VM.
+//   - `stopped` — gone for good; kept only briefly for its final metering.
+//   - `suspended` — snapshotted to disk and torn down, resumable under the
+//     same id with `POST /sandboxes/{sandbox}/resume`. Costs no CPU or memory,
+//     only the snapshot, and keeps its slot and name so a resume cannot be
+//     refused for either.
 type SandboxState string
 
-// SandboxStopReason Why a sandbox stopped. `stopped` means you asked; the rest happened to
-// it, and only `failed` means something went wrong.
+// SandboxStopReason Why a sandbox has no running VM. `stopped` means you asked; `suspended`
+// means it was snapshotted for later; the rest happened to it, and only
+// `failed` means something went wrong.
 type SandboxStopReason string
 
 // SandboxStorage A sandbox's view of object storage. Files written here outlive the
@@ -1456,6 +1531,9 @@ type CreateExecutionJSONRequestBody = ExecutionCreateParams
 
 // CancelExecutionJSONRequestBody defines body for CancelExecution for application/json ContentType.
 type CancelExecutionJSONRequestBody = ExecutionCancelParams
+
+// ResizeExecutionJSONRequestBody defines body for ResizeExecution for application/json ContentType.
+type ResizeExecutionJSONRequestBody = ExecutionResizeParams
 
 // ExtendSandboxJSONRequestBody defines body for ExtendSandbox for application/json ContentType.
 type ExtendSandboxJSONRequestBody = SandboxExtendParams

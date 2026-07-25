@@ -2,12 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/pablofdezr/microvm/internal/api/apitypes"
+	"github.com/pablofdezr/microvm/internal/guestclient"
 	"github.com/pablofdezr/microvm/internal/id"
 	"github.com/pablofdezr/microvm/internal/logstore"
 	"github.com/pablofdezr/microvm/internal/protocol"
@@ -51,6 +53,22 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	}
 	if params.Stdin != nil {
 		req.Stdin = *params.Stdin
+	}
+	req.TTY = deref(params.Tty)
+	if req.TTY {
+		// The window dimensions are only meaningful with a tty, so they are read
+		// only here; an absent one is zero, which the agent fills with its default.
+		rows, apiErr := ttyWindow("rows", params.Rows)
+		if apiErr != nil {
+			s.writeAPIError(w, r, apiErr)
+			return
+		}
+		cols, apiErr := ttyWindow("cols", params.Cols)
+		if apiErr != nil {
+			s.writeAPIError(w, r, apiErr)
+			return
+		}
+		req.Rows, req.Cols = rows, cols
 	}
 
 	if err := sb.StartExec(req); err != nil {
@@ -213,6 +231,58 @@ func (s *Server) handleCancelExecution(w http.ResponseWriter, r *http.Request) {
 
 	updated, _ := sb.Logs(rec.ID)
 	writeJSON(w, http.StatusOK, toAPIExecution(updated))
+}
+
+// handleResizeExecution changes a tty execution's window size.
+func (s *Server) handleResizeExecution(w http.ResponseWriter, r *http.Request) {
+	sb, rec, err := s.execution(r)
+	if err != nil {
+		s.writeAPIError(w, r, err)
+		return
+	}
+
+	var params apitypes.ExecutionResizeParams
+	if err := decodeBody(w, r, &params); err != nil {
+		s.writeAPIError(w, r, err)
+		return
+	}
+	rows, apiErr := ttyWindow("rows", &params.Rows)
+	if apiErr != nil {
+		s.writeAPIError(w, r, apiErr)
+		return
+	}
+	cols, apiErr := ttyWindow("cols", &params.Cols)
+	if apiErr != nil {
+		s.writeAPIError(w, r, apiErr)
+		return
+	}
+
+	if err := sb.Resize(r.Context(), rec.ID, rows, cols); err != nil {
+		// Resizing an execution that has no terminal is the caller's own confusion,
+		// not a broken VM: a 409 with a code they can switch on, rather than the 500
+		// a transport failure would get.
+		if errors.Is(err, guestclient.ErrNotTTY) {
+			s.writeAPIError(w, r, conflictError(CodeExecutionNotTTY,
+				"This execution was not started with tty: true, so it has no terminal to resize."))
+			return
+		}
+		s.writeAPIError(w, r, s.sandboxStateError(sb, err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ttyWindow converts an optional terminal dimension into the uint16 the agent
+// takes, refusing anything outside a terminal's range. Absent (nil) is zero,
+// which the agent reads as "use the default".
+func ttyWindow(param string, v *int) (uint16, *apiError) {
+	if v == nil {
+		return 0, nil
+	}
+	if *v < 0 || *v > 65535 {
+		return 0, invalidParamError(param, "must be between 0 and 65535.")
+	}
+	return uint16(*v), nil
 }
 
 // execution resolves the {sandbox} and {execution} path values.

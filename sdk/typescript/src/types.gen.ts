@@ -182,6 +182,81 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sandboxes/{sandbox}/suspend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suspend a sandbox
+         * @description Snapshot the sandbox's VM to disk and tear the VM down, leaving the
+         *     sandbox resumable under the same id with `POST
+         *     /sandboxes/{sandbox}/resume`. It is the durable half of resume-after-stop:
+         *     a suspended sandbox costs no CPU or memory, only the snapshot on disk.
+         *
+         *     Its slot and name are kept, not released, so a later resume is guaranteed
+         *     both and cannot be refused for either. It is not swept like a stopped
+         *     sandbox — it is kept until you resume or delete it.
+         *
+         *     An execution in flight is a `409`: freezing the VM would capture the
+         *     process mid-run. Finish or cancel it, then suspend. A node not configured
+         *     for snapshots answers `409` too.
+         */
+        post: operations["suspendSandbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandbox}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume a suspended sandbox
+         * @description Boot a fresh VM from a suspended sandbox's snapshot and return it running
+         *     under the same id. The clock restarts: a resumed VM is a new VM with a
+         *     fresh TTL window.
+         *
+         *     Only a `suspended` sandbox can be resumed; a running or stopped one is a
+         *     `409`. Because the suspend kept the slot and name, this neither reserves
+         *     nor can be refused for either.
+         */
+        post: operations["resumeSandbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sandboxes/{sandbox}/executions": {
         parameters: {
             query?: never;
@@ -319,6 +394,41 @@ export interface paths {
          *     a graceful signal it can ignore is a way to outlive its own cancel.
          */
         post: operations["cancelExecution"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sandboxes/{sandbox}/executions/{execution}/resize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+                execution: components["parameters"]["ExecutionId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resize a TTY execution's window
+         * @description Tell a `tty` execution its terminal changed size. The guest raises
+         *     SIGWINCH, so a full-screen program repaints to the new dimensions —
+         *     wire it to your own terminal's resize event to keep the two in step.
+         *
+         *     Only for executions started with `tty: true`; a plain execution has no
+         *     terminal to resize and is answered with a 409.
+         */
+        post: operations["resizeExecution"];
         delete?: never;
         options?: never;
         head?: never;
@@ -671,14 +781,23 @@ export interface components {
             has_more: boolean;
             data: Record<string, never>[];
         };
-        /** @enum {string} */
-        SandboxState: "running" | "stopped";
         /**
-         * @description Why a sandbox stopped. `stopped` means you asked; the rest happened to
-         *     it, and only `failed` means something went wrong.
+         * @description - `running` — has a live VM.
+         *     - `stopped` — gone for good; kept only briefly for its final metering.
+         *     - `suspended` — snapshotted to disk and torn down, resumable under the
+         *       same id with `POST /sandboxes/{sandbox}/resume`. Costs no CPU or memory,
+         *       only the snapshot, and keeps its slot and name so a resume cannot be
+         *       refused for either.
          * @enum {string}
          */
-        SandboxStopReason: "stopped" | "expired" | "idle" | "failed";
+        SandboxState: "running" | "stopped" | "suspended";
+        /**
+         * @description Why a sandbox has no running VM. `stopped` means you asked; `suspended`
+         *     means it was snapshotted for later; the rest happened to it, and only
+         *     `failed` means something went wrong.
+         * @enum {string}
+         */
+        SandboxStopReason: "stopped" | "expired" | "idle" | "failed" | "suspended";
         Sandbox: {
             /** @example sb_01JZ8QK3M4N5P6R7S8T9V0W1X2 */
             id: string;
@@ -686,6 +805,16 @@ export interface components {
             object: "sandbox";
             /** @example python */
             image: string;
+            /**
+             * @description The handle this sandbox was created with, if any. It is unique among
+             *     your running sandboxes and is what `get_or_create` resolves, so you
+             *     can address "the sandbox called build" without storing its id.
+             *
+             *     It frees the moment the sandbox stops: create the next `build` and it
+             *     is a fresh VM. Absent when the sandbox was created without one.
+             * @example build
+             */
+            name?: string;
             state: components["schemas"]["SandboxState"];
             /** @description Set once the sandbox is stopped. */
             stop_reason?: components["schemas"]["SandboxStopReason"];
@@ -863,6 +992,32 @@ export interface components {
              * @example python
              */
             image: string;
+            /**
+             * @description A stable handle for this sandbox, unique among your running
+             *     sandboxes. Letters, digits and `_-.`, at most 64 bytes.
+             *
+             *     On its own it just labels the sandbox and makes a duplicate name a
+             *     409. With `get_or_create` it becomes a lookup: the same name returns
+             *     the sandbox you already have rather than booting a second one, so a
+             *     stable identity outlives any single request without you storing an id.
+             *
+             *     Scoped to your API key, so two tenants may both have a `build` and
+             *     neither can name the other's. It frees when the sandbox stops.
+             * @example build
+             */
+            name?: string;
+            /**
+             * @description When `name` already belongs to one of your running sandboxes, return
+             *     that sandbox instead of creating one — a 200 with the existing
+             *     sandbox rather than a 201 with a new one. Without it, a duplicate
+             *     `name` is refused with a 409.
+             *
+             *     The existing sandbox is returned as it is: the other fields here are
+             *     the shape a create *would* have used and are ignored when there is
+             *     nothing to create. Requires `name`.
+             * @default false
+             */
+            get_or_create?: boolean;
             /** @default 1 */
             vcpus?: number;
             /** @default 256 */
@@ -1234,6 +1389,41 @@ export interface components {
              * @default 300
              */
             timeout_seconds?: number;
+            /**
+             * @description Run the command against a pseudo-terminal instead of pipes. The
+             *     process sees an interactive terminal, so line editing, colour and
+             *     programs that refuse to run without one all work.
+             *
+             *     stdout and stderr are merged — a terminal has one output stream — so
+             *     everything arrives on `stdout`. Resize the window with the resize
+             *     route, and stream input through the stdin route as keystrokes.
+             * @default false
+             */
+            tty?: boolean;
+            /**
+             * @description Initial terminal height in rows, for a `tty` execution. Defaults to
+             *     24 when omitted; ignored without `tty`.
+             * @example 24
+             */
+            rows?: number;
+            /**
+             * @description Initial terminal width in columns, for a `tty` execution. Defaults to
+             *     80 when omitted; ignored without `tty`.
+             * @example 80
+             */
+            cols?: number;
+        };
+        ExecutionResizeParams: {
+            /**
+             * @description The new terminal height, in rows.
+             * @example 40
+             */
+            rows: number;
+            /**
+             * @description The new terminal width, in columns.
+             * @example 120
+             */
+            cols: number;
         };
         ExecutionCancelParams: {
             /**
@@ -1700,6 +1890,18 @@ export interface operations {
             };
         };
         responses: {
+            /**
+             * @description An existing sandbox, returned by `get_or_create` because one of your
+             *     running sandboxes already has this `name`. Nothing was booted.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sandbox"];
+                };
+            };
             /** @description The sandbox is running and ready. */
             201: {
                 headers: {
@@ -1813,6 +2015,72 @@ export interface operations {
                 };
             };
             400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    suspendSandbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sandbox, now `suspended`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sandbox"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    resumeSandbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sandbox, now `running` again. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Sandbox"];
+                };
+            };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -2016,6 +2284,43 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["CapacityExhausted"];
+        };
+    };
+    resizeExecution: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description A sandbox belongs to the tenant whose token created it, and every route
+                 *     below resolves it against the caller: another tenant's sandbox is a `404`,
+                 *     not a `403`. An ID is not a capability, and a `403` would confirm which of a
+                 *     guessed range exist. So a `404` here means one of three things -- never
+                 *     existed, already forgotten, or not yours -- and the API will not say which.
+                 */
+                sandbox: components["parameters"]["SandboxId"];
+                execution: components["parameters"]["ExecutionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionResizeParams"];
+            };
+        };
+        responses: {
+            /** @description The window was resized. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["InvalidRequest"];
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             429: components["responses"]["CapacityExhausted"];
         };
     };

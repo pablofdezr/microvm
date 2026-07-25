@@ -11,6 +11,40 @@ project aims for [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- **Resume-after-stop (suspend/resume).** `POST /sandboxes/{id}/suspend`
+  snapshots a *used* sandbox to disk and tears its VM down; `POST
+  /sandboxes/{id}/resume` boots a fresh VM from that snapshot under the same id,
+  with a fresh TTL window. A suspended sandbox costs no CPU or memory, only the
+  snapshot, and keeps its tenant slot and name so a resume is guaranteed both and
+  cannot be refused for either. It is kept until resumed or deleted, and is never
+  swept like a stopped sandbox. A new `suspended` sandbox state and `suspended`
+  stop reason. Available on the three SDKs (`Suspend`/`Resume`).
+
+  Networked sandboxes can be resumed: the restore takes a fresh netpool slot,
+  remaps its interface onto the new host TAP with Firecracker's
+  `network_overrides`, and re-addresses the guest over vsock through a new guest
+  agent route (`POST /v1/net/configure`) — so a restore comes back on its own
+  address rather than the template's, lifting the old "no networking on restore"
+  limitation. The host-side lifecycle is unit-tested against the runtime fake; the
+  networked-restore path runs only on a KVM host and has not been exercised on one
+  in this change. Still no surviving a daemon restart: a snapshot's only handle is
+  an in-memory ref, so suspend/resume works within a daemon's life, not across a
+  restart of it.
+- **Named sandboxes and get-or-create.** A create may carry a `name` (unique among
+  a tenant's running sandboxes, scoped to the API key). With `get_or_create: true`,
+  the same name returns the sandbox you already have (a 200) rather than booting a
+  second one (a 201) — a stable identity that outlives a single request without
+  storing an id. A duplicate name without `get_or_create` is a 409. The name frees
+  when the sandbox stops and survives a suspend/resume. On the three SDKs
+  (`GetOrCreate`).
+- **TTY executions.** An execution created with `tty: true` runs against a
+  pseudo-terminal in the guest instead of pipes: the process sees an interactive
+  terminal (line editing, colour, programs that refuse to run without one), and
+  stdout and stderr are merged into one stream. Initial size via `rows`/`cols`,
+  resized live with `POST /sandboxes/{id}/executions/{exe}/resize` (guest SIGWINCH).
+  The pty is allocated with raw Linux ioctls — no new dependency. On the three SDKs
+  (`resize`).
+
 - **Cold-start optimizations** (three phases):
   - *Warm build caches baked into the language images.* Each image ships a
     prewarmed cache at a fixed `/opt` path in the read-only rootfs; the guest's
@@ -39,26 +73,24 @@ project aims for [Semantic Versioning](https://semver.org).
     vsock socket, its own host listener and its own CSPRNG. What it is **not**,
     and none of this is planned-and-nearly-there:
 
-    - **No networking.** A snapshot carries the guest's MAC and IP in its memory
-      image and names its host TAP in its device state, so every restore of one
-      template would claim the same address. `Restore` refuses a networked spec
-      and the warm pool never snapshots a networked shape; those shapes cold-boot.
-      Giving a restore its own address needs the guest to reconfigure itself on
-      resume, which is a feature nobody has written.
-    - **No restoring a tenant's sandbox.** Templates are captured from VMs that
-      have run no code. Nothing here can snapshot a sandbox that has.
+    For the warm pool the restore is unnetworked (a networked shape cold-boots
+    instead, because one template restored many times would hand out one address).
+    Resume-after-stop, added later in this changelog, does restore networked
+    sandboxes — one snapshot, one restore, its own netpool slot — so the pool's
+    "no networking" is a pool policy rather than a limit of the mechanism. What
+    still holds for both:
+
     - **No surviving a restart.** A snapshot's only handle is an in-memory ref, so
-      templates are captured per daemon run, reclaimed at shutdown, and swept at
-      startup. Snapshots are a warm-pool optimisation, not storage.
+      templates and suspended sandboxes' snapshots are captured per daemon run,
+      reclaimed at shutdown, and swept at startup. Snapshots are scratch, not
+      storage.
     - A restored guest keeps the template's clock, so its `/proc/uptime` is the
       snapshot's rather than wall-clock.
 
-    Six things people reasonably expect this to unlock — sandbox persistence,
-    resume-after-stop, fork, named sandboxes, get-or-create, and sessions — are
-    **not built**. They are not blocked on anything any more, which is a change
-    from before; they are simply unwritten, and each of them needs work this
-    change does not contain (durable snapshot metadata, guest-side network
-    reconfiguration, and an identity in the API that outlives a VM).
+    Of the family people expect snapshots to unlock, **resume-after-stop, named
+    sandboxes and get-or-create are now built** (see Added). Sandbox persistence
+    across a daemon restart, fork, and sessions are not — each needs what this does
+    not have: durable snapshot metadata, or an API identity spanning several VMs.
 - **Verified boot (dm-verity)**: images built with `MICROVM_VERITY=1` ship a
   hash tree and a root-hash sidecar next to the `.ext4`, and the daemon boots
   them as a dm-verity device — the guest kernel verifies every block of the

@@ -25,7 +25,13 @@ type capturedReq struct {
 // replying 204 (as Firecracker does on success).
 func stubVMM(t *testing.T) (socket string, seen func() []capturedReq) {
 	t.Helper()
-	dir := t.TempDir()
+	// A short path, not t.TempDir(): the sun.sun_path limit is ~104 bytes and a
+	// long test name in t.TempDir() overruns it as "bind: invalid argument".
+	dir, err := os.MkdirTemp("", "fc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "fc.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
@@ -64,7 +70,7 @@ func TestPauseResumeCreateLoad(t *testing.T) {
 	if err := c.CreateSnapshot(ctx, "/snap/state", "/snap/mem"); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
-	if err := c.LoadSnapshot(ctx, "/snap/state", "/snap/mem", true); err != nil {
+	if err := c.LoadSnapshot(ctx, "/snap/state", "/snap/mem", true, nil); err != nil {
 		t.Fatalf("LoadSnapshot: %v", err)
 	}
 	if err := c.Resume(ctx); err != nil {
@@ -90,8 +96,35 @@ func TestPauseResumeCreateLoad(t *testing.T) {
 	if mb["backend_type"] != "File" || mb["backend_path"] != "/snap/mem" {
 		t.Errorf("load mem_backend wrong: %+v", reqs[2].body["mem_backend"])
 	}
+	// A load with no overrides must not send the field at all: Firecracker rejects
+	// an empty network_overrides, and the warm pool's every restore is unnetworked.
+	if _, present := reqs[2].body["network_overrides"]; present {
+		t.Errorf("load sent network_overrides for an unnetworked restore: %+v", reqs[2].body)
+	}
 	if reqs[3].body["state"] != "Resumed" {
 		t.Errorf("resume request wrong: %+v", reqs[3])
+	}
+}
+
+// A networked restore remaps the snapshot's interface onto a fresh host TAP, so
+// the restored VM does not come back on the template's -- which is gone, or is
+// somebody else's slot by now.
+func TestLoadSnapshotSendsNetworkOverrides(t *testing.T) {
+	sock, seen := stubVMM(t)
+	err := New(sock).LoadSnapshot(context.Background(), "/s", "/m", true,
+		[]NetOverride{{IfaceID: "eth0", HostDevName: "fc-tap42"}})
+	if err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+
+	reqs := seen()
+	ovr, ok := reqs[0].body["network_overrides"].([]any)
+	if !ok || len(ovr) != 1 {
+		t.Fatalf("network_overrides missing or wrong shape: %+v", reqs[0].body)
+	}
+	first, _ := ovr[0].(map[string]any)
+	if first["iface_id"] != "eth0" || first["host_dev_name"] != "fc-tap42" {
+		t.Errorf("override wrong: %+v", first)
 	}
 }
 
@@ -109,7 +142,7 @@ func TestErrorStatusIsReported(t *testing.T) {
 	go srv.Serve(l)
 	t.Cleanup(func() { srv.Close() })
 
-	if err := New(sock).LoadSnapshot(context.Background(), "/s", "/m", true); err == nil {
+	if err := New(sock).LoadSnapshot(context.Background(), "/s", "/m", true, nil); err == nil {
 		t.Fatal("expected an error on a 400 response")
 	}
 }

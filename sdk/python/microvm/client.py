@@ -301,11 +301,41 @@ class Sandboxes:
         """Boot a sandbox. Raises APIError with is_capacity when the node is full."""
         return self._c._request("POST", "/sandboxes", body={"image": image, **params})
 
+    def get_or_create(self, image: str, name: str, **params: Any) -> dict:
+        """Return your running sandbox of ``name`` if one exists, else create it.
+
+        It is how a stable identity outlives a single process: name a sandbox once,
+        then reach "the one called build" again from anywhere without storing its
+        id. ``name`` and ``get_or_create`` are set for you; the rest is the shape
+        used only when there is nothing to reuse, and ignored when a sandbox of that
+        name is already running."""
+        return self._c._request(
+            "POST",
+            "/sandboxes",
+            body={"image": image, "name": name, "get_or_create": True, **params},
+        )
+
     def retrieve(self, sandbox_id: str) -> dict:
         return self._c._request("GET", f"/sandboxes/{sandbox_id}")
 
     def delete(self, sandbox_id: str) -> dict:
         return self._c._request("DELETE", f"/sandboxes/{sandbox_id}")
+
+    def suspend(self, sandbox_id: str) -> dict:
+        """Snapshot the sandbox's VM to disk and tear the VM down, leaving it
+        resumable under the same id with ``resume``.
+
+        A suspended sandbox costs no CPU or memory, only the snapshot, and keeps
+        its slot and name so a later ``resume`` is guaranteed both. It is kept
+        until you resume or delete it. An execution in flight is refused with a
+        conflict; finish or cancel it first."""
+        return self._c._request("POST", f"/sandboxes/{sandbox_id}/suspend")
+
+    def resume(self, sandbox_id: str) -> dict:
+        """Boot a fresh VM from a suspended sandbox's snapshot and return it
+        running under the same id, with a fresh TTL window. Only a suspended
+        sandbox can be resumed; a running or stopped one is a conflict."""
+        return self._c._request("POST", f"/sandboxes/{sandbox_id}/resume")
 
     def extend(self, sandbox_id: str, ttl_seconds: int) -> dict:
         """Push the TTL deadline out to ttl_seconds from now, for work that turned
@@ -398,6 +428,21 @@ class Executions:
             "POST",
             f"/sandboxes/{sandbox_id}/executions/{execution_id}/cancel",
             body=params or None,
+        )
+
+    def resize(self, sandbox_id: str, execution_id: str, rows: int, cols: int) -> None:
+        """Resize a running tty execution's terminal, so a full-screen program
+        inside repaints to the new size. Wire it to your own terminal's resize
+        event to keep the two in step.
+
+        Only for an execution started with ``tty=True``; a plain one has no
+        terminal and is refused with a conflict. A resize is a set, not an
+        increment, so retrying it lands on the same window."""
+        self._c._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/executions/{execution_id}/resize",
+            body={"rows": rows, "cols": cols},
+            replayable=True,
         )
 
     def stream(self, sandbox_id: str, execution_id: str) -> Iterator[dict]:

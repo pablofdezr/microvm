@@ -48,17 +48,17 @@ import (
 // reachable, and a restore that cannot fails rather than hand back a VM whose
 // random numbers another tenant already has.
 //
-// It is not a general-purpose "resume this sandbox". Three things this path does
-// not do, deliberately and visibly:
+// The pool restores from templates captured from pristine VMs, but the mechanism
+// is not limited to that: Snapshot captures whatever instance it is handed, so the
+// sandbox manager's resume-after-stop uses this same path to snapshot a *used*
+// sandbox and bring it back later. A networked restore is handled too -- it takes
+// a fresh netpool slot, remaps its interface onto the new TAP with LoadSnapshot's
+// network_overrides, and re-addresses the guest over vsock once it answers.
 //
-//   - Networking. A snapshot carries the guest's MAC and IP in its memory image
-//     and names its host TAP in its device state, so every restore of one template
-//     would come back claiming the same address. Restore refuses a spec with
-//     Network set rather than producing that collision.
-//   - Restore a tenant's sandbox. Templates are captured from VMs that have run no
-//     code. Nothing here can snapshot a sandbox that has.
-//   - Survive a daemon restart. A SnapshotRef only exists in memory, so templates
-//     are captured per run and reclaimed at shutdown and at startup.
+// One thing this path still does not do: survive a daemon restart. A SnapshotRef
+// only exists in memory, so both the pool's templates and a suspended sandbox's
+// snapshot are reclaimed at shutdown and at startup -- suspend/resume works within
+// a daemon's life, not across a restart of it.
 
 const (
 	snapStateFile = "state"
@@ -228,18 +228,18 @@ func (r *Runtime) Restore(ctx context.Context, spec runtime.Spec, ref runtime.Sn
 	if r.cfg.SnapshotDir == "" {
 		return nil, fmt.Errorf("restore: snapshots are disabled (no SnapshotDir)")
 	}
-	if spec.Network {
-		// Not "unimplemented" -- unimplementable from here. The guest's MAC and IP
-		// are in the memory image and its host TAP is named in the device state, so
-		// a restore comes back as the template: on the template's tap if it still
-		// exists (it does not; capture stopped that VM and deleted it), and
-		// otherwise on whatever sandbox the netpool has since issued that slot to,
-		// with the template's address colliding with the current holder's. Giving a
-		// restore its own identity needs the guest to reconfigure itself on resume,
-		// which is a feature and not a fix-up.
-		return nil, fmt.Errorf("restore: a snapshot cannot be restored into a networked sandbox: " +
-			"the guest's MAC and IP live in the memory image, so every restore would claim the same address")
-	}
+	// A networked restore used to be refused here, because a snapshot carries the
+	// guest's IP in its memory image and its host TAP in its device state, so a
+	// plain restore comes back claiming the template's address on a TAP that is gone
+	// or belongs to someone else now. It is handled rather than refused: the restore
+	// gets its own netpool slot, LoadSnapshot's network_overrides remaps the
+	// interface onto the fresh TAP (the host side), and once the guest answers it is
+	// told its new address over vsock (the guest side). See restoreInto.
+	//
+	// KVM-validation note: the host-side suspend/resume lifecycle is exercised by
+	// the runtimetest fake, but this networked-restore path -- the override, the
+	// TAP, the guest reconfiguration -- runs only against a real Firecracker on a
+	// KVM host and has not been exercised on one here.
 
 	// One deadline over the whole thing. Every step below also bounds itself, but a
 	// step that is bounded only by its own timeout is a step that can be reached
@@ -286,6 +286,25 @@ func (r *Runtime) restoreInto(ctx context.Context, inst *instance, spec runtime.
 	jailRoot := r.jailRoot(inst.jailID)
 	if err := os.MkdirAll(jailRoot, 0o755); err != nil {
 		return fmt.Errorf("restore: jail: %w", err)
+	}
+
+	// A networked restore gets its own netpool slot: a fresh host TAP and /30, so it
+	// does not come back on the template's address. The TAP has to exist before the
+	// load below resolves the override onto it. Set on inst so a rollback (Restore
+	// calls inst.Stop on error) deletes the TAP and releases the slot, exactly as
+	// the cold path's teardown does.
+	var netOverrides []fcapi.NetOverride
+	if spec.Network {
+		lease, err := r.pool.Allocate()
+		if err != nil {
+			return fmt.Errorf("restore: allocate network: %w", err)
+		}
+		inst.lease = &lease
+		inst.tapName = lease.TapName
+		if err := r.taps.Create(lease); err != nil {
+			return fmt.Errorf("restore: create tap: %w", err)
+		}
+		netOverrides = []fcapi.NetOverride{{IfaceID: "eth0", HostDevName: lease.TapName}}
 	}
 
 	// The block devices are not inside a snapshot, only referenced by it, so the
@@ -367,7 +386,7 @@ func (r *Runtime) restoreInto(ctx context.Context, inst *instance, spec runtime.
 	if err := waitForSocket(ctx, inst.apiPath, inst.group); err != nil {
 		return fmt.Errorf("restore: API socket never appeared: %w\n--- console ---\n%s", err, inst.consoleTail())
 	}
-	if err := api.LoadSnapshot(ctx, snapStateFile, snapMemFile, true); err != nil {
+	if err := api.LoadSnapshot(ctx, snapStateFile, snapMemFile, true, netOverrides); err != nil {
 		return fmt.Errorf("restore: load snapshot: %w\n--- console ---\n%s", err, inst.consoleTail())
 	}
 	resumed := time.Now()
@@ -399,7 +418,41 @@ func (r *Runtime) restoreInto(ctx context.Context, inst *instance, spec runtime.
 		// it fails closed rather than handing back a VM that reuses entropy.
 		return fmt.Errorf("restore: reseed entropy: %w", err)
 	}
+
+	// Last, once the guest is running on its own vCPUs and its own entropy: tell it
+	// its new address. The snapshot restored the template's IP, so without this the
+	// guest would answer on the template's address over this restore's own TAP --
+	// the collision the refusal used to exist to prevent. Fatal, because a guest on
+	// the wrong network is worse than one that never came back: the pool recaptures
+	// or cold-boots, and the tenant gets a VM whose address is its own.
+	if inst.lease != nil {
+		if err := configureRestoredNetwork(ctx, inst); err != nil {
+			return fmt.Errorf("restore: configure guest network: %w", err)
+		}
+	}
 	return nil
+}
+
+// netConfigTimeout bounds the guest network reconfiguration on the restore path.
+// Like the reseed, it is one vsock round trip to a guest that is already
+// answering; anything longer is a guest that has stopped serving.
+const netConfigTimeout = 5 * time.Second
+
+// configureRestoredNetwork re-addresses a restored guest onto its own netpool
+// slot, replacing the template's address the memory image brought back.
+func configureRestoredNetwork(ctx context.Context, inst *instance) error {
+	ctx, cancel := context.WithTimeout(ctx, netConfigTimeout)
+	defer cancel()
+
+	lease := inst.lease
+	// Mirrors the cold path's kernel command line (see vmConfig): the same guest
+	// CIDR, the same gateway (the TAP's host IP), and the same default resolver.
+	return inst.client.ConfigureNet(ctx, protocol.NetConfigRequest{
+		Iface:   "eth0",
+		IP:      lease.GuestCIDR(),
+		Gateway: lease.HostIP.String(),
+		DNS:     "1.1.1.1",
+	})
 }
 
 // armGuestForSnapshot asks the guest to carry the interrupt-controller state

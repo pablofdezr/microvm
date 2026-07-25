@@ -520,8 +520,51 @@ class SandboxResource {
     return this.c.json<Sandbox>("POST", "/sandboxes", { body: params, opts });
   }
 
+  /**
+   * Return your running sandbox of the given `name` if one exists, and otherwise
+   * create it from `params`.
+   *
+   * It is how a stable identity outlives a single process: name a sandbox once,
+   * then reach "the one called build" again from anywhere without storing its id.
+   * `name` is filled in for you and `get_or_create` is set; the rest of `params`
+   * is the shape used only when there is nothing to reuse, and ignored when a
+   * sandbox of that name is already running.
+   */
+  getOrCreate(
+    name: string,
+    params: Omit<SandboxCreateParams, "name" | "get_or_create">,
+    opts?: RequestOptions,
+  ): Promise<Sandbox> {
+    return this.c.json<Sandbox>("POST", "/sandboxes", {
+      body: { ...params, name, get_or_create: true },
+      opts,
+    });
+  }
+
   retrieve(id: string, opts?: RequestOptions): Promise<Sandbox> {
     return this.c.json<Sandbox>("GET", `/sandboxes/${id}`, { opts });
+  }
+
+  /**
+   * Snapshot the sandbox's VM to disk and tear the VM down, leaving it resumable
+   * under the same id with `resume`.
+   *
+   * A suspended sandbox costs no CPU or memory, only the snapshot, and keeps its
+   * slot and name so a later `resume` is guaranteed both. It is kept until you
+   * resume or delete it. An execution in flight is refused with a conflict (see
+   * `APIError.isConflict`); finish or cancel it first.
+   */
+  suspend(id: string, opts?: RequestOptions): Promise<Sandbox> {
+    return this.c.json<Sandbox>("POST", `/sandboxes/${id}/suspend`, { opts });
+  }
+
+  /**
+   * Boot a fresh VM from a suspended sandbox's snapshot and return it running
+   * under the same id, with a fresh TTL window. Only a suspended sandbox can be
+   * resumed; a running or stopped one is a conflict.
+   */
+  resume(id: string, opts?: RequestOptions): Promise<Sandbox> {
+    return this.c.json<Sandbox>("POST", `/sandboxes/${id}/resume`, { opts });
   }
 
   /**
@@ -653,6 +696,30 @@ class ExecutionResource {
       `/sandboxes/${sandboxID}/executions/${executionID}/cancel`,
       { body: params, opts },
     );
+  }
+
+  /**
+   * Resize a running tty execution's terminal, so a full-screen program inside
+   * repaints to the new size. Wire it to your own terminal's resize event to
+   * keep the two in step.
+   *
+   * Only for an execution started with `tty: true`; a plain one has no terminal
+   * and is refused with a conflict (see `APIError.isConflict`). A resize is a set
+   * rather than an increment, so retrying it lands on the same window.
+   */
+  async resize(
+    sandboxID: string,
+    executionID: string,
+    rows: number,
+    cols: number,
+    opts?: RequestOptions,
+  ): Promise<void> {
+    const resp = await this.c.request(
+      "POST",
+      `/sandboxes/${sandboxID}/executions/${executionID}/resize`,
+      { body: { rows, cols }, replayable: true, opts },
+    );
+    await resp.text().catch(() => undefined); // 204, no body — free the stream
   }
 
   /**

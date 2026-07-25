@@ -368,7 +368,8 @@ func TestExecValidation(t *testing.T) {
 	}{
 		{"missing id", `{"cmd":"echo"}`, http.StatusBadRequest},
 		{"missing cmd", `{"id":"x"}`, http.StatusBadRequest},
-		{"tty unsupported", `{"id":"x","cmd":"sh","tty":true}`, http.StatusBadRequest},
+		// A tty request is valid input now: it is accepted here and, where the
+		// platform has no ptys, fails in band as an error frame rather than a 400.
 		{"malformed", `{`, http.StatusBadRequest},
 	}
 	for _, tc := range tests {

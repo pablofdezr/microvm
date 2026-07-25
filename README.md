@@ -345,24 +345,32 @@ host page cache, on a Pi 5):
   the measurements and why there is no host-side lever are in
   [internal/agent/gic_linux.go](internal/agent/gic_linux.go).
 
-  **What snapshots are not.** They are a warm-pool optimisation, and only that:
+  Snapshots power two things: the warm pool (above) and **resume-after-stop** —
+  `POST /sandboxes/{id}/suspend` snapshots a *used* sandbox and tears its VM down,
+  and `POST /sandboxes/{id}/resume` boots a fresh VM from that snapshot under the
+  same id. A suspended sandbox costs no CPU or memory, only the snapshot, and keeps
+  its slot and name so a resume is guaranteed both. A networked sandbox can be
+  resumed: the restore takes a fresh netpool slot, remaps its interface onto the
+  new TAP with Firecracker's `network_overrides`, and re-addresses the guest over
+  vsock once it answers, so it comes back on its own address rather than the
+  template's.
 
-  - No networking. A snapshot carries the guest's MAC and IP in its memory image,
-    so every restore of one template would claim the same address. Networked
-    shapes cold-boot instead.
-  - No restoring a tenant's sandbox. Templates come from VMs that have run no code.
-  - No surviving a daemon restart. Templates are captured per run, discarded at
-    shutdown, and swept at startup — so `-snapshot-dir` is scratch space, not
-    storage, and it wants one directory per daemon.
-  - Requires guest images rebuilt from this repo (the agent's snapshot routes), and
-    a restored guest keeps the template's clock, so its `/proc/uptime` is the
-    snapshot's rather than wall-clock.
+  **What snapshots still are not:**
 
-  Sandbox **persistence, resume-after-stop, fork, named sandboxes, get-or-create
-  and sessions do not exist.** They are no longer blocked on anything — restore
-  works — but nothing has been written for them, and each needs more than a working
-  restore: durable snapshot metadata, guest-side network reconfiguration, and an
-  API identity that outlives a VM.
+  - No surviving a daemon restart. A snapshot's only handle is an in-memory ref, so
+    both the pool's templates and a suspended sandbox's snapshot are captured per
+    run, discarded at shutdown, and swept at startup — `-snapshot-dir` is scratch
+    space, not storage, and it wants one directory per daemon. Suspend/resume works
+    within a daemon's life, not across a restart of it.
+  - No fork or sessions. Restoring one snapshot many times, or an API identity that
+    spans several VMs, is not built.
+  - Requires guest images rebuilt from this repo (the agent's snapshot and network
+    routes), and a restored guest keeps the template's clock, so its `/proc/uptime`
+    is the snapshot's rather than wall-clock.
+
+  Networked resume runs only against a real Firecracker on a KVM host; the
+  host-side suspend/resume lifecycle is covered by unit tests, but the
+  networked-restore path itself has not been exercised on KVM in this change.
 
 One gotcha worth recording: a Dockerfile's `ENV` is container-runtime metadata,
 not a file. `docker export` discards it and the guest kernel hands PID 1 an
@@ -389,17 +397,20 @@ Two ways to run code, and the difference matters:
 Use a sandbox for several commands sharing state, a task for throughput.
 
 ```
-POST   /v1/sandboxes                                   create
+POST   /v1/sandboxes                                   create (optional name + get_or_create)
 GET    /v1/sandboxes                                   list (cursor paginated), ?tag=k:v narrows it
 GET    /v1/sandboxes/{sb}                              state + live stats
 DELETE /v1/sandboxes/{sb}                              destroy, returns the final cost
 POST   /v1/sandboxes/{sb}/extend                       buy more time, bounded from creation
+POST   /v1/sandboxes/{sb}/suspend                      snapshot to disk, tear the VM down
+POST   /v1/sandboxes/{sb}/resume                       boot a fresh VM from the snapshot
 
-POST   /v1/sandboxes/{sb}/executions                   start a command, returns at once
+POST   /v1/sandboxes/{sb}/executions                   start a command, returns at once (tty optional)
 GET    /v1/sandboxes/{sb}/executions                   list
 GET    /v1/sandboxes/{sb}/executions/{exe}             output, even after the VM is gone
 GET    /v1/sandboxes/{sb}/executions/{exe}/stream      SSE: replays, then follows
 POST   /v1/sandboxes/{sb}/executions/{exe}/cancel      signal the process group
+POST   /v1/sandboxes/{sb}/executions/{exe}/resize      resize a tty execution's window
 
 POST   /v1/sandboxes/{sb}/files                        upload
 POST   /v1/sandboxes/{sb}/files/batch                  upload up to 100, in order

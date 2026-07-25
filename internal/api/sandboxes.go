@@ -56,6 +56,21 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		},
 		TTL: time.Duration(deref(params.TtlSeconds)) * time.Second,
 	}
+	// The name is a handle a caller picks, so it is validated here like a tag:
+	// bounded charset and length, refused before anything is spent on the create.
+	if params.Name != nil && *params.Name != "" {
+		if err := sandbox.ValidateName(*params.Name); err != nil {
+			s.writeAPIError(w, r, invalidParamError("name", err.Error()))
+			return
+		}
+		spec.Name = *params.Name
+	}
+	getOrCreate := deref(params.GetOrCreate)
+	if getOrCreate && spec.Name == "" {
+		s.writeAPIError(w, r, invalidParamError("get_or_create",
+			"needs a name to resolve; set name to the handle you want to reuse."))
+		return
+	}
 	if params.Env != nil {
 		spec.Env = *params.Env
 	}
@@ -129,9 +144,21 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		spec.Storage = mount
 	}
 
-	sb, err := s.mgr.Create(r.Context(), spec)
+	// GetOrCreate resolves an existing sandbox to a 200; a plain create always
+	// boots and answers 201. Both share every failure path below.
+	sb, created, err := s.createSandbox(r, spec, getOrCreate)
 	if err != nil {
-		// Seeding first, because a create that got as far as fetching failed for a
+		// A name collision is the caller's to fix -- pick another name, or ask for
+		// get_or_create -- so it is answered before the capacity paths that a
+		// generic create failure falls through to.
+		var nameConflict *sandbox.NameConflictError
+		if errors.As(err, &nameConflict) {
+			s.writeAPIError(w, r, conflictError(CodeAlreadyExists, fmt.Sprintf(
+				"You already have a running sandbox named %q. Pass get_or_create to reuse it, "+
+					"or choose another name.", nameConflict.Name)))
+			return
+		}
+		// Seeding next, because a create that got as far as fetching failed for a
 		// reason of its own: a refused URL is the caller's, a bad origin is somebody
 		// else's server, and neither is this node being full. Reported as capacity
 		// they would send a caller into a retry loop against a URL that will never
@@ -156,7 +183,25 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toAPISandbox(sb))
+	// 201 for a sandbox that was booted, 200 for one get_or_create handed back
+	// unchanged: a caller can tell "I made this" from "this already existed"
+	// without diffing the body against what they sent.
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, toAPISandbox(sb))
+}
+
+// createSandbox routes a create to the plain or the get-or-create path and
+// reports whether a VM was booted. The plain path always did, so its bool is
+// true; get-or-create returns false when it resolved an existing sandbox.
+func (s *Server) createSandbox(r *http.Request, spec sandbox.Spec, getOrCreate bool) (*sandbox.Sandbox, bool, error) {
+	if getOrCreate {
+		return s.mgr.GetOrCreate(r.Context(), spec)
+	}
+	sb, err := s.mgr.Create(r.Context(), spec)
+	return sb, true, err
 }
 
 // refuseTagFlood bounds the tag count before the map that would hold it exists.
@@ -389,6 +434,75 @@ func (s *Server) handleExtendSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toAPISandbox(sb))
 }
 
+// handleSuspendSandbox snapshots the sandbox's VM and tears it down, leaving it
+// resumable under the same id.
+func (s *Server) handleSuspendSandbox(w http.ResponseWriter, r *http.Request) {
+	sb, err := s.sandbox(r)
+	if err != nil {
+		s.writeAPIError(w, r, err)
+		return
+	}
+
+	// Its own deadline, generous: the snapshot write is the guest's whole memory
+	// to disk, which is minutes on a large guest or a slow disk (see fcapi). A
+	// client hanging up mid-capture must not abort it and leave the VM in limbo.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 6*time.Minute)
+	defer cancel()
+
+	if err := sb.Suspend(ctx); err != nil {
+		switch {
+		case errors.Is(err, sandbox.ErrSnapshotUnsupported):
+			s.writeAPIError(w, r, conflictError(CodeSnapshotUnsupported,
+				"This node is not configured for suspend/resume."))
+		case errors.Is(err, sandbox.ErrSandboxBusy):
+			s.writeAPIError(w, r, conflictError(CodeSandboxBusy,
+				"This sandbox has an execution in flight. Finish or cancel it, then suspend."))
+		case sb.State() != sandbox.StateRunning:
+			// Not running to begin with, or the capture failed and left it stopped.
+			s.writeAPIError(w, r, sandboxNotRunningError(sb.ID(), string(sb.State()), string(sb.Reason())))
+		default:
+			s.log.Error("suspend sandbox failed", "sandbox", sb.ID(), "err", err)
+			s.writeAPIError(w, r, internalError(err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, toAPISandbox(sb))
+}
+
+// handleResumeSandbox boots a fresh VM from a suspended sandbox's snapshot.
+func (s *Server) handleResumeSandbox(w http.ResponseWriter, r *http.Request) {
+	sb, err := s.sandbox(r)
+	if err != nil {
+		s.writeAPIError(w, r, err)
+		return
+	}
+
+	if sb.State() != sandbox.StateSuspended {
+		s.writeAPIError(w, r, conflictError(CodeNotSuspended, fmt.Sprintf(
+			"Sandbox %s is %s, not suspended, so there is nothing to resume.", sb.ID(), sb.State())))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 60*time.Second)
+	defer cancel()
+
+	resumed, err := s.mgr.Resume(ctx, sb)
+	if err != nil {
+		if errors.Is(err, sandbox.ErrSnapshotUnsupported) {
+			s.writeAPIError(w, r, conflictError(CodeSnapshotUnsupported,
+				"This node is not configured for suspend/resume."))
+			return
+		}
+		// Booting the VM back from the snapshot failed. Reported as capacity, like a
+		// create that could not boot: the caller's move is to back off and retry, and
+		// the snapshot is still there to retry against.
+		s.log.Warn("resume sandbox failed", "sandbox", sb.ID(), "err", err)
+		s.writeAPIError(w, r, capacityError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, toAPISandbox(resumed))
+}
+
 // sandbox resolves the {sandbox} path value, scoped to whoever is asking.
 func (s *Server) sandbox(r *http.Request) (*sandbox.Sandbox, error) {
 	raw := r.PathValue("sandbox")
@@ -464,6 +578,12 @@ func toAPISandbox(sb *sandbox.Sandbox) apitypes.Sandbox {
 		out.Stats.NetworkTxBytes = ptr(int64(*v))
 	}
 
+	// Absent rather than empty when the sandbox has no name: a caller reading this
+	// back sees the same shape they sent, and an anonymous sandbox has no name
+	// field rather than an empty one.
+	if info.Name != "" {
+		out.Name = ptr(info.Name)
+	}
 	if !info.StoppedAt.IsZero() {
 		out.Stopped = &info.StoppedAt
 	}
