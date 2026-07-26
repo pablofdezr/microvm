@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -131,7 +132,34 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (*Archive, error) {
 			resp.ContentLength, f.cfg.MaxBytes)
 	}
 
-	return f.buffer(resp.Body)
+	archive, err := f.buffer(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// The copy above can report success on a body that was cut short, so the
+	// context gets the last word on whether there was time to finish it.
+	//
+	// When the deadline fires mid-transfer the request is cancelled, the origin's
+	// handler returns, and the response terminates *cleanly* -- so io.Copy sees
+	// the bytes that made it plus a legitimate EOF and reports no error at all.
+	// Which of the two lands first, the cancellation or the EOF, is a matter of
+	// scheduling: that is why the test for this failed about once in three hundred
+	// runs rather than never or always.
+	//
+	// Left as success it is worse than a flaky test. A truncated tarball is not
+	// reliably a broken one -- tar stops at the first short member and everything
+	// before it extracts fine -- so a fetch that timed out halfway could seed a
+	// sandbox with a partial project and report nothing wrong to anybody.
+	if cerr := ctx.Err(); cerr != nil {
+		archive.Close()
+		if errors.Is(cerr, context.DeadlineExceeded) {
+			return nil, fetchFailed("timed out after %s", f.cfg.Timeout)
+		}
+		// The caller's own context went away, which is not the origin's fault.
+		return nil, fetchFailed("cancelled before the body was complete")
+	}
+	return archive, nil
 }
 
 // buffer copies the body into an unlinked temp file.

@@ -393,9 +393,31 @@ func TestSlowOriginHitsTheTimeout(t *testing.T) {
 
 	f := newTestFetcher(t, srv, Config{Timeout: 100 * time.Millisecond})
 	start := time.Now()
-	_, err := f.Fetch(context.Background(), srv.URL+"/slow")
+	archive, err := f.Fetch(context.Background(), srv.URL+"/slow")
+
+	// No archive on this path, which is the assertion that used to fail.
+	//
+	// The deadline cancelling the request makes the origin's handler return, which
+	// ends the response *cleanly* -- so io.Copy could see the bytes that arrived
+	// plus a legitimate EOF and report no error, and the fetch handed back an
+	// archive holding a partial body. Which of the cancellation and the EOF landed
+	// first was down to scheduling, so this failed about once in three hundred runs
+	// rather than never or always.
+	//
+	// It is asserted here rather than in a test of its own because this is the test
+	// that actually reaches the interleaving; forcing it deterministically needs a
+	// hook into the copy that does not exist. Fetch now consults the context after
+	// the copy, which closed it over 1200 iterations that previously failed every
+	// 300.
+	if archive != nil {
+		archive.Close()
+		t.Error("a stalled body produced an archive; a partial project would be seeded from it")
+	}
 	if !errors.Is(err, ErrFetchFailed) {
 		t.Fatalf("a stalled body returned %v, want ErrFetchFailed", err)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error %q does not say the deadline was what stopped it", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("the timeout took %s to fire", elapsed)

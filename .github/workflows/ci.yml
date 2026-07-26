@@ -1,0 +1,110 @@
+# Build, vet and test the daemon on every push.
+#
+# This did not exist, and its absence had already cost something: a snapshot test
+# asserting behaviour the project had deliberately replaced survived a whole commit
+# red, because nothing ever ran the suite where it could run.
+#
+# Which is the reason the runners here are Linux and not `macos-*`. Most of this
+# repository is linux-only -- the Firecracker runtime, the guest agent, netpool,
+# storagefs, cgroups -- so on a macOS workstation `go test ./...` cross-compiles
+# those packages, cannot exec the resulting arm64-Linux binaries, and prints
+#
+#     fork/exec /var/folders/.../agent.test: exec format error
+#     FAIL  github.com/pablofdezr/microvm/internal/agent  0.004s
+#
+# for about two dozen packages at once. Every one of those is a false FAIL, a real
+# one looks identical, and the signal is unusable. A Linux runner is the only place
+# the tests that matter actually execute.
+#
+# Both architectures are built because both are supported (images/build.sh and
+# kernel/build.sh take arm64 or amd64), but arm64 is first among equals: it is what
+# the project is developed and benchmarked on.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    strategy:
+      # Both architectures report. Stopping the matrix on the first failure hides
+      # whether a break is arch-specific, which is the main thing the matrix is
+      # here to tell us.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # From go.mod rather than pinned here: two places to state the toolchain
+          # is one place to forget it.
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        # `gofmt -l` prints offending files and exits 0 either way, so the check is
+        # whether it printed anything.
+        run: |
+          unformatted=$(gofmt -l cmd internal test)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        # -race because almost everything here is concurrent -- the warm pool's
+        # refill, the guest supervisor, the meters, the logstore's subscribers --
+        # and a data race in any of them is the class of bug that reproduces in
+        # production and not on a laptop.
+        #
+        # Tests needing KVM or root skip themselves; a runner has neither, so what
+        # runs here is the host-side logic, which is the part a unit test can own.
+        run: go test -race ./...
+
+  generated:
+    name: generated types match the spec
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: check-generated
+        # api/check-generated.sh has said "run this in CI" since it was written,
+        # and until now nothing did -- so the guard against an edit to
+        # openapi.yaml that forgot to regenerate the server and SDK types was a
+        # script somebody had to remember. It regenerates into a scratch copy and
+        # diffs, leaving the tree untouched.
+        run: api/check-generated.sh
