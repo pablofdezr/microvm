@@ -68,23 +68,23 @@ func TestRestoreRefusesASnapshotWithNoImageBinding(t *testing.T) {
 	}
 }
 
-// A networked sandbox cannot be restored: the guest's MAC and IP are in the memory
-// image and its host TAP is named in the device state, so every restore of one
-// template claims the same address. It must refuse before allocating anything,
-// because the alternative is an address collision with whichever live sandbox the
-// netpool has since issued that slot to.
-func TestRestoreRefusesANetworkedSpec(t *testing.T) {
-	r := &Runtime{cfg: Config{SnapshotDir: t.TempDir()}, log: discardLog()}
-
-	_, err := r.Restore(context.Background(),
-		runtime.Spec{ID: "x", Image: "python", Network: true}, runtime.SnapshotRef{})
-	if err == nil {
-		t.Fatal("a networked restore was attempted")
-	}
-	if !strings.Contains(err.Error(), "MAC and IP") {
-		t.Errorf("error %q does not say why", err)
-	}
-}
+// TestRestoreRefusesANetworkedSpec used to live here, asserting that a restore
+// refused any spec with Network set: a snapshot carries the guest's MAC and IP in
+// its memory image and its host TAP in its device state, so a plain restore came
+// back claiming the template's address.
+//
+// It is gone because the behaviour it guarded was deliberately replaced rather
+// than kept -- a networked restore now takes a fresh netpool slot, remaps the
+// interface onto the new TAP with Firecracker's network_overrides, and re-addresses
+// the guest over vsock (see Restore and restoreInto). The test outlived the refusal
+// it was written for by one commit, and since the early refusal was what returned
+// before Restore touched anything, removing it left the test running on into a
+// Runtime built by struct literal -- panicking on a nil cgroup slice that New
+// always sets, so it failed for a reason unrelated to what it claimed to check.
+//
+// What replaced it is not unit-testable here: the override, the TAP and the guest
+// reconfiguration only run against a real Firecracker on a KVM host. The host-side
+// suspend/resume lifecycle is covered against the runtime fake instead.
 
 // The snapshot files are read by every restore and writable by none of them.
 //
