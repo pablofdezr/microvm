@@ -48,6 +48,8 @@ type config struct {
 	warm        string
 	snapshotDir string
 
+	guestBootVerbose bool
+
 	redisAddr   string
 	redisPrefix string
 
@@ -133,6 +135,8 @@ func main() {
 		"comma-separated warm-pool shapes to pre-boot, image:vcpus:mem:count (e.g. python-arm64.ext4:2:512:2); each shape keeps that many pristine VMs ready to skip the cold boot")
 	flag.StringVar(&cfg.snapshotDir, "snapshot-dir", "",
 		"enable Firecracker snapshots (VMs boot with the API socket) and store them here; the warm pool fills by restoring a per-shape template snapshot (a restored guest answers in tens of milliseconds) and falls back to cold boot if any of it fails. Scratch space, not storage: templates are captured per run, discarded at shutdown and swept at startup, so use one directory per daemon and budget one copy of a guest's RAM per warm shape. Networked shapes are never snapshotted. Needs guest images built from this repo at or after the snapshot agent routes, and a guest kernel with /dev/mem on arm64 GICv2 hosts -- see DEPLOY.md")
+	flag.BoolVar(&cfg.guestBootVerbose, "guest-boot-verbose", false,
+		"leave the guest kernel's boot messages at full verbosity. Off by default because every kernel printk is a synchronous write to an emulated UART that the guest blocks on, and the kernel boot is the largest single phase of a create: quieting it halved that phase on a Pi 5 (169ms of guest kernel to 84ms, and a 288ms create to 170ms). The console stays attached either way, and the threshold only rises to KERN_ERR -- a panic still prints, so does an error that explains a failed boot, and so does everything the guest agent writes. Turn it on when a guest fails in a way the errors alone do not explain")
 	flag.IntVar(&cfg.memMiB, "mem", 0,
 		"schedulable memory in MiB for queued tasks; tasks are packed so their memory never exceeds this. 0 means unbounded. Memory is the dimension that must not oversubscribe, so set it whenever tasks vary in size")
 	flag.StringVar(&cfg.redisAddr, "redis", "",
@@ -285,7 +289,8 @@ func run(cfg config, log *slog.Logger) error {
 		DefaultDiskBps:    cfg.diskBps,
 		DefaultDiskIOPS:   cfg.diskIOPS,
 
-		SnapshotDir: cfg.snapshotDir,
+		SnapshotDir:      cfg.snapshotDir,
+		GuestBootVerbose: cfg.guestBootVerbose,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("start runtime: %w", err)

@@ -598,6 +598,7 @@ microvm result tsk_01JZ8...             <span class="c"># wait for it and print 
 
 microvm ps                              <span class="c"># sandboxes on this node</span>
 microvm queue                           <span class="c"># depth and this node's slots</span>
+microvm bench python main.py -n 10      <span class="c"># time each leg separately</span>
 microvm logs sb_01JZ8... exe_01JZ8...   <span class="c"># an execution's recorded output</span></code></pre></div>
         </article>
 
@@ -633,7 +634,7 @@ microvm logs sb_01JZ8... exe_01JZ8...   <span class="c"># an execution's recorde
         </div>
         <div class="item">
           <h3>Fast cold starts <span class="new">NEW</span></h3>
-          <p>Warm build caches baked into the images, plus a pool of pre-booted VMs that skips the boot entirely — optionally filled by restoring a Firecracker snapshot, which a guest answers in tens of milliseconds. Restores are a pool optimisation: each one is a fresh VM with its own rotated CSPRNG, not a saved sandbox you can come back to.</p>
+          <p>Sandboxes boot <code>quiet</code>, because the kernel narrating a successful boot to an emulated UART was half the boot — that alone took a create from 288&nbsp;ms to 170&nbsp;ms. On top of it: warm build caches baked into the images, plus a pool of pre-booted VMs that skips the boot entirely, optionally filled by restoring a Firecracker snapshot, which a guest answers in tens of milliseconds. Restores are a pool optimisation: each one is a fresh VM with its own rotated CSPRNG, not a saved sandbox you can come back to.</p>
         </div>
         <div class="item">
           <h3>Auth &amp; quotas</h3>
@@ -682,20 +683,35 @@ microvm logs sb_01JZ8... exe_01JZ8...   <span class="c"># an execution's recorde
       <div class="section-head">
         <p class="label">Benchmarks</p>
         <h2>Measured on a Raspberry Pi 5</h2>
-        <p class="lead">Real code, measured end to end (full <code>microvm run</code>, image hot in the page cache).</p>
+        <p class="lead">Real code, timed one leg at a time with <code>microvm bench</code> — 10 runs after a discarded warm-up, image hot in the page cache. Medians.</p>
       </div>
       <div class="table-scroll">
         <table>
-          <thead><tr><th>Image</th><th class="num">Size</th><th class="num">No cache</th><th class="num">Baked cache</th></tr></thead>
+          <thead><tr><th>Image</th><th class="num">Size</th><th class="num">Boot</th><th class="num">Run the code</th><th class="num">Teardown</th><th class="num">Total</th></tr></thead>
           <tbody>
-            <tr><td><span class="name">python</span></td><td class="num">154 MB</td><td class="num">~0.5 s</td><td class="num">~0.5 s</td></tr>
-            <tr><td><span class="name">node</span> <span class="dim">· tsx</span></td><td class="num">303 MB</td><td class="num">~3 s</td><td class="num">~1.3 s</td></tr>
-            <tr><td><span class="name">go</span> <span class="dim">· Alpine</span></td><td class="num">620 MB</td><td class="num">~27 s</td><td class="num">~2.4 s</td></tr>
-            <tr><td><span class="name">rust</span></td><td class="num">859 MB</td><td class="num">~1.4 s</td><td class="num">~1 s</td></tr>
+            <tr><td><span class="name">python</span></td><td class="num">154 MB</td><td class="num">167 ms</td><td class="num">78 ms</td><td class="num">24 ms</td><td class="num"><strong>281 ms</strong></td></tr>
+            <tr><td><span class="name">node</span> <span class="dim">· tsx</span></td><td class="num">303 MB</td><td class="num">229 ms</td><td class="num">943 ms</td><td class="num">46 ms</td><td class="num"><strong>1.20 s</strong></td></tr>
+            <tr><td><span class="name">go</span> <span class="dim">· Alpine</span></td><td class="num">620 MB</td><td class="num">255 ms</td><td class="num">841 ms</td><td class="num">53 ms</td><td class="num"><strong>1.17 s</strong></td></tr>
+            <tr><td><span class="name">rust</span></td><td class="num">859 MB</td><td class="num">304 ms</td><td class="num">846 ms</td><td class="num">62 ms</td><td class="num"><strong>1.15 s</strong></td></tr>
           </tbody>
         </table>
       </div>
-      <p class="table-note">The baked Go cache builds in single-digit ms in the image itself; the sandbox's read-only rootfs + overlay adds the rest. A warm pool skips the boot entirely for the interpreted languages.</p>
+      <p class="table-note">The split is the point. Booting the sandbox costs 170–300&nbsp;ms and barely tracks image size — rootfs images are hardlinked into each jail, not copied. What varies is <em>Run the code</em>: a compiler for Go and Rust, the tsx transform for node, 71–79% of those three totals and no part of it a cost of starting a microVM.</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Inside one boot</th><th class="num">Median</th></tr></thead>
+          <tbody>
+            <tr><td>Stage the jail — hardlink kernel and rootfs, render <code>vm.json</code>, chown</td><td class="num">0.5 ms</td></tr>
+            <tr><td>Exec the jailer, which execs Firecracker</td><td class="num">0.7 ms</td></tr>
+            <tr><td>Guest kernel, up to the point it execs our init</td><td class="num">82 ms</td></tr>
+            <tr><td>Overlay root, mounts, network, env, storage</td><td class="num">5 ms</td></tr>
+            <tr><td>VMM start-up, supervisor re-exec, agent binding vsock, health-poll granularity</td><td class="num">119 ms</td></tr>
+            <tr><td><strong>One create, end to end</strong></td><td class="num"><strong>214 ms</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="table-note">42 cold boots across the four images. Host work is ~1&nbsp;ms of it. The guest kernel is the largest named phase, which is why sandboxes boot <code>quiet</code>: every kernel printk is a synchronous write to an emulated UART the guest blocks on, so letting it narrate a successful boot cost 87&nbsp;ms — quieting it took the guest kernel from 169&nbsp;ms to 82&nbsp;ms and a create from 288&nbsp;ms to 170&nbsp;ms. The console stays attached at <code>KERN_ERR</code>, so a panic still prints with its call trace.</p>
+      <p class="table-note">That before-and-after is one image measured twice, so it was checked against a second: a separately built <code>python</code> rootfs, served by a different daemon on the same host, creates in 152&nbsp;ms quiet — consistent with the 170&nbsp;ms above rather than particular to the image the table was built from. The 119&nbsp;ms remainder is the next thing worth attacking.</p>
     </div>
   </section>
 

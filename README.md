@@ -279,41 +279,63 @@ its sandboxes no storage.
 
 ## Images
 
-Slim where a slim variant exists. Measured on a Pi 5, running real code, as a
-**cold boot with no warm cache, pool or snapshots** — the baseline the
-optimizations below improve on:
+Slim where a slim variant exists. Measured on a Pi 5 with `microvm bench`, which
+times each leg of a full run separately rather than reporting one number for all
+of them: 10 iterations after a discarded warm-up, so the image really is hot in
+the host page cache. Medians, no warm pool and no snapshots:
 
-| Image | Size | Cold run |
-|---|---|---|
-| python | 127 MB | 164 ms |
-| node (TypeScript via tsx) | 278 MB | 3.2 s |
-| rust | 801 MB | 1.4 s |
-| go | ~620 MB (Alpine) | 27 s (compiles cold, no cache) |
+| Image | Size | Boot the sandbox | Run the code | Tear down + round trips | Total |
+|---|---|---|---|---|---|
+| python | 154 MB | 167 ms | 78 ms | 24 ms | **281 ms** |
+| node · tsx | 303 MB | 229 ms | 943 ms | 46 ms | **1.20 s** |
+| go · Alpine | 620 MB | 255 ms | 841 ms | 53 ms | **1.17 s** |
+| rust | 859 MB | 304 ms | 846 ms | 62 ms | **1.15 s** |
 
-Go and Rust are large because running their code means compiling it, which is
-also why their cold runs are dominated by the compile rather than the boot.
+The split is the point, and a single total hides it. **Booting the sandbox costs
+170–300 ms and barely tracks the image size at all** — a 859 MB rootfs boots in
+twice what a 154 MB one does, not six times, because images are hardlinked into
+each jail rather than copied. What actually varies is the second column, which is
+the code under test compiling itself: a compiler for Go and Rust, the tsx
+transform for node. That is 71–79% of those three totals and none of it is a cost
+of starting a microVM. Only python's total is mostly sandbox.
 
-Measured end to end (full `microvm run`, steady state with the image hot in the
-host page cache, on a Pi 5):
+Inside that boot, over 42 cold boots across the four images:
 
-| Image | Cold run, no cache | With the baked cache |
-|---|---|---|
-| python | ~0.5 s | — (interpreted) |
-| node (tsx) | ~3 s | **~1.3 s** |
-| go (Alpine) | ~27 s | **~2.4 s** |
-| rust | ~1.4 s | **~1 s** (mold) |
+| Phase | Median |
+|---|---|
+| Stage the jail — hardlink kernel and rootfs, render `vm.json`, chown | 0.5 ms |
+| Exec the jailer, which execs Firecracker | 0.7 ms |
+| Guest kernel, up to the point it execs our init | 82 ms |
+| `InitGuest` — overlay root, mounts, network, env, storage | 5 ms |
+| VMM start-up before the kernel, the supervisor re-exec, the agent binding vsock, and the 5 ms health-poll granularity | 119 ms |
+| **One create, end to end** | **214 ms** |
+
+Host work is ~1 ms of it. The guest kernel is the largest named phase, which is
+why sandboxes boot `quiet` (see `-guest-boot-verbose`): every kernel printk is a
+synchronous write to an emulated UART that the guest blocks on, so letting the
+kernel narrate a successful boot cost 87 ms — quieting it took the guest kernel
+from 169 ms to 82 ms and a create from 288 ms to 170 ms. The console stays
+attached and the threshold only rises to `KERN_ERR`, so a panic still prints with
+its call trace. The 119 ms remainder is the next thing worth attacking.
 
 **Cold starts** are attacked in three layers, each opt-in and independent:
 
 - **Warm build caches** baked into each image. Go 1.20+ ships no precompiled
-  standard library, so a cold `go build` recompiles everything it imports — ~27s
-  on a Pi 5. A `GOCACHE` prewarmed with `go build std`, baked into the read-only
-  rootfs and read through the guest's overlay, cuts that to **~2.4s** inside a
-  sandbox. (The same cache builds in single-digit milliseconds in the image
-  itself; the gap is the read-only rootfs + overlay + virtio-blk the guest reads
-  the cache through, and it degrades further when a busy node's page cache is
-  contended — so this is a real win but not the sub-second a raw build sees.)
-  Node ships a warm `NODE_COMPILE_CACHE` (~3s → ~1.3s); Rust links with `mold`.
+  standard library, so a cold `go build` recompiles everything it imports, which
+  on a Pi 5 is tens of seconds. A `GOCACHE` prewarmed with `go build std`, baked
+  into the read-only rootfs and read through the guest's overlay, is what puts the
+  841 ms in the table above. (The same cache builds in single-digit milliseconds
+  in the image itself; the gap is the read-only rootfs + overlay + virtio-blk the
+  guest reads it through, and it degrades further when a busy node's page cache is
+  contended — so this is a real win but not the sub-second a raw build sees.) Node
+  ships a warm `NODE_COMPILE_CACHE`; Rust links with `mold`.
+
+  The cold, cache-less figures this improves on are not in the table because
+  `microvm bench` measures the images as they ship, and they ship with the cache.
+  Removing it to quantify the delta is a separate experiment, and the numbers that
+  used to sit here predate the harness — they came from wall-clocking whole `run`
+  invocations, which is exactly the conflation the table above exists to undo, so
+  they are not comparable to it and have been dropped rather than restated.
 - **A warm pool** of pristine pre-booted VMs (`-warm image:vcpus:mem:count`), so
   a task skips the boot entirely. Each pooled VM is a distinct VM that has run no
   code, so handing one out keeps the one-sandbox-per-task rule — no snapshot
@@ -588,7 +610,17 @@ microvm queue                         # depth and this node's slots
 microvm ps
 microvm ps -tag env=ci                # only sandboxes carrying that tag
 microvm logs sb_01JZ8... exe_01JZ8... # an execution's recorded output
+microvm bench python main.py -n 10    # time each leg of a run separately
 ```
+
+`bench` is what produced the numbers under [Images](#images). It runs the same
+public API the other commands do and times every leg a caller can see — create,
+upload, exec, first byte, the program, teardown — so a total is never quoted
+without the breakdown that explains it. `-warmup` (default 1) discards the first
+iterations, which is what makes "hot in the page cache" true rather than assumed;
+`-warmup=0` measures the cold read instead. `-json` gives the raw per-run numbers.
+For the inside of the boot, read the daemon's own `sandbox booted` log line for
+the same runs.
 
 The exit code is the program's own, so it composes:
 

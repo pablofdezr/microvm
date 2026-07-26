@@ -90,6 +90,27 @@ type Config struct {
 	// and snapshotted, and snapshots are written under this directory. Empty is
 	// the default and leaves the cold-boot path exactly as it was.
 	SnapshotDir string
+
+	// GuestBootVerbose leaves the guest kernel's boot messages at their default
+	// verbosity instead of quieting them.
+	//
+	// It exists because the console is not free. Every printk is a synchronous
+	// write to an emulated UART, and the guest blocks on each one -- so on a
+	// Pi 5, where the kernel boot was measured as the single largest phase of a
+	// create, a good part of it was the kernel narrating the boot to a log file
+	// nobody reads on a healthy VM. Quieting it halved that phase: 169ms of
+	// guest kernel became 84ms, and the whole create went from 288ms to 170ms.
+	//
+	// Quiet is therefore the default, and it costs less than it sounds. The
+	// console stays attached and the threshold only rises to KERN_ERR, so a
+	// panic still prints, an error that explains a failed boot still prints, and
+	// so does everything the agent itself writes to stderr. What goes away is
+	// the narration of a boot that worked.
+	//
+	// Set it when a guest fails in a way the errors alone do not explain -- a
+	// device that did not probe, a timing problem that only the ordering of the
+	// INFO lines reveals. It is the flag to reach for before guessing.
+	GuestBootVerbose bool
 }
 
 // Runtime creates Firecracker-backed sandboxes.
@@ -345,6 +366,23 @@ func (r *Runtime) rootfsPath(image string) (string, error) {
 }
 
 func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) error {
+	// One clock for the whole create, sampled at each phase boundary. Total is
+	// measured against createStart rather than summed from the phases, so a cost
+	// that falls between two of them shows up as Unattributed instead of
+	// silently vanishing. The timings are published on the instance only on the
+	// success path: a create that failed has a breakdown of nothing useful.
+	createStart := time.Now()
+	phase := createStart
+	// since closes one phase and opens the next, returning what the closed one
+	// cost.
+	since := func() time.Duration {
+		now := time.Now()
+		d := now.Sub(phase)
+		phase = now
+		return d
+	}
+	var timings runtime.Timings
+
 	rootfs, err := r.rootfsPath(spec.Image)
 	if err != nil {
 		return err
@@ -363,6 +401,13 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		if err := r.taps.Create(lease); err != nil {
 			return fmt.Errorf("create tap: %w", err)
 		}
+	}
+	// Left at zero for a sandbox with no network, which is the honest reading:
+	// the phase did not happen rather than took no time.
+	if spec.Network {
+		timings.Network = since()
+	} else {
+		phase = time.Now()
 	}
 
 	// The jailer chroots the VMM, so everything it opens must already be inside
@@ -452,11 +497,18 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		inst.hostListener = l
 	}
 
+	// Everything above is host work done before any VM exists: the jail tree,
+	// the hardlinks, the verity sidecar, vm.json, the chown and the inbound
+	// socket.
+	timings.Stage = since()
+
 	if err := r.start(inst, spec); err != nil {
 		return err
 	}
+	timings.StartVMM = since()
 
-	if err := inst.waitReady(ctx); err != nil {
+	health, err := inst.waitReadyHealth(ctx)
+	if err != nil {
 		// The bare timeout says only that nothing answered, which is true of
 		// every possible cause. The console holds the actual reason -- a VMM
 		// that refused to start, a kernel panic, an init failure -- and the
@@ -465,6 +517,33 @@ func (r *Runtime) setup(ctx context.Context, inst *instance, spec runtime.Spec) 
 		return fmt.Errorf("sandbox never became ready: %w\n--- guest console ---\n%s",
 			err, inst.consoleTail())
 	}
+	timings.BootWait = since()
+	timings.Total = time.Since(createStart)
+
+	// The guest's own split of BootWait, when it offered one. Guest-reported and
+	// therefore diagnostic only -- see runtime.Timings. A guest that lies here
+	// makes a log line wrong and nothing else, which is why nothing downstream
+	// is allowed to read these for a decision.
+	if health.KernelBootUS > 0 || health.GuestInitUS > 0 {
+		timings.GuestKernel = time.Duration(health.KernelBootUS) * time.Microsecond
+		timings.GuestInit = time.Duration(health.GuestInitUS) * time.Microsecond
+		timings.GuestReported = true
+	}
+
+	inst.timings = timings
+	inst.timingsOK = true
+
+	inst.log.Info("sandbox booted",
+		"total", timings.Total.Round(time.Microsecond),
+		"network", timings.Network.Round(time.Microsecond),
+		"stage", timings.Stage.Round(time.Microsecond),
+		"start_vmm", timings.StartVMM.Round(time.Microsecond),
+		"boot_wait", timings.BootWait.Round(time.Microsecond),
+		"guest_kernel", timings.GuestKernel.Round(time.Microsecond),
+		"guest_init", timings.GuestInit.Round(time.Microsecond),
+		"guest_reported", timings.GuestReported,
+		"unattributed", timings.Unattributed().Round(time.Microsecond))
+
 	return nil
 }
 
@@ -536,7 +615,23 @@ func (r *Runtime) vmConfig(spec runtime.Spec, lease *netpool.Lease, vp *verity.P
 	if vp != nil {
 		rootBoot = vp.BootParam() + " root=" + verity.RootDevice + " ro"
 	}
-	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off " + rootBoot +
+	// The console device stays attached either way -- it is where a panic and the
+	// agent's own stderr go, and detaching it would cost the diagnostic entirely
+	// rather than just quieting it. Only the kernel's verbosity changes.
+	//
+	// `quiet` alone, and not `quiet loglevel=1`. Both were measured on a Pi 5 and
+	// they are indistinguishable -- 84ms and 82ms of guest kernel against 169ms
+	// verbose -- because what costs the time is the volume of INFO-level
+	// narration, not the handful of messages above it. So the cheaper threshold
+	// buys nothing and gives up a great deal: `quiet` leaves the console at
+	// KERN_ERR, which still prints the errors that explain a failed boot, where
+	// loglevel=1 would print only KERN_EMERG and leave a root that failed to
+	// mount looking like silence.
+	quiet := " quiet"
+	if r.cfg.GuestBootVerbose {
+		quiet = ""
+	}
+	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off" + quiet + " " + rootBoot +
 		" microvm.hostname=" + spec.ID
 
 	if spec.Limits.DiskMiB > 0 {

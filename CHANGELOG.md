@@ -124,6 +124,47 @@ project aims for [Semantic Versioning](https://semver.org).
   Go SDK (`example_test.go`).
 - **CI guard**: `api/check-generated.sh` fails the build when the generated SDK
   types drift from `api/openapi.yaml`.
+- **`microvm bench`**, which times each leg of a run separately instead of
+  reporting one number for all of them: create, upload, exec start, first byte,
+  the program, retrieve, teardown, and the remainder the phases do not account
+  for. `-warmup` (default 1) discards the first iterations, which is what makes
+  "hot in the page cache" true rather than assumed; `-json` gives the raw per-run
+  numbers. It drives the same public API a caller does, so it measures what a
+  caller experiences rather than an internal fast path.
+
+  It exists because the published benchmark table quoted one wall-clock figure
+  per image, and four unrelated things lived inside it — host work, a guest
+  kernel boot, the caller's own program, and the CLI's round trips. Read as a
+  claim about how fast a microVM starts, which is how a single number reads, it
+  was measuring mostly a compiler: Go's "~2.4 s" was 841 ms of `go build` on top
+  of a 255 ms boot. The README and the site now publish the breakdown.
+- **A create is timed phase by phase**, logged at `sandbox booted` (staging, the
+  jailer, the boot wait) and `sandbox created` (source fetch, boot, seed, and
+  whether a warm-pool VM served it). The guest reports its own kernel and init
+  durations on its health response, read from `CLOCK_BOOTTIME` because
+  `/proc/uptime` only has centisecond resolution. Those two are the guest's word,
+  so they are diagnostics only — logged, never metered, billed or enforced on.
+  A guest built before this reports nothing and the split is simply absent, which
+  is also the honest answer for a snapshot restore, where the numbers would
+  describe the captured boot rather than this one.
+
+### Changed
+
+- **Sandboxes boot the guest kernel `quiet`**, with `-guest-boot-verbose` to turn
+  the narration back on. Every kernel printk is a synchronous write to an
+  emulated UART that the guest blocks on, and the phase timings above showed the
+  guest kernel to be the largest single part of a create by a wide margin — the
+  host's own work is about 1 ms of it. On a Pi 5 this took the guest kernel from
+  169 ms to 82 ms and a create from 288 ms to 170 ms, replicated against a second
+  image at 152 ms.
+
+  The console stays attached and the threshold only rises to `KERN_ERR`, so a
+  panic still prints with its call trace, an error that explains a failed boot
+  still prints, and so does everything the agent writes to stderr — verified by
+  booting a deliberately corrupt rootfs and reading the panic off the console.
+  `quiet loglevel=1` was measured too and rejected: indistinguishable in time
+  (the cost is the volume of INFO-level narration, not the few lines above it)
+  while leaving a root that failed to mount looking like silence.
 
 ### Fixed
 

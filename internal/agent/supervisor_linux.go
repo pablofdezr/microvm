@@ -57,6 +57,10 @@ func startSupervisor(log *slog.Logger) (*exec.Cmd, error) {
 	// link to the running image always does.
 	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
 	cmd.Env = append(os.Environ(), supervisorEnvKey+"=supervisor")
+	// The boot breakdown PID 1 just measured, handed to the process that will
+	// actually answer the host's health poll. Appended rather than set, so a
+	// guest with no measurement simply carries nothing.
+	cmd.Env = append(cmd.Env, bootEnv()...)
 
 	// Inherit the console so the supervisor's logs reach the serial port, which
 	// is the only way to debug a guest that never gets far enough to serve.

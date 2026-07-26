@@ -48,17 +48,28 @@ type Agent struct {
 	// field so a test can supply one that does not ioctl the kernel running the
 	// test. See reseed.go for why the rotation is not a file write.
 	reseed func(token []byte) error
+
+	// kernelBoot and guestInit are what PID 1 measured of this guest's boot,
+	// recovered from the environment it re-execed us with. They are reported on
+	// health and are diagnostics only -- protocol.HealthResponse carries the rule.
+	// Both are zero in a guest that did not measure, and in one restored from a
+	// snapshot.
+	kernelBoot time.Duration
+	guestInit  time.Duration
 }
 
 // New returns an Agent that runs commands under workdir.
 func New(workdir string, log *slog.Logger) *Agent {
+	kernelBoot, guestInit := readBootEnv()
 	return &Agent{
-		workdir: workdir,
-		execs:   newRegistry(),
-		started: time.Now(),
-		log:     log,
-		gic:     newGICCarrier(log),
-		reseed:  reseedCSPRNG,
+		workdir:    workdir,
+		execs:      newRegistry(),
+		started:    time.Now(),
+		log:        log,
+		gic:        newGICCarrier(log),
+		reseed:     reseedCSPRNG,
+		kernelBoot: kernelBoot,
+		guestInit:  guestInit,
 	}
 }
 
@@ -135,9 +146,11 @@ func (a *Agent) handleSnapshotDisarm(w http.ResponseWriter, r *http.Request) {
 
 func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, protocol.HealthResponse{
-		OK:       true,
-		Version:  Version,
-		UptimeMS: time.Since(a.started).Milliseconds(),
+		OK:           true,
+		Version:      Version,
+		UptimeMS:     time.Since(a.started).Milliseconds(),
+		KernelBootUS: a.kernelBoot.Microseconds(),
+		GuestInitUS:  a.guestInit.Microseconds(),
 	})
 }
 

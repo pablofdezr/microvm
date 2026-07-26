@@ -151,6 +151,23 @@ type HealthResponse struct {
 	// UptimeMS is milliseconds since the agent started, which after a snapshot
 	// restore reflects the snapshotted uptime rather than wall-clock time.
 	UptimeMS int64 `json:"uptime_ms"`
+
+	// KernelBootUS is how long the guest kernel took before it execed our init,
+	// and GuestInitUS is how long that init then took to make the guest usable.
+	//
+	// Microseconds, not milliseconds: the phases being split here are tens of
+	// milliseconds end to end, and a millisecond field rounds the interesting
+	// parts of an init away. They are read from CLOCK_BOOTTIME rather than
+	// /proc/uptime, which only has centisecond resolution.
+	//
+	// These are the *guest's* account of its own boot, and the guest runs code
+	// assumed hostile, so they are diagnostics and nothing else -- see
+	// runtime.Timings, which is where the rule that nothing may act on them
+	// lives. Zero means the guest did not report them: an older agent, or a
+	// restored snapshot, where the numbers would describe the captured boot
+	// rather than this one.
+	KernelBootUS int64 `json:"kernel_boot_us,omitempty"`
+	GuestInitUS  int64 `json:"guest_init_us,omitempty"`
 }
 
 // SnapshotArmResponse is the agent's answer to POST /v1/snapshot/arm, the call

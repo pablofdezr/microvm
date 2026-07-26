@@ -390,7 +390,10 @@ func (r *Runtime) restoreInto(ctx context.Context, inst *instance, spec runtime.
 		return fmt.Errorf("restore: load snapshot: %w\n--- console ---\n%s", err, inst.consoleTail())
 	}
 	resumed := time.Now()
-	if err := inst.waitReadyWithin(ctx, restoreReadyTimeout); err != nil {
+	// The health response is discarded here on purpose: its kernel and init
+	// figures describe the boot that was *captured*, not this restore, so
+	// carrying them onto a restored VM would report a boot that did not happen.
+	if _, err := inst.waitReadyWithin(ctx, restoreReadyTimeout); err != nil {
 		// The console before the teardown, exactly as the cold path does it: Stop
 		// removes the jail, so this is the last moment the guest's own account of
 		// itself exists. Not having it here is what made this failure take three

@@ -743,6 +743,14 @@ func (m *Manager) GetOrCreate(ctx context.Context, spec Spec) (*Sandbox, bool, e
 func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*Sandbox, bool, error) {
 	spec.applyDefaults()
 
+	// The manager's own view of what a create cost. It sits above the runtime's
+	// breakdown and names the two phases the runtime cannot see -- fetching a
+	// source, and writing the seed into the guest -- both of which happen inside
+	// a caller's create and neither of which is a boot. Attributing them to the
+	// boot is how "starting a sandbox" acquires seconds that no VM spent.
+	createStart := time.Now()
+	var fetchDur, bootDur, seedDur time.Duration
+
 	// The name is resolved before anything is spent on this create: a
 	// get-or-create hit returns the existing VM without booting a second one or
 	// charging a slot, and a plain collision is refused here rather than after a
@@ -778,10 +786,17 @@ func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*San
 	// that cost nothing against their cap would be a way to have the daemon make
 	// unbounded outbound requests. See prepareSeed for why it is not done after
 	// boot.
+	fetchStart := time.Now()
 	seed, err := m.prepareSeed(ctx, spec)
 	if err != nil {
 		m.release(spec.Tenant)
 		return nil, false, err
+	}
+	// Only a create that actually fetched something has a fetch phase; for
+	// everyone else this stays zero rather than recording the cost of deciding
+	// there was nothing to do.
+	if seed != nil {
+		fetchDur = time.Since(fetchStart)
 	}
 	if seed != nil {
 		defer seed.Close()
@@ -804,7 +819,9 @@ func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*San
 	// back to a cold boot otherwise. The pool is skipped whenever the sandbox has
 	// object storage, because storage is bound to the sandbox's own prefix on the
 	// boot command line and a pre-booted VM cannot carry it.
+	bootStart := time.Now()
 	inst := m.acquireWarm(spec)
+	warmHit := inst != nil
 	if inst == nil {
 		inst, err = m.rt.Create(ctx, spec.Spec)
 		if err != nil {
@@ -815,6 +832,7 @@ func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*San
 			return nil, false, err
 		}
 	}
+	bootDur = time.Since(bootStart)
 
 	now := time.Now()
 	sb := &Sandbox{
@@ -872,6 +890,7 @@ func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*San
 			return nil, false, err
 		}
 		sb.source = ptrTo(seed.Result())
+		seedDur = time.Since(started)
 	}
 
 	m.mu.Lock()
@@ -886,7 +905,38 @@ func (m *Manager) create(ctx context.Context, spec Spec, getOrCreate bool) (*San
 		namePublished = true
 	}
 
-	sb.log.Info("sandbox created", "ttl", spec.TTL, "idle_timeout", spec.IdleTimeout, "name", spec.Name)
+	// Logged as one line with the phases side by side, because the point of the
+	// breakdown is the comparison: a create that spent 2s fetching a repo and
+	// 150ms booting is a fetch problem, and the aggregate on its own says only
+	// that the sandbox was slow. The runtime logs the inside of `boot` separately
+	// (see the "sandbox booted" line), and warm reports whether a VM was booted
+	// for this create at all -- a pool hit has a boot phase of microseconds, and
+	// reading that as a boot time would be reading the pool's success as the
+	// kernel's.
+	args := []any{
+		"ttl", spec.TTL,
+		"idle_timeout", spec.IdleTimeout,
+		"name", spec.Name,
+		"total", time.Since(createStart).Round(time.Microsecond),
+		"fetch", fetchDur.Round(time.Microsecond),
+		"boot", bootDur.Round(time.Microsecond),
+		"seed", seedDur.Round(time.Microsecond),
+		"warm", warmHit,
+	}
+	// The runtime's phase breakdown, when this create actually booted a VM that
+	// measured itself. Absent for a pool hit and for a restore, where the boot
+	// being described is not this create's.
+	if tc, ok := inst.(runtime.TimedCreate); ok {
+		if t, measured := tc.CreateTimings(); measured {
+			args = append(args,
+				"boot_stage", t.Stage.Round(time.Microsecond),
+				"boot_vmm", t.StartVMM.Round(time.Microsecond),
+				"boot_wait", t.BootWait.Round(time.Microsecond),
+				"boot_guest_kernel", t.GuestKernel.Round(time.Microsecond),
+				"boot_guest_init", t.GuestInit.Round(time.Microsecond))
+		}
+	}
+	sb.log.Info("sandbox created", args...)
 	return sb, true, nil
 }
 

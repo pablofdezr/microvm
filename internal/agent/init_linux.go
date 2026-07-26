@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -42,6 +43,13 @@ type mount struct {
 // InitGuest brings the guest up: early mounts, a writable root, the standard
 // pseudo-filesystems, networking and DNS. It runs before anything is served.
 func InitGuest(log *slog.Logger) error {
+	// Read before anything else, because at this instant the clock holds exactly
+	// one thing: what the kernel spent getting here. The kernel execs us as PID
+	// 1, so time-since-boot measured on our first line *is* the kernel's own
+	// boot, with nothing of ours mixed in. A syscall, not a file read, so it
+	// works before /proc exists -- which is the whole reason it can come first.
+	kernelBoot, clockOK := sinceBoot()
+
 	// These come first and in this order for a reason: the kernel hands PID 1 a
 	// bare root with nothing mounted, so /proc does not exist yet -- and the
 	// boot parameters are read *from* /proc/cmdline. Reading the command line
@@ -102,6 +110,18 @@ func InitGuest(log *slog.Logger) error {
 	// (so the mountpoint is writable), both of which the steps above established.
 	// It is best-effort by design -- see mountStorage.
 	mountStorage(log, cmdline)
+
+	// Close the measurement here rather than in RunInit: this is the point at
+	// which the guest is actually usable, and everything after it is the
+	// supervisor re-exec, which the host sees as part of its own boot wait.
+	if now, ok := sinceBoot(); ok && clockOK {
+		bootTimings.kernel = kernelBoot
+		bootTimings.init = now - kernelBoot
+		bootTimings.ok = true
+		log.Info("guest up",
+			"kernel_boot", kernelBoot.Round(time.Microsecond),
+			"init", bootTimings.init.Round(time.Microsecond))
+	}
 
 	return nil
 }

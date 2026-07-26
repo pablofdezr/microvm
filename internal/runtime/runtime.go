@@ -124,6 +124,75 @@ type Stats struct {
 	NetworkTxBytes *uint64
 }
 
+// Timings breaks one create down into the phases that make it up.
+//
+// It exists because "a sandbox took 500ms to start" is four different claims
+// wearing one number -- host work, a kernel boot, the guest's own init, and
+// whatever the caller's program then did -- and only the first three are the
+// runtime's to fix. Publishing the aggregate on its own invited exactly the
+// wrong conclusion: that the microVM was slow, when the microVM was a small
+// and roughly constant part of it.
+//
+// Every duration here is measured on the host against one monotonic clock,
+// except the two Guest fields -- see their comment, which is a trust boundary
+// and not a footnote.
+type Timings struct {
+	// Network is allocating the lease and creating the TAP device. Zero for a
+	// sandbox with no network.
+	Network time.Duration
+
+	// Stage is building the jail tree: hardlinking the kernel and rootfs,
+	// loading any verity sidecar, rendering vm.json and chowning it all. It is
+	// the phase that would balloon if the images ever landed on a different
+	// filesystem from the jail, since stageFile then copies instead of linking.
+	Stage time.Duration
+
+	// StartVMM is the jailer exec: fork, chroot, cgroup setup, exec Firecracker.
+	// It ends when the process is started, not when the guest is up.
+	StartVMM time.Duration
+
+	// BootWait is from a started VMM to the guest agent answering health. It
+	// contains the guest kernel boot, the guest's init, and the agent binding
+	// its vsock listener -- the Guest fields below split it further when the
+	// guest reported them.
+	BootWait time.Duration
+
+	// Total is the whole create as the caller experienced it. It is measured
+	// directly rather than summed, so it also captures anything not broken out
+	// above; Total minus the sum of the phases is the unattributed remainder.
+	Total time.Duration
+
+	// GuestKernel is how long the guest kernel took before it execed our init,
+	// and GuestInit is how long that init then took to make the guest usable.
+	// Both are measured inside the guest and travel on its health response.
+	//
+	// Which makes them the guest's word, and the guest runs code we assume is
+	// hostile. They are therefore diagnostics only: they are logged, and they
+	// feed the benchmark harness, and nothing reads them to decide anything.
+	// Never meter, bill, schedule or enforce a timeout on these -- a sandbox
+	// that can choose its own numbers would be choosing its own bill.
+	//
+	// GuestReported is false when the agent did not supply them, which is the
+	// case for an older guest image and for a restored snapshot, where the
+	// figures describe the boot that was captured rather than this one.
+	GuestKernel   time.Duration
+	GuestInit     time.Duration
+	GuestReported bool
+}
+
+// Unattributed is Total minus everything broken out into a named phase.
+//
+// A large remainder is the interesting case: it means the create spent its time
+// somewhere this struct does not yet name, which is a prompt to instrument
+// rather than a number to publish.
+func (t Timings) Unattributed() time.Duration {
+	rest := t.Network + t.Stage + t.StartVMM + t.BootWait
+	if t.Total <= rest {
+		return 0
+	}
+	return t.Total - rest
+}
+
 // Instance is a running sandbox.
 type Instance interface {
 	// ID returns the sandbox's identifier.
@@ -176,6 +245,25 @@ type MeterAdopter interface {
 	// AdoptMeter restarts the wall-clock and idle meters from now. It is called
 	// once, as the sandbox leaves the pool and before any caller can see it.
 	AdoptMeter()
+}
+
+// TimedCreate is an optional Instance capability: reporting how long this
+// sandbox's own create took, phase by phase.
+//
+// Optional for the same reason as MeterAdopter -- a backend with nothing
+// interesting to say about its boot, and every test fake, should not be made to
+// invent numbers. Callers type-assert, and a backend that does not implement it
+// simply has no breakdown to log.
+//
+// The timings describe the create that produced this instance and never change
+// afterwards, so there is no synchronisation contract here beyond the one the
+// backend needs to publish them once.
+type TimedCreate interface {
+	// CreateTimings returns the phase breakdown of this instance's create. The
+	// second result is false when the instance was not produced by a create that
+	// measured itself -- a snapshot restore, or a VM taken from the warm pool,
+	// whose boot happened long before and for nobody in particular.
+	CreateTimings() (Timings, bool)
 }
 
 // GuestClient is what the layers above can ask of the code inside a sandbox.

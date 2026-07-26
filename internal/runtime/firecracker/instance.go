@@ -19,6 +19,7 @@ import (
 	"github.com/pablofdezr/microvm/internal/cgroup"
 	"github.com/pablofdezr/microvm/internal/guestclient"
 	"github.com/pablofdezr/microvm/internal/netpool"
+	"github.com/pablofdezr/microvm/internal/protocol"
 	"github.com/pablofdezr/microvm/internal/runtime"
 )
 
@@ -78,11 +79,23 @@ type instance struct {
 	// one number that cannot be re-derived afterwards.
 	tapName string
 
+	// timings is this VM's own create, phase by phase, and timingsOK reports
+	// whether it was ever filled in. Both are written once by setup, before the
+	// instance is published to any caller, and only read afterwards -- which is
+	// what makes them safe without a lock. A VM that arrived by snapshot restore
+	// leaves timingsOK false: the boot those numbers would describe happened
+	// earlier and for nobody in particular.
+	timings   runtime.Timings
+	timingsOK bool
+
 	stopOnce sync.Once
 	stopErr  error
 }
 
 func (i *instance) ID() string { return i.id }
+
+// CreateTimings implements runtime.TimedCreate.
+func (i *instance) CreateTimings() (runtime.Timings, bool) { return i.timings, i.timingsOK }
 
 func (i *instance) Client() runtime.GuestClient { return i.client }
 
@@ -293,18 +306,37 @@ func (i *instance) killVMM(ctx context.Context) error {
 // declare every sandbox dead before Firecracker had written its first log line.
 // The cgroup is the kernel's own record of what is running, and it cannot be
 // wrong about it.
-func (i *instance) waitReady(ctx context.Context) error {
+// It returns the health response that ended the wait, because the guest states
+// its own kernel and init timings on it and the boot path is the only place they
+// can be collected.
+func (i *instance) waitReadyHealth(ctx context.Context) (protocol.HealthResponse, error) {
 	return i.waitReadyWithin(ctx, bootTimeout)
 }
 
-// waitReadyWithin is waitReady with an explicit deadline. The restore path uses
-// a shorter one, for the reasons measured at restoreReadyTimeout.
-func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) error {
+// waitReady is waitReadyHealth for the callers with no use for the breakdown.
+func (i *instance) waitReady(ctx context.Context) error {
+	_, err := i.waitReadyWithin(ctx, bootTimeout)
+	return err
+}
+
+// readyResult is what the readiness poller reports back: the health response
+// that satisfied it, or the error that ended it.
+type readyResult struct {
+	health protocol.HealthResponse
+	err    error
+}
+
+// waitReadyWithin is waitReadyHealth with an explicit deadline. The restore path
+// uses a shorter one, for the reasons measured at restoreReadyTimeout.
+func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) (protocol.HealthResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ready := make(chan error, 1)
-	go func() { ready <- i.client.WaitReady(ctx) }()
+	ready := make(chan readyResult, 1)
+	go func() {
+		health, err := i.client.WaitReadyHealth(ctx)
+		ready <- readyResult{health: health, err: err}
+	}()
 
 	ticker := time.NewTicker(livenessInterval)
 	defer ticker.Stop()
@@ -317,8 +349,8 @@ func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) e
 
 	for {
 		select {
-		case err := <-ready:
-			return err
+		case res := <-ready:
+			return res.health, res.err
 
 		case <-ctx.Done():
 			// WaitReady is watching the same context, so it is about to return --
@@ -326,10 +358,10 @@ func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) e
 			// worth reading. Racing it to the return statement threw that away and
 			// reported a bare deadline instead, so give it a moment to answer.
 			select {
-			case err := <-ready:
-				return err
+			case res := <-ready:
+				return res.health, res.err
 			case <-time.After(readyDrainGrace):
-				return fmt.Errorf("sandbox did not answer within %v: %w", timeout, ctx.Err())
+				return protocol.HealthResponse{}, fmt.Errorf("sandbox did not answer within %v: %w", timeout, ctx.Err())
 			}
 
 		case <-ticker.C:
@@ -343,7 +375,7 @@ func (i *instance) waitReadyWithin(ctx context.Context, timeout time.Duration) e
 				continue
 			}
 			if seenPopulated {
-				return errors.New("the VM exited before the sandbox was ready")
+				return protocol.HealthResponse{}, errors.New("the VM exited before the sandbox was ready")
 			}
 		}
 	}

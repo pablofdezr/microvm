@@ -49,20 +49,32 @@ func New(udsPath string) *Client {
 // has to run. Handing a sandbox to a caller before this returns would surface
 // as a confusing connection error on their first exec.
 func (c *Client) WaitReady(ctx context.Context) error {
+	_, err := c.WaitReadyHealth(ctx)
+	return err
+}
+
+// WaitReadyHealth is WaitReady, returning the health response that satisfied it.
+//
+// The response is worth keeping rather than discarding: it carries the guest's
+// own account of how long its kernel and init took, which is the only way to
+// split the host's single "waited for boot" figure into the parts a caller can
+// actually act on. Those numbers are the guest's word and are diagnostics only
+// -- see runtime.Timings for why nothing may decide anything from them.
+func (c *Client) WaitReadyHealth(ctx context.Context) (protocol.HealthResponse, error) {
 	const pollInterval = 5 * time.Millisecond
 
 	var lastErr error
 	for {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
-				return fmt.Errorf("guest agent never became ready: %w (last attempt: %v)", err, lastErr)
+				return protocol.HealthResponse{}, fmt.Errorf("guest agent never became ready: %w (last attempt: %v)", err, lastErr)
 			}
-			return fmt.Errorf("guest agent never became ready: %w", err)
+			return protocol.HealthResponse{}, fmt.Errorf("guest agent never became ready: %w", err)
 		}
 
 		health, err := c.Health(ctx)
 		if err == nil && health.OK {
-			return nil
+			return health, nil
 		}
 		lastErr = err
 

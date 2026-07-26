@@ -41,6 +41,7 @@ Usage:
   microvm result <task-id>               a task's result
   microvm queue                          queue depth and this node's slots
   microvm images                         images the node can run
+  microvm bench <image> <file>           time a full run, phase by phase
 
 Flags:
   -url string      daemon address (default $MICROVM_URL or http://127.0.0.1:8080)
@@ -52,6 +53,8 @@ Flags:
   -env key=value   set an environment variable; repeatable
   -tag key=value   label the sandbox; repeatable, and narrows microvm ps
   -json            print the raw result as JSON
+  -n int           bench: iterations to measure (default 5)
+  -warmup int      bench: iterations to discard first (default 1)
 
 Seed the sandbox with a project before the command runs, for run and exec — a
 task has no sandbox to seed. The daemon fetches it host-side, so this works with
@@ -95,6 +98,12 @@ type options struct {
 	sourceRef   string
 	sourceStrip int
 	sourceCred  string
+
+	// Benchmarking. iterations are the runs that count; warmup are the runs
+	// discarded first, which is what makes "image hot in the page cache" true
+	// rather than assumed.
+	iterations int
+	warmup     int
 }
 
 // seedRequested reports whether any -source flag was given. One flagset serves
@@ -148,6 +157,8 @@ func run() error {
 	fs.IntVar(&opts.sourceStrip, "source-strip", 0, "leading path elements to drop from a tarball's members")
 	fs.StringVar(&opts.sourceCred, "source-credential", "", "operator credential name, for a private repository")
 	fs.BoolVar(&opts.asJSON, "json", false, "print raw JSON")
+	fs.IntVar(&opts.iterations, "n", 5, "bench: iterations to measure")
+	fs.IntVar(&opts.warmup, "warmup", 1, "bench: iterations to discard first")
 	fs.Usage = func() { fmt.Print(usage) }
 
 	// Flags may follow the positional arguments, which is what people actually
@@ -167,6 +178,8 @@ func run() error {
 	switch cmd {
 	case "run":
 		return cmdRun(ctx, client, opts, args)
+	case "bench":
+		return cmdBench(ctx, client, opts, args)
 	case "exec":
 		return cmdExec(ctx, client, opts, args)
 	case "ps":
